@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Torneo Fútbol</title>
+  <meta name="description" content="Inscripción de equipos, sorteo, partidos y tabla del torneo">
+  <meta name="theme-color" content="#15803d">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Torneo">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-cat="M">
+  <header class="top">
+    <div class="brand">⚽ Torneo <span id="sync" class="sync init" data-a="syncInfo" role="button" aria-label="Estado de la base de datos"></span></div>
+    <div class="seg" id="cats">
+      <button data-a="cat" data-c="M">Masculino</button>
+      <button data-a="cat" data-c="F">Femenino</button>
+    </div>
+  </header>
+
+  <main id="view"></main>
+
+  <nav class="tabs" id="tabs">
+    <button data-a="tab" data-t="equipos"><span>👥</span>Equipos</button>
+    <button data-a="tab" data-t="partidos"><span>⚽</span>Partidos</button>
+    <button data-a="tab" data-t="tabla"><span>🏆</span>Tabla</button>
+    <button data-a="tab" data-t="ajustes"><span>⚙️</span>Ajustes</button>
+  </nav>
+
+  <div id="modal" class="modal" hidden>
+    <div class="sheet" id="sheet"></div>
+  </div>
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
