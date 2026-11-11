@@ -1,11 +1,6 @@
-// API única del torneo: guarda todo el estado en Upstash Redis (Vercel Storage).
-// Variables de entorno (las crea Vercel al conectar Upstash):
-//   KV_REST_API_URL / KV_REST_API_TOKEN   (o UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-// Opcional: ADMIN_PIN -> si se define, solo quien tenga el PIN puede guardar cambios.
+// Estado del torneo. Lectura pública; guardar requiere sesión de organizador.
+const { configured, redis, verify, readBody } = require('./_lib');
 
-const DB_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-const DB_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const PIN = process.env.ADMIN_PIN || '';
 const K_REV = 'torneo:rev';
 const K_DATA = 'torneo:data';
 
@@ -18,17 +13,6 @@ redis.call('SET', KEYS[1], tostring(n))
 redis.call('SET', KEYS[2], ARGV[2])
 return {1, tostring(n)}`;
 
-async function redis(cmd) {
-  const r = await fetch(DB_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${DB_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(cmd),
-  });
-  const j = await r.json();
-  if (j.error) throw new Error(j.error);
-  return j.result;
-}
-
 async function readAll() {
   const [rev, data] = await redis(['MGET', K_REV, K_DATA]);
   return { rev: Number(rev || 0), data: data ? JSON.parse(data) : null };
@@ -36,7 +20,7 @@ async function readAll() {
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
-  if (!DB_URL || !DB_TOKEN) return res.status(501).json({ error: 'Base de datos no configurada' });
+  if (!configured()) return res.status(501).json({ error: 'Base de datos no configurada' });
 
   try {
     if (req.method === 'GET') {
@@ -45,15 +29,13 @@ module.exports = async function handler(req, res) {
         const rev = Number((await redis(['GET', K_REV])) || 0);
         if (String(rev) === String(since)) return res.status(200).json({ rev, same: true });
       }
-      const all = await readAll();
-      return res.status(200).json({ ...all, pin: !!PIN });
+      return res.status(200).json(await readAll());
     }
 
     if (req.method === 'PUT' || req.method === 'POST') {
-      if (PIN && req.headers['x-pin'] !== PIN) return res.status(401).json({ error: 'PIN incorrecto' });
-      let body = req.body;
-      if (typeof body === 'string') body = JSON.parse(body);
-      const data = body && body.data;
+      if (!(await verify(req))) return res.status(401).json({ error: 'Debe ingresar como organizador' });
+      const body = readBody(req);
+      const data = body.data;
       if (!data || !data.cats || typeof data.cats.M !== 'object' || typeof data.cats.F !== 'object') {
         return res.status(400).json({ error: 'Datos no válidos' });
       }
@@ -62,7 +44,6 @@ module.exports = async function handler(req, res) {
 
       const [ok, rev] = await redis(['EVAL', CAS, '2', K_REV, K_DATA, String(Number(body.baseRev) || 0), json]);
       if (Number(ok) === 1) return res.status(200).json({ rev: Number(rev) });
-      // Otro dispositivo guardó antes: devolver lo actual para combinar.
       return res.status(409).json(await readAll());
     }
 

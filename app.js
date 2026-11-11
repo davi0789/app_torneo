@@ -34,25 +34,35 @@ function load() {
     const d = JSON.parse(localStorage.getItem(KEY));
     if (d && d.cats && d.cats.M && d.cats.F) return d;
   } catch (e) { /* sin datos */ }
-  return { cats: { M: newTournament(), F: newTournament() }, cat: 'M', tab: 'equipos' };
+  return { cats: { M: newTournament(), F: newTournament() }, cat: 'M', tab: 'partidos', view: 'cal' };
 }
 let S = load();
 
 /* Estado de sincronización con la base de datos en línea */
 const SYNC_KEY = 'torneo-sync-v1';
-const PIN_KEY = 'torneo-pin';
-const sync = { mode: 'init', rev: 0, base: null, dirty: false, known: false, needPin: false, last: 0, pushing: false, timer: null, pendingRender: false };
+const AUTH_KEY = 'torneo-auth';
+const sync = { mode: 'init', rev: 0, base: null, dirty: false, known: false, needSetup: false, last: 0, pushing: false, timer: null, pendingRender: false };
 try {
   const d = JSON.parse(localStorage.getItem(SYNC_KEY));
   if (d) Object.assign(sync, { rev: d.rev || 0, base: d.base || null, dirty: !!d.dirty, known: true });
 } catch (e) { /* nada */ }
+
+/* Sesión de organizador. Sin sesión = vista pública (solo lectura). */
+let auth = null;
+try { auth = JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) { /* nada */ }
+let orgs = null; // lista de organizadores (se carga en Ajustes)
+const isAdmin = () => sync.mode === 'local' || !!(auth && auth.token);
+function setAuth(a) {
+  auth = a;
+  try { if (a) localStorage.setItem(AUTH_KEY, JSON.stringify(a)); else localStorage.removeItem(AUTH_KEY); } catch (e) { /* nada */ }
+}
 
 function saveLocal() {
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('⚠️ No se pudo guardar'); }
 }
 function save() {
   saveLocal();
-  if (sync.mode !== 'local') {
+  if (sync.mode !== 'local' && isAdmin()) {
     sync.dirty = JSON.stringify(payload()) !== JSON.stringify(sync.base);
     saveSync();
     if (sync.dirty) schedulePush();
@@ -316,16 +326,61 @@ const views = { equipos: viewEquipos, partidos: viewPartidos, tabla: viewTabla, 
 
 function render() {
   sync.pendingRender = false;
+  const adm = isAdmin();
   document.body.dataset.cat = S.cat;
+  document.body.classList.toggle('public', !adm);
   document.querySelectorAll('#cats button').forEach((b) => b.classList.toggle('on', b.dataset.c === S.cat));
+  const t4 = document.querySelector('#tabs [data-t="ajustes"]');
+  if (t4) t4.innerHTML = adm ? '<span>⚙️</span>Ajustes' : '<span>🔑</span>Ingresar';
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.t === S.tab));
   $('#view').innerHTML = (views[S.tab] || viewEquipos)();
   renderModal();
   setMode(sync.mode, false);
 }
 
+/* ---- utilidades de fechas ---- */
+const pad = (n) => String(n).padStart(2, '0');
+const isoDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+function dayLabel(d) {
+  const dt = new Date(d + 'T12:00');
+  let s = dt.toLocaleDateString('es', { weekday: 'long', day: 'numeric', month: 'long', year: dt.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined });
+  s = s.charAt(0).toUpperCase() + s.slice(1);
+  const today = isoDate(new Date());
+  const tomorrow = isoDate(new Date(Date.now() + 864e5));
+  if (d === today) s = 'Hoy · ' + s;
+  else if (d === tomorrow) s = 'Mañana · ' + s;
+  return s;
+}
+const shortDate = (d) => new Date(d + 'T12:00').toLocaleDateString('es', { weekday: 'short', day: 'numeric', month: 'short' });
+const phaseLabel = (m) => (m.phase === 'ko' ? m.label : `${m.group ? 'Grupo ' + m.group + ' · ' : ''}Jornada ${m.round}`);
+
+function teamRecord(id) {
+  const r = { pj: 0, g: 0, e: 0, p: 0, gf: 0, gc: 0 };
+  for (const m of T().matches) {
+    if (m.status !== 'done' || (m.home !== id && m.away !== id)) continue;
+    const home = m.home === id;
+    r.pj++; r.gf += home ? m.hs : m.as; r.gc += home ? m.as : m.hs;
+    const w = winner(m);
+    if (!w) r.e++; else if (w === id) r.g++; else r.p++;
+  }
+  return r;
+}
+const recordHTML = (r) => `<span class="rec"><b class="g">${r.g}G</b><b class="e">${r.e}E</b><b class="p">${r.p}P</b></span>`;
+
 function viewEquipos() {
   const t = T(), c = t.config;
+  if (!isAdmin()) {
+    let h = `<h1>Equipos ${CATS[S.cat]}</h1>`;
+    if (!t.teams.length) return h + `<div class="empty">Aún no hay equipos inscritos.</div>`;
+    h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos</p>`;
+    for (const tm of t.teams) {
+      h += `<button class="list-item" data-a="viewTeam" data-id="${tm.id}">
+        <div class="avatar">${esc(tm.name.slice(0, 1).toUpperCase())}</div>
+        <div class="grow"><div class="t">${esc(tm.name)}</div><small>${tm.players.length} integrantes</small></div>
+        ${recordHTML(teamRecord(tm.id))}</button>`;
+    }
+    return h;
+  }
   const paid = t.teams.reduce((a, x) => a + num(x.paid), 0);
   const due = t.teams.reduce((a, x) => a + Math.max(0, num(c.fee) - num(x.paid)), 0);
   let h = `<h1>Equipos ${CATS[S.cat]}</h1>
@@ -361,79 +416,118 @@ function optRadio(name, value, cur, title, desc) {
     <div><b>${title}</b>${desc ? `<span>${desc}</span>` : ''}</div></label>`;
 }
 
-function viewPartidos() {
-  const t = T(), c = t.config;
-  if (t.stage === 'inscripcion') {
-    const n = t.teams.length;
-    let h = `<h1>Sorteo ${CATS[S.cat]}</h1>
+function drawSetupHTML() {
+  const t = T(), c = t.config, n = t.teams.length;
+  let h = `<h1>Sorteo ${CATS[S.cat]}</h1>
     <p class="muted">${n} equipo(s) inscritos. Configure el formato y realice el sorteo.</p>
     <h3>Formato</h3>
     ${optRadio('format', 'liga', c.format, 'Todos contra todos', 'Todos se enfrentan una vez. Tabla por puntos.')}
     ${optRadio('format', 'grupos', c.format, 'Cuadrangulares (grupos)', 'Se sortean grupos; los mejores pasan a eliminación.')}
     ${optRadio('format', 'elim', c.format, 'Eliminación directa', 'Llave de eliminación desde el inicio.')}`;
-    if (c.format === 'liga') {
-      h += `<h3>Fase final</h3>
+  if (c.format === 'liga') {
+    h += `<h3>Fase final</h3>
       ${optRadio('ligaFinal', 0, c.ligaFinal, 'Sin fase final', 'Gana el primero de la tabla')}
       ${optRadio('ligaFinal', 2, c.ligaFinal, 'Final', '1° vs 2° de la tabla')}
       ${optRadio('ligaFinal', 4, c.ligaFinal, 'Semifinales', '1° vs 4° y 2° vs 3°, luego final')}`;
-    }
-    if (c.format === 'grupos') {
-      h += `<div class="grid2">
+  }
+  if (c.format === 'grupos') {
+    h += `<div class="grid2">
         <label class="fl">Equipos por grupo<select data-cfg="groupSize">
           ${[3, 4, 5, 6].map((v) => `<option value="${v}" ${c.groupSize == v ? 'selected' : ''}>${v}${v === 4 ? ' (cuadrangular)' : ''}</option>`).join('')}
         </select></label>
         <label class="fl">Clasifican por grupo<select data-cfg="perGroup">
           ${[1, 2, 3, 4].map((v) => `<option value="${v}" ${c.perGroup == v ? 'selected' : ''}>${v}</option>`).join('')}
         </select></label></div>`;
-      if (n >= 4) {
-        const ng = Math.max(2, Math.floor(n / c.groupSize));
-        h += `<p class="muted"><small>Con ${n} equipos se formarán ${ng} grupos.</small></p>`;
-      }
-    }
-    h += `<h3>Premiación</h3>
+    if (n >= 4) h += `<p class="muted"><small>Con ${n} equipos se formarán ${Math.max(2, Math.floor(n / c.groupSize))} grupos.</small></p>`;
+  }
+  h += `<h3>Premiación</h3>
       ${optRadio('podium', 1, c.podium, 'Solo campeón (1 lugar)', '')}
       ${optRadio('podium', 2, c.podium, 'Campeón y subcampeón (2 lugares)', '')}
       ${optRadio('podium', 3, c.podium, '3 lugares', 'Incluye partido por el tercer lugar si hay semifinales')}
       <label class="fl">Duración de partido por defecto (minutos)<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
       <div style="height:12px"></div>
       <button class="btn block" data-a="draw" ${n < 2 ? 'disabled' : ''}>🎲 Realizar sorteo</button>`;
-    return h;
+  return h;
+}
+
+function calendarHTML(list) {
+  const key = (m) => m.date + ' ' + (m.time || '99:99') + ' ' + String(m.field || '').padStart(3, '0');
+  const dated = list.filter((m) => m.date).sort((a, b) => key(a).localeCompare(key(b)));
+  const undated = list.filter((m) => !m.date);
+  let h = '';
+  if (!dated.length) {
+    h += `<div class="note">${isAdmin() ? 'Aún no hay fechas programadas. Use “Programar fechas y horarios”.' : 'Aún no se han programado fechas.'}</div>`;
   }
+  let cur = null;
+  for (const m of dated) {
+    if (m.date !== cur) { cur = m.date; h += `<div class="day ${m.date === isoDate(new Date()) ? 'today' : ''}">${esc(dayLabel(m.date))}</div>`; }
+    h += matchCard(m);
+  }
+  if (undated.length) {
+    if (dated.length) h += `<div class="day">Sin fecha asignada</div>`;
+    for (const m of undated) h += matchCard(m);
+  }
+  return h;
+}
 
-  const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa' }[c.format];
-  let h = `<h1>Partidos ${CATS[S.cat]}</h1><p class="muted">${fmt} · ${c.podium} lugar(es) · toque un partido para jugarlo</p>`;
-
+function phasesHTML() {
+  const t = T(), c = t.config;
+  let h = '';
   const p1 = phase1();
-  const done1 = p1.filter((m) => m.status === 'done').length;
   if (p1.length) {
-    h += `<h3>${c.format === 'liga' ? 'Fase regular' : 'Fase de grupos'} · ${done1}/${p1.length}</h3>`;
-    const rounds = [...new Set(p1.map((m) => m.round))];
-    for (const r of rounds) {
-      h += `<div class="muted" style="font-size:13px;margin:10px 0 6px;font-weight:700">Fecha ${r}</div>`;
+    h += `<h3>${c.format === 'liga' ? 'Fase regular' : 'Fase de grupos'} · ${p1.filter((m) => m.status === 'done').length}/${p1.length}</h3>`;
+    for (const r of [...new Set(p1.map((m) => m.round))]) {
+      h += `<div class="day">Jornada ${r}</div>`;
       for (const m of p1.filter((x) => x.round === r)) h += matchCard(m);
     }
-    if (t.stage === 'fase1' && needsFinal()) {
-      h += phase1Done()
-        ? `<button class="btn block" data-a="genFinal">🏁 Generar fase final</button>`
-        : `<div class="note warn">Cuando terminen todos los partidos podrá generar la fase final.</div>`;
-    }
   }
-
   const ko = t.matches.filter((m) => m.phase === 'ko');
   if (ko.length) {
     h += `<h3>Fase final</h3>`;
     const labels = [];
     for (const m of ko) { const base = m.label.replace(/ \d+$/, ''); if (!labels.includes(base)) labels.push(base); }
     for (const lb of labels) {
-      h += `<div class="muted" style="font-size:13px;margin:10px 0 6px;font-weight:700">${lb}</div>`;
+      h += `<div class="day">${lb}</div>`;
       for (const m of ko.filter((x) => x.label.replace(/ \d+$/, '') === lb)) h += matchCard(m);
     }
-    if (c.format !== 'elim') h += `<button class="btn ghost block sm" data-a="undoFinal">Deshacer fase final</button>`;
+  }
+  return h;
+}
+
+function viewPartidos() {
+  const t = T(), c = t.config, adm = isAdmin();
+  if (t.stage === 'inscripcion') {
+    if (adm) return drawSetupHTML();
+    return `<h1>Partidos ${CATS[S.cat]}</h1><div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
+  }
+  const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa' }[c.format];
+  const mode = S.view === 'fase' ? 'fase' : 'cal';
+  const all = t.matches;
+  const done = all.filter((m) => m.status === 'done').length;
+  let h = `<h1>Partidos ${CATS[S.cat]}</h1>
+    <p class="muted">${fmt} · ${done}/${all.length} jugados${adm ? ' · toque un partido para jugarlo' : ''}</p>
+    <div class="seg2">
+      <button data-a="view" data-v="cal" class="${mode === 'cal' ? 'on' : ''}">📅 Calendario</button>
+      <button data-a="view" data-v="fase" class="${mode === 'fase' ? 'on' : ''}">🗂️ Por fase</button>
+    </div>`;
+  if (adm) h += `<button class="btn ghost block sm" data-a="openSchedule" style="margin-bottom:10px">🗓️ Programar fechas y horarios</button>`;
+
+  const live = all.filter((m) => m.status === 'live');
+  if (live.length) { h += `<h3>🔴 En juego ahora</h3>`; for (const m of live) h += matchCard(m); }
+
+  h += mode === 'cal' ? calendarHTML(all) : phasesHTML();
+
+  if (adm) {
+    if (t.stage === 'fase1' && needsFinal()) {
+      h += phase1Done()
+        ? `<button class="btn block" data-a="genFinal">🏁 Generar fase final</button>`
+        : `<div class="note warn">Cuando terminen todos los partidos de la primera fase podrá generar la fase final.</div>`;
+    }
+    if (all.some((m) => m.phase === 'ko') && c.format !== 'elim') h += `<button class="btn ghost block sm" data-a="undoFinal">Deshacer fase final</button>`;
   }
   const pod = podium();
   if (pod) h += podiumHTML(pod);
-
-  h += `<div style="height:20px"></div><button class="btn danger block sm" data-a="undoDraw">Deshacer sorteo (borra resultados)</button>`;
+  if (adm) h += `<div style="height:20px"></div><button class="btn danger block sm" data-a="undoDraw">Deshacer sorteo (borra resultados)</button>`;
   return h;
 }
 
@@ -443,17 +537,22 @@ function matchCard(m) {
   const side = (id, src, cls) => id
     ? `<div class="${cls} ${done && w === id ? 'win' : ''}">${esc(tname(id))}</div>`
     : `<div class="${cls} tbd">${esc(srcLabel(src))}</div>`;
-  const status = done ? '<span class="badge b-ok">Final</span>'
+  const status = done ? (w ? '<span class="badge b-ok">Final</span>' : '<span class="badge b-ok">Empate</span>')
     : m.status === 'live' ? '<span class="badge b-live">En juego</span>'
       : '<span class="badge b-pend">Pendiente</span>';
   const pens = done && m.ph != null && m.hs === m.as ? `<small>pen ${m.ph}-${m.pa}</small>` : '';
   const yc = m.cards.filter((x) => x.type === 'Y').length, rc = m.cards.filter((x) => x.type === 'R').length;
   const cards = (yc || rc) ? `${yc ? `🟨${yc}` : ''} ${rc ? `🟥${rc}` : ''}` : '';
+  const when = [
+    m.date && S.view === 'fase' ? shortDate(m.date) : '',
+    m.time ? '🕒 ' + m.time : '',
+    m.field ? 'Cancha ' + esc(m.field) : '',
+  ].filter(Boolean).join(' · ');
   return `<button class="match ${m.status}" data-a="openMatch" data-id="${m.id}">
     ${side(m.home, m.srcH, 'h')}
     <div class="sc">${m.status === 'pend' ? 'vs' : `${m.hs} - ${m.as}`}${pens}</div>
     ${side(m.away, m.srcA, 'a')}
-    <div class="meta"><span>${m.phase === 'ko' ? esc(m.label) : (m.group ? 'Grupo ' + m.group : '')} · ${m.duration} min</span><span>${cards} ${status}</span></div>
+    <div class="meta"><span>${when ? `<b>${when}</b> · ` : ''}${esc(phaseLabel(m))}</span><span>${cards} ${status}</span></div>
   </button>`;
 }
 
@@ -506,10 +605,59 @@ function viewTabla() {
   return h;
 }
 
-function viewAjustes() {
-  const c = T().config;
+function installCard() {
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  return `<div class="card">
+    <h2>Instalar en el teléfono</h2>
+    ${standalone ? '<p class="muted">✅ La app ya está instalada.</p>' : `
+      ${installEvt ? '<button class="btn block" data-a="install">📲 Instalar app</button>' : ''}
+      <p class="muted" style="font-size:14px"><b>Android (Chrome):</b> menú ⋮ → “Instalar aplicación” o “Agregar a pantalla principal”.<br>
+      <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>`}
+  </div>`;
+}
+
+function loginHTML() {
+  const setup = sync.needSetup;
+  return `<h1>${setup ? 'Crear organizador' : 'Ingreso de organizadores'}</h1>
+  <div class="card">
+    <p class="muted" style="font-size:14px;margin-top:0">${setup
+    ? 'Aún no hay organizadores. Cree la cuenta principal; luego podrá agregar a los demás organizadores.'
+    : 'Sin ingresar puede ver equipos, partidos, resultados y calendario. Para inscribir, sortear y anotar resultados ingrese con su usuario.'}</p>
+    <form id="loginForm" autocomplete="on">
+      <label class="fl">Usuario<input id="l-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="ej: david" required></label>
+      <label class="fl">Contraseña<input id="l-pass" name="password" type="password" autocomplete="${setup ? 'new-password' : 'current-password'}" placeholder="${setup ? 'Mínimo 6 caracteres' : ''}" required></label>
+      ${setup ? '<label class="fl">Repetir contraseña<input id="l-pass2" type="password" autocomplete="new-password" required></label>' : ''}
+      <div style="height:12px"></div>
+      <button class="btn block" type="submit">${setup ? 'Crear cuenta e ingresar' : 'Ingresar'}</button>
+    </form>
+  </div>
+  ${installCard()}`;
+}
+
+function viewAjustes() {
+  if (!isAdmin()) return loginHTML();
+  const c = T().config;
+  const online = sync.mode !== 'local';
   return `<h1>Ajustes ${CATS[S.cat]}</h1>
+  ${online ? `<div class="card">
+    <h2>Sesión</h2>
+    <p style="margin:6px 0 10px">👤 <b>${esc(auth.user)}</b> <small>· organizador</small></p>
+    <div class="row">
+      <button class="btn ghost sm" data-a="changePass">Cambiar contraseña</button>
+      <button class="btn danger sm" data-a="logout">Cerrar sesión</button>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Organizadores</h2>
+    <p class="muted" style="font-size:14px">Pueden inscribir, sortear y anotar resultados. El público solo ve.</p>
+    <div id="orgList">${orgs ? orgs.users.map((u) => `<div class="org"><span>👤 ${esc(u)}${u === orgs.me ? ' <small>(usted)</small>' : ''}</span>
+      ${u === orgs.me ? '' : `<button class="btn danger sm" data-a="delOrg" data-u="${esc(u)}">Quitar</button>`}</div>`).join('') : '<p class="muted">Cargando…</p>'}</div>
+    <form id="orgForm" class="grid2" style="margin-top:8px" autocomplete="off">
+      <input id="o-user" placeholder="Nuevo usuario" autocapitalize="none" spellcheck="false" autocomplete="off">
+      <input id="o-pass" type="password" placeholder="Contraseña" autocomplete="new-password">
+      <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar organizador</button>
+    </form>
+  </div>` : ''}
   <div class="card">
     <h2>Inscripción</h2>
     <div class="grid2">
@@ -525,20 +673,12 @@ function viewAjustes() {
   <div class="card">
     <h2>Base de datos en línea</h2>
     <p class="muted" style="font-size:14px" id="sync-status">${esc(syncText())}</p>
-    ${sync.needPin ? `<label class="fl">PIN de organizador <small>(necesario para guardar cambios)</small>
-      <input type="password" inputmode="numeric" id="pin" placeholder="PIN" value="${esc(localStorage.getItem(PIN_KEY) || '')}"></label>` : ''}
-    ${sync.mode !== 'local' ? '<button class="btn ghost block sm" data-a="syncNow">🔄 Sincronizar ahora</button>' : ''}
+    ${online ? '<button class="btn ghost block sm" data-a="syncNow">🔄 Sincronizar ahora</button>' : ''}
   </div>
-  <div class="card">
-    <h2>Instalar en el teléfono</h2>
-    ${standalone ? '<p class="muted">✅ La app ya está instalada.</p>' : `
-      ${installEvt ? '<button class="btn block" data-a="install">📲 Instalar app</button>' : ''}
-      <p class="muted" style="font-size:14px"><b>Android (Chrome):</b> menú ⋮ → “Instalar aplicación” o “Agregar a pantalla principal”.<br>
-      <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>`}
-  </div>
+  ${installCard()}
   <div class="card">
     <h2>Respaldo de datos</h2>
-    <p class="muted" style="font-size:14px">Los datos se guardan en este dispositivo. Exporte un respaldo para pasarlo a otro teléfono o no perderlo.</p>
+    <p class="muted" style="font-size:14px">Descargue una copia de todo el torneo, o restaure una copia anterior.</p>
     <div class="row">
       <button class="btn ghost" data-a="export">⬇️ Exportar</button>
       <label class="btn ghost">⬆️ Importar<input type="file" accept="application/json,.json" id="importFile" hidden></label>
@@ -560,10 +700,16 @@ function renderModal() {
   const el = $('#modal');
   clearInterval(tick); tick = null;
   if (!modal) { el.hidden = true; document.body.style.overflow = ''; return; }
+  // si perdió el permiso (cerró sesión), no mostrar formularios de edición
+  if (!isAdmin() && (modal.type === 'team' || modal.type === 'schedule')) { modal = null; return renderModal(); }
   const sheet = $('#sheet');
   const scroll = sheet.scrollTop;
   if (modal.type === 'team') sheet.innerHTML = teamFormHTML(modal.id);
-  else if (modal.type === 'match') {
+  else if (modal.type === 'schedule') sheet.innerHTML = scheduleHTML();
+  else if (modal.type === 'teamView') {
+    if (!teamById(modal.id)) { modal = null; return renderModal(); }
+    sheet.innerHTML = teamViewHTML(modal.id);
+  } else if (modal.type === 'match') {
     const m = mById(modal.id);
     if (!m) { modal = null; return renderModal(); }
     sheet.innerHTML = matchHTML(m);
@@ -573,6 +719,110 @@ function renderModal() {
   el.hidden = false;
   document.body.style.overflow = 'hidden';
   sheet.scrollTop = scroll;
+}
+
+function teamViewHTML(id) {
+  const tm = teamById(id);
+  const r = teamRecord(id);
+  const ms = T().matches.filter((m) => m.home === id || m.away === id);
+  return `<div class="mh"><h2>${esc(tm.name)}</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb">
+    <div class="stats" style="margin-top:12px;grid-template-columns:repeat(4,minmax(0,1fr))">
+      <div class="stat"><b>${r.pj}</b><span>Jugados</span></div>
+      <div class="stat"><b class="g">${r.g}</b><span>Ganados</span></div>
+      <div class="stat"><b class="e">${r.e}</b><span>Empatados</span></div>
+      <div class="stat"><b class="p">${r.p}</b><span>Perdidos</span></div>
+    </div>
+    <p class="muted" style="margin:0 0 6px">Goles a favor ${r.gf} · en contra ${r.gc}</p>
+    <h3>Partidos</h3>
+    ${ms.length ? ms.map(matchCard).join('') : '<p class="muted">Aún no tiene partidos asignados.</p>'}
+    <h3>Integrantes</h3>
+    <ul class="cardlist">${tm.players.map((p) => `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}</span></li>`).join('')}</ul>
+  </div>`;
+}
+
+/* ---- Programar calendario ---- */
+function scheduleHTML() {
+  const c = T().config;
+  const s = Object.assign({ mode: 'dia', date: isoDate(new Date()), time: '08:00', fields: 1, gap: c.duration + 5, scope: 'sin' }, c.sched || {});
+  const opt = (v, title, desc) => `<label class="opt ${s.mode === v ? 'on' : ''}"><input type="radio" name="s-mode" value="${v}" ${s.mode === v ? 'checked' : ''}>
+    <div><b>${title}</b><span>${desc}</span></div></label>`;
+  return `<div class="mh"><h2>Programar calendario</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb">
+    <p class="muted" style="font-size:14px">Asigna fecha, hora y cancha automáticamente. Después puede ajustar cada partido por separado.</p>
+    <h3>¿Cómo se juega?</h3>
+    ${opt('dia', 'Todo en un día', 'Todos los partidos seguidos el mismo día')}
+    ${opt('diario', 'Una jornada por día', 'Jornada 1 hoy, jornada 2 mañana…')}
+    ${opt('semana', 'Una jornada por semana', 'Mismo día de la semana, cada 7 días')}
+    ${opt('mes', 'Una jornada por mes', 'Mismo día de cada mes')}
+    <div class="grid2">
+      <label class="fl">Fecha de inicio<input type="date" id="s-date" value="${s.date}"></label>
+      <label class="fl">Hora del primer partido<input type="time" id="s-time" value="${s.time}"></label>
+      <label class="fl">Canchas a la vez<select id="s-fields">${[1, 2, 3, 4].map((v) => `<option ${+s.fields === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+      <label class="fl">Minutos entre partidos<input type="number" inputmode="numeric" min="5" id="s-gap" value="${s.gap}"></label>
+    </div>
+    <label class="fl">Aplicar a<select id="s-scope">
+      <option value="sin" ${s.scope === 'sin' ? 'selected' : ''}>Solo partidos pendientes sin fecha</option>
+      <option value="pend" ${s.scope === 'pend' ? 'selected' : ''}>Todos los partidos pendientes (reprogramar)</option>
+    </select></label>
+    <small>“Minutos entre partidos” = duración del partido + descanso (por defecto ${c.duration} + 5).</small>
+  </div>
+  <div class="mf">
+    <button class="btn block" data-a="applySchedule">🗓️ Programar</button>
+    <button class="btn danger block sm" data-a="clearSchedule">Quitar fechas de los partidos pendientes</button>
+  </div>`;
+}
+
+function addDays(iso, n) { const d = new Date(iso + 'T12:00'); d.setDate(d.getDate() + n); return isoDate(d); }
+function addMonths(iso, n) {
+  const d = new Date(iso + 'T12:00');
+  const day = d.getDate();
+  d.setDate(1); d.setMonth(d.getMonth() + n);
+  d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+  return isoDate(d);
+}
+function addMinutes(hhmm, mins) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const t = h * 60 + m + mins;
+  return `${pad(Math.floor(t / 60) % 24)}:${pad(t % 60)}`;
+}
+
+function applySchedule() {
+  const t = T();
+  const mode = (document.querySelector('input[name="s-mode"]:checked') || {}).value || 'dia';
+  const s = {
+    mode, date: $('#s-date').value, time: $('#s-time').value || '08:00',
+    fields: Math.max(1, parseInt($('#s-fields').value, 10) || 1),
+    gap: Math.max(5, parseInt($('#s-gap').value, 10) || t.config.duration + 5),
+    scope: $('#s-scope').value,
+  };
+  if (!s.date) return toast('Elija la fecha de inicio');
+  const target = t.matches.filter((m) => m.status === 'pend' && (s.scope === 'pend' || !m.date));
+  if (!target.length) return toast('No hay partidos pendientes para programar');
+
+  // Agrupar en jornadas, en orden: fase 1 por jornada, luego cada ronda de la fase final
+  const jKey = (m) => (m.phase === 'ko' ? 1000 + m.round : m.round);
+  const keys = [...new Set(target.map(jKey))].sort((a, b) => a - b);
+  let slot = 0;
+  keys.forEach((k, j) => {
+    let day = s.date;
+    if (mode === 'dia') {
+      slot = Math.ceil(slot / s.fields) * s.fields; // cada jornada empieza en un turno nuevo
+    } else {
+      slot = 0;
+      day = mode === 'diario' ? addDays(s.date, j) : mode === 'semana' ? addDays(s.date, 7 * j) : addMonths(s.date, j);
+    }
+    for (const m of target.filter((x) => jKey(x) === k)) {
+      m.date = day;
+      m.time = addMinutes(s.time, Math.floor(slot / s.fields) * s.gap);
+      m.field = s.fields > 1 ? String((slot % s.fields) + 1) : '';
+      slot++;
+    }
+  });
+  t.config.sched = s;
+  S.view = 'cal';
+  save(); closeModal(); render();
+  toast(`🗓️ ${target.length} partidos programados`);
 }
 
 function teamFormHTML(id) {
@@ -671,7 +921,7 @@ function updateClock() {
   el.textContent = fmtClock(ms);
   const over = ms >= m.duration * 60000;
   el.classList.toggle('over', over);
-  if (over && m.runAt && !m.alerted) {
+  if (over && m.runAt && !m.alerted && isAdmin()) {
     m.alerted = true; save();
     if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 600]);
     toast(`⏰ Se cumplieron los ${m.duration} minutos`);
@@ -679,46 +929,61 @@ function updateClock() {
 }
 
 function matchHTML(m) {
-  const t = T();
+  const adm = isAdmin();
   const done = m.status === 'done';
   const ready = !!(m.home && m.away);
+  const edit = adm && !done && ready;      // puede anotar
   const isKO = m.phase === 'ko';
-  const title = isKO ? m.label : `${m.group ? 'Grupo ' + m.group + ' · ' : ''}Fecha ${m.round}`;
   const side = (id, src, s, val) => `<div>
     <div class="tn">${esc(id ? tname(id) : srcLabel(src))}</div>
-    <span class="big">${val}</span>
-    ${!done && ready ? `<div class="stepper"><button class="minus" data-a="goal" data-s="${s}" data-d="-1">−</button><button data-a="goal" data-s="${s}" data-d="1">+</button></div>` : ''}
+    <span class="big">${m.status === 'pend' && !adm ? '–' : val}</span>
+    ${edit ? `<div class="stepper"><button class="minus" data-a="goal" data-s="${s}" data-d="-1">−</button><button data-a="goal" data-s="${s}" data-d="1">+</button></div>` : ''}
   </div>`;
 
-  let h = `<div class="mh"><h2>${esc(title)}</h2><button class="x" data-a="close">✕</button></div><div class="mb">`;
+  let h = `<div class="mh"><h2>${esc(phaseLabel(m))}</h2><button class="x" data-a="close">✕</button></div><div class="mb">`;
   if (!ready) h += `<div class="note warn" style="margin-top:12px">Este partido se define cuando terminen los partidos anteriores.</div>`;
   h += `<div class="score">${side(m.home, m.srcH, 'h', m.hs)}<div class="vs">-</div>${side(m.away, m.srcA, 'a', m.as)}</div>`;
+  if (done) {
+    const w = winner(m);
+    h += `<p style="text-align:center;margin:0 0 6px;font-weight:700">${w ? `🏆 Ganó ${esc(tname(w))}${m.ph != null && m.hs === m.as ? ` (penales ${m.ph}-${m.pa})` : ''}` : '🤝 Empate'}</p>`;
+  }
 
-  if (!done) {
+  // Programación (fecha, hora, cancha)
+  if (adm) {
+    h += `<div class="grid3">
+      <label class="fl">Fecha<input type="date" id="m-date" value="${esc(m.date || '')}"></label>
+      <label class="fl">Hora<input type="time" id="m-time" value="${esc(m.time || '')}"></label>
+      <label class="fl">Cancha<input id="m-field" maxlength="12" placeholder="—" value="${esc(m.field || '')}"></label>
+    </div>`;
+  } else {
+    h += `<p class="muted" style="text-align:center;margin:4px 0 8px">${m.date ? '📅 ' + esc(dayLabel(m.date)) : 'Fecha por definir'}${m.time ? ' · 🕒 ' + esc(m.time) : ''}${m.field ? ' · Cancha ' + esc(m.field) : ''}</p>`;
+  }
+
+  if (!done && (adm || m.status === 'live')) {
     const running = !!m.runAt;
     h += `<div class="timer">
       <div><div class="clock" id="clock">00:00</div><small>${running ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar'}</small></div>
-      <div class="dur">Tiempo<input type="number" inputmode="numeric" min="1" id="m-dur" value="${m.duration}">min</div>
+      ${adm ? `<div class="dur">Tiempo<input type="number" inputmode="numeric" min="1" id="m-dur" value="${m.duration}">min</div>
       <div class="row" style="width:100%">
         ${running ? `<button class="btn ghost sm" data-a="pause">⏸ Pausar</button>`
         : `<button class="btn sm" data-a="start" ${ready ? '' : 'disabled'}>▶ ${m.elapsed ? 'Reanudar' : 'Iniciar'}</button>`}
         ${m.elapsed || running ? `<button class="btn ghost sm" data-a="resetClock">↺ Reiniciar reloj</button>` : ''}
-      </div></div>`;
-  } else {
-    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${m.duration} min${m.elapsed ? ` · reloj ${fmtClock(m.elapsed)}` : ''}</p>`;
+      </div>` : `<div class="dur">de ${m.duration} min</div>`}</div>`;
+  } else if (done) {
+    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${m.duration} min</p>`;
   }
 
-  if (isKO && ready && m.hs === m.as && (!done || m.ph != null)) {
+  if (isKO && ready && m.hs === m.as && (edit || m.ph != null)) {
     h += `<h3>Penales (empate)</h3><div class="pens">
-      <input type="number" inputmode="numeric" min="0" id="m-ph" value="${m.ph ?? ''}" ${done ? 'disabled' : ''} placeholder="0">
+      <input type="number" inputmode="numeric" min="0" id="m-ph" value="${m.ph ?? ''}" ${edit ? '' : 'disabled'} placeholder="0">
       <span>-</span>
-      <input type="number" inputmode="numeric" min="0" id="m-pa" value="${m.pa ?? ''}" ${done ? 'disabled' : ''} placeholder="0"></div>`;
+      <input type="number" inputmode="numeric" min="0" id="m-pa" value="${m.pa ?? ''}" ${edit ? '' : 'disabled'} placeholder="0"></div>`;
   }
 
   // Tarjetas
-  if (ready) {
+  if (ready && (adm || m.cards.length)) {
     h += `<h3>Tarjetas</h3>`;
-    if (!done) {
+    if (edit) {
       const selTeam = modal.cardTeam && [m.home, m.away].includes(modal.cardTeam) ? modal.cardTeam : m.home;
       const tm = teamById(selTeam);
       h += `<div class="cardform">
@@ -732,11 +997,11 @@ function matchHTML(m) {
     const list = [...m.cards].sort((a, b) => a.min - b.min);
     h += list.length ? `<ul class="cardlist">${list.map((cd) => `<li><span class="chip ${cd.type}"></span>
       <span class="grow"><b>${esc(cd.player)}</b> <small>${esc(tname(cd.team))}</small></span>
-      <small>${cd.min}'</small>${done ? '' : `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>`}</li>`).join('')}</ul>`
+      <small>${cd.min}'</small>${edit ? `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>` : ''}</li>`).join('')}</ul>`
       : `<p class="muted" style="font-size:14px">Sin tarjetas.</p>`;
   }
   h += `</div><div class="mf">`;
-  if (ready) {
+  if (adm && ready) {
     h += done
       ? `<button class="btn ghost block" data-a="reopen">✏️ Corregir resultado</button>`
       : `<button class="btn block" data-a="finish">✅ Finalizar partido</button>`;
@@ -788,14 +1053,63 @@ function saveSync() {
 }
 function schedulePush(ms = 400) { clearTimeout(sync.timer); sync.timer = setTimeout(push, ms); }
 
-async function apiCall(method, body, query = '') {
+async function apiCall(method, body, query = '', path = 'api/state') {
   const headers = { 'Content-Type': 'application/json' };
-  const pin = localStorage.getItem(PIN_KEY);
-  if (pin) headers['x-pin'] = pin;
-  const r = await fetch('api/state' + query, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
+  if (auth && auth.token) headers.Authorization = 'Bearer ' + auth.token;
+  const r = await fetch(path + query, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
   let j = null;
   try { j = await r.json(); } catch (e) { /* respuesta no JSON (sin API) */ }
   return { status: r.status, j };
+}
+const authCall = (body) => apiCall(body ? 'POST' : 'GET', body, '', 'api/auth');
+
+/* ---- Sesión de organizadores ---- */
+async function checkSetup() {
+  try {
+    const { status, j } = await authCall();
+    if (status === 200 && j) {
+      const was = sync.needSetup;
+      sync.needSetup = !!j.setup;
+      if (was !== sync.needSetup && !isAdmin() && S.tab === 'ajustes') requestRender();
+    }
+  } catch (e) { /* sin conexión */ }
+}
+
+async function doLogin() {
+  const user = $('#l-user').value.trim().toLowerCase();
+  const pass = $('#l-pass').value;
+  if (!user || !pass) return toast('Escriba usuario y contraseña');
+  const setup = sync.needSetup;
+  if (setup && pass !== $('#l-pass2').value) return toast('Las contraseñas no coinciden');
+  try {
+    const { status, j } = await authCall({ action: setup ? 'setup' : 'login', user, pass });
+    if (status === 409 && setup) { sync.needSetup = false; render(); return toast(j.error); }
+    if (status !== 200) return toast((j && j.error) || 'No se pudo ingresar');
+    setAuth({ user: j.user, token: j.token });
+    sync.needSetup = false;
+    // empezar desde lo que hay en línea para no subir datos viejos de este teléfono
+    sync.dirty = false; sync.rev = -1;
+    S.tab = 'equipos';
+    render();
+    toast(`👋 Bienvenido, ${j.user}`);
+    pull(true);
+  } catch (e) {
+    toast('Sin conexión. Intente de nuevo.');
+  }
+}
+
+async function loadOrgs() {
+  const { status, j } = await authCall({ action: 'list' });
+  if (status === 401) return sessionExpired();
+  if (status === 200) { orgs = j; if (S.tab === 'ajustes') requestRender(); }
+}
+
+function sessionExpired() {
+  setAuth(null); orgs = null;
+  sync.dirty = false; sync.rev = -1;
+  toast('La sesión terminó. Ingrese de nuevo.');
+  render();
+  pull(true);
 }
 
 /** Combina cambios locales (local vs base) sobre lo que hay en el servidor (remote). */
@@ -852,7 +1166,9 @@ function adopt(j) {
 }
 
 function setMode(m, touch = true) {
+  const wasAdmin = isAdmin();
   sync.mode = m;
+  if (wasAdmin !== isAdmin()) requestRender();
   if (m === 'online' && touch) sync.last = Date.now();
   const dot = $('#sync');
   if (dot) { dot.className = 'sync ' + m; dot.title = syncText(); }
@@ -876,14 +1192,13 @@ async function pull(full) {
     const { status, j } = await apiCall('GET', null, q);
     if (status === 404 || status === 501 || !j) return setMode('local');
     if (status !== 200) throw new Error(status);
-    if (j.pin !== undefined) sync.needPin = j.pin;
     setMode('online');
     if (j.same) { if (sync.dirty) schedulePush(0); return; }
     if (!j.data) {                                   // base vacía: subir lo de este teléfono
-      if (S.cats.M.teams.length + S.cats.F.teams.length > 0) { sync.dirty = true; sync.rev = j.rev; schedulePush(0); }
+      if (isAdmin() && S.cats.M.teams.length + S.cats.F.teams.length > 0) { sync.dirty = true; sync.rev = j.rev; schedulePush(0); }
       return;
     }
-    if (sync.dirty && sync.known) return schedulePush(0); // push combina si hay conflicto
+    if (sync.dirty && sync.known && isAdmin()) return schedulePush(0); // push combina si hay conflicto
     if (j.rev !== sync.rev || !sync.known) adopt(j);
   } catch (e) {
     setMode('offline');
@@ -891,7 +1206,7 @@ async function pull(full) {
 }
 
 async function push() {
-  if (sync.mode === 'local' || !sync.dirty || sync.pushing) return;
+  if (sync.mode === 'local' || !sync.dirty || sync.pushing || !isAdmin()) return;
   sync.pushing = true;
   setMode('saving');
   try {
@@ -909,11 +1224,8 @@ async function push() {
         }
         sync.rev = j ? j.rev : 0;
       } else if (status === 401) {
-        const pin = prompt('Esta base de datos tiene PIN de organizador.\nIngrese el PIN para guardar cambios:');
-        if (pin) { localStorage.setItem(PIN_KEY, pin.trim()); continue; }
-        sync.dirty = false; sync.rev = -1; sync.pushing = false;
-        toast('Sin PIN solo puede ver. Se recargaron los datos.');
-        return pull(true);
+        sync.pushing = false;
+        return sessionExpired();
       } else if (status === 404 || status === 501) {
         return setMode('local');
       } else {
@@ -932,6 +1244,8 @@ async function push() {
 function startSync() {
   if (location.protocol === 'file:') return setMode('local');
   pull(true);
+  checkSetup();
+  if (auth && S.tab === 'ajustes') loadOrgs();
   setInterval(() => {
     if (document.visibilityState !== 'visible') return;
     if (sync.pendingRender && !isBusy()) render();
@@ -945,8 +1259,46 @@ function startSync() {
 /* ---------------- Eventos ---------------- */
 const actions = {
   cat: (d) => { S.cat = d.c; save(); render(); window.scrollTo(0, 0); },
-  tab: (d) => { S.tab = d.t; save(); render(); window.scrollTo(0, 0); },
+  tab: (d) => {
+    S.tab = d.t; save(); render(); window.scrollTo(0, 0);
+    if (d.t === 'ajustes' && auth && sync.mode !== 'local') loadOrgs();
+    if (d.t === 'ajustes' && !isAdmin()) checkSetup();
+  },
   close: () => closeModal(),
+  view: (d) => { S.view = d.v; save(); render(); },
+  viewTeam: (d) => openModal('teamView', d.id),
+  openSchedule: () => openModal('schedule', null),
+  applySchedule: () => applySchedule(),
+  clearSchedule: () => {
+    const ms = T().matches.filter((m) => m.status === 'pend' && m.date);
+    if (!ms.length) return toast('No hay partidos pendientes con fecha');
+    if (!confirm('¿Quitar fecha, hora y cancha de ' + ms.length + ' partidos pendientes?')) return;
+    ms.forEach((m) => { m.date = ''; m.time = ''; m.field = ''; });
+    save(); closeModal(); render();
+  },
+  logout: () => {
+    if (sync.dirty && !confirm('Hay cambios que aún no se guardaron en línea. ¿Cerrar sesión de todos modos?')) return;
+    setAuth(null); orgs = null;
+    sync.dirty = false; sync.rev = -1;
+    S.tab = 'partidos'; render(); pull(true);
+    toast('Sesión cerrada');
+  },
+  changePass: async () => {
+    const p1 = prompt('Nueva contraseña (mínimo 6 caracteres):');
+    if (!p1) return;
+    if (p1.length < 6) return toast('Mínimo 6 caracteres');
+    if (prompt('Repita la nueva contraseña:') !== p1) return toast('Las contraseñas no coinciden');
+    const { status, j } = await authCall({ action: 'password', pass: p1 });
+    if (status === 401) return sessionExpired();
+    toast(status === 200 ? '✅ Contraseña cambiada' : (j && j.error) || 'No se pudo cambiar');
+  },
+  delOrg: async (d) => {
+    if (!confirm('¿Quitar al organizador "' + d.u + '"? Ya no podrá editar.')) return;
+    const { status, j } = await authCall({ action: 'remove', user: d.u });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast((j && j.error) || 'No se pudo quitar');
+    orgs = j; render(); toast('Organizador quitado');
+  },
   newTeam: () => openModal('team', null),
   editTeam: (d) => openModal('team', d.id),
   saveTeam: () => saveTeam(),
@@ -1036,12 +1388,30 @@ const actions = {
   },
 };
 
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install']);
+
+document.addEventListener('submit', async (e) => {
+  if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
+  if (e.target.id === 'orgForm') {
+    e.preventDefault();
+    const user = $('#o-user').value.trim().toLowerCase(), pass = $('#o-pass').value;
+    if (!user || !pass) return toast('Escriba usuario y contraseña');
+    const { status, j } = await authCall({ action: 'add', user, pass });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast((j && j.error) || 'No se pudo agregar');
+    orgs = j; render(); toast('✅ Organizador ' + user + ' agregado');
+  }
+});
+
 document.addEventListener('click', (e) => {
   if (e.target.id === 'modal') return closeModal();
   const el = e.target.closest('[data-a]');
   if (!el || el.disabled) return;
   const fn = actions[el.dataset.a];
-  if (fn) { e.preventDefault(); fn(el.dataset, el); }
+  if (!fn) return;
+  e.preventDefault();
+  if (!isAdmin() && !PUBLIC_ACTIONS.has(el.dataset.a)) return toast('Ingrese como organizador para editar');
+  fn(el.dataset, el);
 });
 
 document.addEventListener('input', (e) => {
@@ -1051,6 +1421,7 @@ document.addEventListener('input', (e) => {
 document.addEventListener('change', (e) => {
   const el = e.target;
   if (el.dataset.cfg) {
+    if (!isAdmin()) return;
     const c = T().config;
     const k = el.dataset.cfg;
     let v = num(el.value);
@@ -1073,9 +1444,14 @@ document.addEventListener('change', (e) => {
     return;
   }
   if (el.id === 'c-team' && modal) { modal.cardTeam = el.value; renderModal(); return; }
-  if (el.id === 'pin') {
-    localStorage.setItem(PIN_KEY, el.value.trim());
-    toast('PIN guardado'); if (sync.dirty) push();
+  if (['m-date', 'm-time', 'm-field'].includes(el.id)) {
+    const m = curMatch(); if (!m || !isAdmin()) return;
+    m[{ 'm-date': 'date', 'm-time': 'time', 'm-field': 'field' }[el.id]] = el.value.trim();
+    save(); toast('Programación guardada');
+    return;
+  }
+  if (el.name === 's-mode') {
+    document.querySelectorAll('input[name="s-mode"]').forEach((r) => r.closest('.opt').classList.toggle('on', r.checked));
     return;
   }
   if (el.id === 'importFile' && el.files[0]) {

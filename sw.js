@@ -1,5 +1,5 @@
 // Service worker: permite usar la app sin internet.
-const CACHE = 'torneo-v2';
+const CACHE = 'torneo-v3';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
