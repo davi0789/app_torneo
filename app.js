@@ -79,7 +79,7 @@ function load() {
     const d = normalizeData(JSON.parse(localStorage.getItem(KEY)));
     if (d) { fixSelection(d); return d; }
   } catch (e) { /* sin datos */ }
-  const d = { torneos: { t1: newTorneo('Mi Torneo') }, tab: 'partidos', view: 'cal' };
+  const d = { torneos: { t1: newTorneo('Mi Torneo') }, tab: 'inicio', view: 'cal' };
   d.torneos.t1.createdAt = 0;
   fixSelection(d);
   return d;
@@ -383,7 +383,9 @@ function genFinal() {
 }
 
 /* ---------------- Vistas ---------------- */
-const views = { equipos: viewEquipos, partidos: viewPartidos, tabla: viewTabla, ajustes: viewAjustes };
+const views = { inicio: viewInicio, equipos: viewEquipos, partidos: viewPartidos, tabla: viewTabla, ajustes: viewAjustes };
+const ICON_SETTINGS = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>';
+const ICON_KEY = '<svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3M14 9l2 2"/></svg>';
 
 function render() {
   sync.pendingRender = false;
@@ -391,6 +393,13 @@ function render() {
   fixSelection(S);
   const brand = $('#brand-name');
   if (brand) brand.textContent = TOR().name;
+  const sub = $('#brand-sub');
+  if (sub) {
+    const nT = Object.values(CATS_()).reduce((a, t) => a + t.teams.length, 0);
+    sub.textContent = Object.keys(S.torneos).length > 1 ? 'Toca para cambiar de torneo' : `${Object.keys(CATS_()).length} categorías · ${nT} equipos`;
+  }
+  const nb = document.querySelector('.nav-brand span');
+  if (nb) nb.textContent = TOR().name;
   document.body.dataset.pal = String((T().color || 0) % PALETTES);
   document.body.classList.toggle('public', !adm);
   const cats = $('#cats');
@@ -398,10 +407,10 @@ function render() {
   const onBtn = cats.querySelector('.on');
   if (onBtn) cats.scrollLeft = onBtn.offsetLeft - cats.clientWidth / 2 + onBtn.clientWidth / 2;
   const t4 = document.querySelector('#tabs [data-t="ajustes"]');
-  if (!showAccess() && S.tab === 'ajustes') S.tab = 'partidos';
+  if (!showAccess() && S.tab === 'ajustes') S.tab = 'inicio';
   if (t4) {
     t4.hidden = !showAccess();
-    t4.innerHTML = adm ? '<span>⚙️</span>Ajustes' : '<span>🔑</span>Ingresar';
+    t4.innerHTML = adm ? ICON_SETTINGS + 'Ajustes' : ICON_KEY + 'Ingresar';
   }
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.t === S.tab));
   $('#view').innerHTML = (views[S.tab] || viewEquipos)();
@@ -438,19 +447,186 @@ function teamRecord(id) {
 }
 const recordHTML = (r) => `<span class="rec"><b class="g">${r.g}G</b><b class="e">${r.e}E</b><b class="p">${r.p}P</b></span>`;
 
+/* ---------------- Inicio (panel) ---------------- */
+const whenKey = (m, empty = '9999-99-99') => (m.date || empty) + ' ' + (m.time || '99:99');
+const bigCrest = (id, size = 60) => {
+  const tm = teamById(id);
+  if (!tm) return `<div class="avatar" style="width:${size * 0.8}px;height:${size * 0.8}px;border-radius:50%">?</div>`;
+  return tm.crest ? crestHTML(tm.crest, tm.name, size) : teamBadge(tm, Math.round(size * 0.8));
+};
+
+function phaseText() {
+  const t = T();
+  if (t.stage === 'inscripcion') return 'Inscripciones abiertas';
+  const pod = podium();
+  if (pod && pod[0]) return 'Finalizado';
+  const ko = t.matches.filter((m) => m.phase === 'ko' && m.status !== 'done');
+  if (t.stage === 'final' && ko.length) return ko[0].label.replace(/ \d+$/, '');
+  return t.config.format === 'grupos' ? 'Fase de grupos' : 'Fase regular';
+}
+
+function whenText(m) {
+  if (!m.date) return 'Fecha por definir';
+  return `${dayLabel(m.date)}${m.time ? ' · ' + m.time : ''}`;
+}
+
+function featureMatch(m, title) {
+  const live = m.status === 'live', done = m.status === 'done';
+  const side = (id, src) => `<div class="vs-team"><div class="crest-slot">${id ? bigCrest(id, 64) : '<div class="avatar">?</div>'}</div><b>${esc(id ? tname(id) : srcLabel(src))}</b></div>`;
+  const iso = m.date ? `${m.date}T${m.time || '00:00'}` : '';
+  return `<button class="feature ${live ? 'live' : ''}" data-a="openMatch" data-id="${m.id}">
+    <div class="feature-meta">${live ? '<span class="badge b-live"><i class="pulse"></i>EN VIVO</span>' : `<b>${esc(title)}</b>`}<span>${esc(phaseLabel(m))}</span></div>
+    <div class="vs-row">${side(m.home, m.srcH)}
+      ${live || done ? `<div class="vs-score">${m.hs} - ${m.as}</div>` : '<div class="vs-score vs">VS</div>'}
+      ${side(m.away, m.srcA)}</div>
+    <div class="feature-meta">
+      ${live ? `<span class="live-clock" data-clock="${m.id}"></span><span>de ${m.duration} min</span>` : `<span>📅 ${esc(whenText(m))}</span>`}
+      ${m.field ? `<span>📍 Cancha ${esc(m.field)}</span>` : ''}
+    </div>
+    ${!live && iso ? `<span class="countdown" data-countdown="${iso}"></span>` : ''}
+  </button>`;
+}
+
+function miniMatch(m) {
+  const tm = (id, src) => `<div class="tm">${id ? `<span class="mcrest">${bigCrest(id, 22)}</span>` : ''}<span>${esc(id ? tname(id) : srcLabel(src))}</span></div>`;
+  return `<button class="mini" data-a="openMatch" data-id="${m.id}">
+    <div class="when">${m.date ? esc(shortDate(m.date)) : 'Por definir'}${m.time ? ' · ' + m.time : ''}</div>
+    ${tm(m.home, m.srcH)}${tm(m.away, m.srcA)}
+    <div class="ph">${esc(phaseLabel(m))}${m.field ? ' · Cancha ' + esc(m.field) : ''}</div>
+  </button>`;
+}
+
+function resultRow(m) {
+  const w = winner(m);
+  return `<div class="res" data-a="openMatch" data-id="${m.id}" role="button">
+    <div class="t r ${w === m.home ? 'w' : ''}"><span>${esc(tname(m.home))}</span>${miniCrest(m.home)}</div>
+    <div class="s">${m.hs} - ${m.as}${m.ph != null && m.hs === m.as ? `<small> (${m.ph}-${m.pa})</small>` : ''}</div>
+    <div class="t ${w === m.away ? 'w' : ''}">${miniCrest(m.away)}<span>${esc(tname(m.away))}</span></div>
+  </div>`;
+}
+
+function miniStandings() {
+  const t = T(), c = t.config;
+  if (t.stage === 'inscripcion' || c.format === 'elim' || !t.groups.length) return '';
+  const blocks = t.groups.map((g) => {
+    const rows = standings(g.teams, c.format === 'liga' ? 'liga' : 'grupo', g.name).slice(0, c.format === 'liga' ? 6 : 4);
+    return `${g.name ? `<div class="day" style="margin:14px 14px 6px">Grupo ${g.name}</div>` : ''}
+      <table><tr><th>#</th><th class="tn">Equipo</th><th>PJ</th><th>DG</th><th>Pts</th></tr>
+      ${rows.map((r, i) => `<tr class="${i < (c.format === 'liga' ? (c.ligaFinal || c.podium) : c.perGroup) ? 'q' : ''}"><td>${i + 1}</td><td class="tn">${miniCrest(r.id)}${esc(tname(r.id))}</td><td>${r.pj}</td><td>${r.gf - r.gc}</td><td class="pts">${r.pts}</td></tr>`).join('')}</table>`;
+  }).join('');
+  return `<div class="sec-head"><h2>📊 Posiciones</h2><button class="link" data-a="tab" data-t="tabla">Ver todo →</button></div>
+    <div class="panel">${blocks}</div>`;
+}
+
+function teamsGrid(limit) {
+  const teams = T().teams;
+  if (!teams.length) return '';
+  const list = limit ? teams.slice(0, limit) : teams;
+  return `<div class="team-grid">${list.map((tm) => `<button class="team-card" data-a="viewTeam" data-id="${tm.id}">
+      ${tm.crest ? crestHTML(tm.crest, tm.name, 56) : teamBadge(tm, 48)}
+      <b>${esc(tm.name)}</b>${recordHTML(teamRecord(tm.id))}</button>`).join('')}</div>`;
+}
+
+function viewInicio() {
+  const t = T(), tor = TOR(), adm = isAdmin();
+  const all = t.matches;
+  const done = all.filter((m) => m.status === 'done');
+  const live = all.filter((m) => m.status === 'live');
+  const goals = done.concat(live).reduce((a, m) => a + m.hs + m.as, 0);
+  const cards = all.reduce((a, m) => a + m.cards.length, 0);
+  const pct = all.length ? Math.round((done.length / all.length) * 100) : 0;
+  const pod = podium();
+
+  let h = `<section class="hero">
+    <div class="hero-chips"><span class="hero-chip solid">${esc(catName(S.cat))}</span><span class="hero-chip">${esc(phaseText())}</span></div>
+    <h1>${esc(tor.name)}</h1>
+    <p>${t.teams.length} equipos · ${TC().starters} titulares + ${TC().subs} suplentes</p>
+    <div class="hero-stats">
+      <div><b>${t.teams.length}</b><span>Equipos</span></div>
+      <div><b>${done.length}<small style="color:inherit;opacity:.7;font-size:13px;display:inline">/${all.length}</small></b><span>Jugados</span></div>
+      <div><b>${goals}</b><span>Goles</span></div>
+      <div><b>${cards}</b><span>Tarjetas</span></div>
+    </div>
+    ${all.length ? `<div class="progress"><span style="width:${pct}%"></span></div><small>${pct}% del torneo completado</small>` : ''}
+  </section>`;
+
+  // Campeón
+  if (pod && pod[0]) {
+    const medal = ['🥈', '🥉'];
+    h += `<section class="champ">
+      <div style="font-size:13px;font-weight:800;letter-spacing:.08em">🏆 CAMPEÓN</div>
+      <div class="crest-slot">${bigCrest(pod[0], 80)}</div>
+      <h2>${esc(tname(pod[0]))}</h2>
+      <div class="places">${pod.slice(1).map((id, i) => (id ? `<span>${medal[i]} ${esc(tname(id))}</span>` : '')).join('')}</div>
+    </section>`;
+  }
+
+  // Inscripciones (antes del sorteo)
+  if (t.stage === 'inscripcion') {
+    h += adm
+      ? `<div class="cta-grid"><button class="btn" data-a="newTeam">＋ Inscribir equipo</button><button class="btn ghost" data-a="tab" data-t="partidos">🎲 Ir al sorteo</button></div>`
+      : '';
+    h += `<div class="sec-head"><h2>🛡️ Equipos inscritos</h2><span class="muted" style="font-size:14px">${t.teams.length}</span></div>`;
+    h += t.teams.length ? teamsGrid() : `<div class="empty"><span class="big-ic">📝</span>Aún no hay equipos inscritos en ${esc(catName(S.cat))}.</div>`;
+    return h;
+  }
+
+  const upcoming = all.filter((m) => m.status === 'pend').sort((a, b) => whenKey(a).localeCompare(whenKey(b)));
+  const recent = done.slice().sort((a, b) => whenKey(b, '0000').localeCompare(whenKey(a, '0000'))).slice(0, 5);
+
+  let left = '';
+  if (live.length) {
+    left += `<div class="sec-head"><h2><i class="pulse"></i> En vivo</h2></div>`;
+    left += live.map((m) => featureMatch(m, 'En vivo')).join('');
+  }
+  if (upcoming.length) {
+    left += `<div class="sec-head"><h2>⏭️ Próximo partido</h2><button class="link" data-a="tab" data-t="partidos">Calendario →</button></div>`;
+    left += featureMatch(upcoming[0], 'Próximo');
+    if (upcoming.length > 1) {
+      left += `<div class="sec-head"><h2>📅 Siguientes</h2><span class="muted" style="font-size:13px">${upcoming.length - 1} partidos</span></div>
+        <div class="hscroll">${upcoming.slice(1, 12).map(miniMatch).join('')}</div>`;
+    }
+  }
+  if (recent.length) {
+    left += `<div class="sec-head"><h2>✅ Últimos resultados</h2><button class="link" data-a="tab" data-t="partidos">Ver todos →</button></div>
+      <div class="panel">${recent.map(resultRow).join('')}</div>`;
+  }
+  if (!left) left = `<div class="empty"><span class="big-ic">⚽</span>Pronto se publicarán los partidos.</div>`;
+
+  let right = miniStandings();
+  right += `<div class="sec-head"><h2>🛡️ Equipos</h2><button class="link" data-a="tab" data-t="equipos">Ver todos →</button></div>${teamsGrid(8)}`;
+
+  h += `<div class="home-grid"><div>${left}</div><div>${right}</div></div>`;
+  return h;
+}
+
+/* Reloj de partidos en vivo y cuentas regresivas (se actualizan cada segundo) */
+function tickLive() {
+  document.querySelectorAll('[data-clock]').forEach((el) => {
+    const m = mById(el.dataset.clock);
+    if (m) el.textContent = '⏱ ' + fmtClock(elapsedMs(m));
+  });
+  document.querySelectorAll('[data-cmin]').forEach((el) => {
+    const m = mById(el.dataset.cmin);
+    if (m) el.textContent = Math.min(m.duration, Math.floor(elapsedMs(m) / 60000) + 1) + "'";
+  });
+  document.querySelectorAll('[data-countdown]').forEach((el) => {
+    const diff = new Date(el.dataset.countdown).getTime() - Date.now();
+    if (isNaN(diff)) return;
+    if (diff <= 0) { el.textContent = diff > -3 * 3600e3 ? '⏰ Por comenzar' : '📌 Pendiente de resultado'; return; }
+    const d = Math.floor(diff / 864e5), h = Math.floor((diff % 864e5) / 36e5), mi = Math.floor((diff % 36e5) / 6e4), s = Math.floor((diff % 6e4) / 1000);
+    el.textContent = '⏳ Comienza en ' + (d ? `${d} d ${h} h` : h ? `${h} h ${pad(mi)} min` : `${mi} min ${pad(s)} s`);
+  });
+}
+setInterval(tickLive, 1000);
+
 function viewEquipos() {
   const t = T(), c = t.config;
   if (!isAdmin()) {
-    let h = `<h1>Equipos ${catName(S.cat)}</h1>`;
-    if (!t.teams.length) return h + `<div class="empty">Aún no hay equipos inscritos.</div>`;
-    h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos</p>`;
-    for (const tm of t.teams) {
-      h += `<button class="list-item" data-a="viewTeam" data-id="${tm.id}">
-        ${teamBadge(tm, 40)}
-        <div class="grow"><div class="t">${esc(tm.name)}</div><small>${tm.players.length} integrantes</small></div>
-        ${recordHTML(teamRecord(tm.id))}</button>`;
-    }
-    return h;
+    let h = `<h1>Equipos ${esc(catName(S.cat))}</h1>`;
+    if (!t.teams.length) return h + `<div class="empty"><span class="big-ic">🛡️</span>Aún no hay equipos inscritos.</div>`;
+    h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos. Toca un equipo para ver su plantel y partidos.</p>`;
+    return h + teamsGrid();
   }
   const paid = t.teams.reduce((a, x) => a + num(x.paid), 0);
   const due = t.teams.reduce((a, x) => a + Math.max(0, num(c.fee) - num(x.paid)), 0);
@@ -609,7 +785,7 @@ function matchCard(m) {
     ? `<div class="${cls} ${done && w === id ? 'win' : ''}">${cls === 'a' ? miniCrest(id) : ''}<span>${esc(tname(id))}</span>${cls === 'h' ? miniCrest(id) : ''}</div>`
     : `<div class="${cls} tbd">${esc(srcLabel(src))}</div>`;
   const status = done ? (w ? '<span class="badge b-ok">Final</span>' : '<span class="badge b-ok">Empate</span>')
-    : m.status === 'live' ? '<span class="badge b-live">En juego</span>'
+    : m.status === 'live' ? `<span class="badge b-live"><i class="pulse"></i>EN VIVO <span data-cmin="${m.id}"></span></span>`
       : '<span class="badge b-pend">Pendiente</span>';
   const pens = done && m.ph != null && m.hs === m.as ? `<small>pen ${m.ph}-${m.pa}</small>` : '';
   const yc = m.cards.filter((x) => x.type === 'Y').length, rc = m.cards.filter((x) => x.type === 'R').length;
@@ -1263,7 +1439,7 @@ async function doLogin() {
     sync.needSetup = false;
     // empezar desde lo que hay en línea para no subir datos viejos de este teléfono
     sync.dirty = false; sync.rev = -1;
-    S.tab = 'equipos';
+    S.tab = 'inicio';
     render();
     toast(`👋 Bienvenido, ${j.user}`);
     pull(true);
@@ -1482,7 +1658,7 @@ const actions = {
     if (sync.dirty && !confirm('Hay cambios que aún no se guardaron en línea. ¿Cerrar sesión de todos modos?')) return;
     setAuth(null); orgs = null;
     sync.dirty = false; sync.rev = -1;
-    S.tab = ADMIN_URL ? 'ajustes' : 'partidos'; render(); pull(true);
+    S.tab = ADMIN_URL ? 'ajustes' : 'inicio'; render(); pull(true);
     toast('Sesión cerrada');
   },
   changePass: async () => {
@@ -1625,6 +1801,19 @@ const actions = {
     save(); render(); toast('Categoría eliminada');
   },
   syncInfo: () => toast(syncText()),
+  theme: () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('torneo-theme', next); } catch (e) { /* nada */ }
+  },
+  share: async () => {
+    const url = location.origin + '/';
+    const text = TOR().name + ' · resultados, calendario y tabla en vivo';
+    try {
+      if (navigator.share) await navigator.share({ title: TOR().name, text, url });
+      else { await navigator.clipboard.writeText(url); toast('🔗 Enlace copiado: ' + url); }
+    } catch (e) { /* cancelado */ }
+  },
   syncNow: () => { if (sync.dirty) push(); else pull(true); },
   install: async () => {
     if (!installEvt) return;
@@ -1634,7 +1823,7 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo']);
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
