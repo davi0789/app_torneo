@@ -3,7 +3,9 @@
    Torneo de Fútbol — app local (PWA). Datos en localStorage.
    ========================================================= */
 const KEY = 'torneo-futbol-v1';
-const CATS = { M: 'Masculino', F: 'Femenino' };
+const PALETTES = 6; // colores disponibles para categorías
+const catName = (k) => (S.cats[k] && S.cats[k].name) || 'Categoría';
+const totalTeams = (d) => Object.values(d.cats).reduce((a, t) => a + ((t && t.teams) || []).length, 0);
 
 const $ = (s) => document.querySelector(s);
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
@@ -13,8 +15,9 @@ const money = (n) => '$' + (Number(n) || 0).toLocaleString('es', { maximumFracti
 const shuffle = (arr) => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const num = (v, d = 0) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
 
-function newTournament() {
+function newTournament(name = '', color = 0) {
   return {
+    name, color,
     config: {
       minPlayers: 8, maxPlayers: 10, fee: 0, duration: 20,
       format: 'liga',      // liga | grupos | elim
@@ -29,12 +32,24 @@ function newTournament() {
   };
 }
 
+/** Valida los datos y completa nombre/color de categorías antiguas. */
+function normalizeData(d) {
+  if (!d || !d.cats || typeof d.cats !== 'object') return null;
+  const defaults = { M: ['Masculino', 0], F: ['Femenino', 1] };
+  Object.keys(d.cats).forEach((k, i) => {
+    const t = d.cats[k];
+    if (!t || !Array.isArray(t.teams) || !Array.isArray(t.matches)) { delete d.cats[k]; return; }
+    if (!t.name) t.name = defaults[k] ? defaults[k][0] : 'Categoría ' + (i + 1);
+    if (t.color == null) t.color = defaults[k] ? defaults[k][1] : i % PALETTES;
+  });
+  return Object.keys(d.cats).length ? d : null;
+}
 function load() {
   try {
-    const d = JSON.parse(localStorage.getItem(KEY));
-    if (d && d.cats && d.cats.M && d.cats.F) return d;
+    const d = normalizeData(JSON.parse(localStorage.getItem(KEY)));
+    if (d) { if (!d.cats[d.cat]) d.cat = Object.keys(d.cats)[0]; return d; }
   } catch (e) { /* sin datos */ }
-  return { cats: { M: newTournament(), F: newTournament() }, cat: 'M', tab: 'partidos', view: 'cal' };
+  return { cats: { M: newTournament('Masculino', 0), F: newTournament('Femenino', 1) }, cat: 'M', tab: 'partidos', view: 'cal' };
 }
 let S = load();
 
@@ -95,7 +110,7 @@ function playerIndex(exceptTeamId) {
   for (const k of Object.keys(S.cats)) {
     for (const tm of S.cats[k].teams) {
       if (tm.id === exceptTeamId) continue;
-      for (const p of tm.players) map.set(norm(p.name), `${tm.name} (${CATS[k]})`);
+      for (const p of tm.players) map.set(norm(p.name), `${tm.name} (${catName(k)})`);
     }
   }
   return map;
@@ -281,7 +296,7 @@ function doDraw() {
   if (short.length) return toast(`Faltan integrantes en: ${short.map((x) => x.name).join(', ')}`);
   if (c.format === 'grupos' && n < 4) return toast('Para grupos se necesitan al menos 4 equipos');
   if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
-  if (!confirm(`¿Realizar el sorteo de ${n} equipos (${CATS[S.cat]})?`)) return;
+  if (!confirm(`¿Realizar el sorteo de ${n} equipos (${catName(S.cat)})?`)) return;
 
   const ids = shuffle(t.teams.map((x) => x.id));
   t.matches = []; t.groups = [];
@@ -330,9 +345,13 @@ const views = { equipos: viewEquipos, partidos: viewPartidos, tabla: viewTabla, 
 function render() {
   sync.pendingRender = false;
   const adm = isAdmin();
-  document.body.dataset.cat = S.cat;
+  if (!S.cats[S.cat]) S.cat = Object.keys(S.cats)[0];
+  document.body.dataset.pal = String((T().color || 0) % PALETTES);
   document.body.classList.toggle('public', !adm);
-  document.querySelectorAll('#cats button').forEach((b) => b.classList.toggle('on', b.dataset.c === S.cat));
+  const cats = $('#cats');
+  cats.innerHTML = Object.keys(S.cats).map((k) => `<button data-a="cat" data-c="${k}" class="${k === S.cat ? 'on' : ''}">${esc(catName(k))}</button>`).join('');
+  const onBtn = cats.querySelector('.on');
+  if (onBtn) cats.scrollLeft = onBtn.offsetLeft - cats.clientWidth / 2 + onBtn.clientWidth / 2;
   const t4 = document.querySelector('#tabs [data-t="ajustes"]');
   if (!showAccess() && S.tab === 'ajustes') S.tab = 'partidos';
   if (t4) {
@@ -377,7 +396,7 @@ const recordHTML = (r) => `<span class="rec"><b class="g">${r.g}G</b><b class="e
 function viewEquipos() {
   const t = T(), c = t.config;
   if (!isAdmin()) {
-    let h = `<h1>Equipos ${CATS[S.cat]}</h1>`;
+    let h = `<h1>Equipos ${catName(S.cat)}</h1>`;
     if (!t.teams.length) return h + `<div class="empty">Aún no hay equipos inscritos.</div>`;
     h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos</p>`;
     for (const tm of t.teams) {
@@ -390,7 +409,7 @@ function viewEquipos() {
   }
   const paid = t.teams.reduce((a, x) => a + num(x.paid), 0);
   const due = t.teams.reduce((a, x) => a + Math.max(0, num(c.fee) - num(x.paid)), 0);
-  let h = `<h1>Equipos ${CATS[S.cat]}</h1>
+  let h = `<h1>Equipos ${catName(S.cat)}</h1>
   <div class="stats">
     <div class="stat"><b>${t.teams.length}</b><span>Equipos</span></div>
     <div class="stat"><b>${money(paid)}</b><span>Recaudado</span></div>
@@ -425,7 +444,7 @@ function optRadio(name, value, cur, title, desc) {
 
 function drawSetupHTML() {
   const t = T(), c = t.config, n = t.teams.length;
-  let h = `<h1>Sorteo ${CATS[S.cat]}</h1>
+  let h = `<h1>Sorteo ${catName(S.cat)}</h1>
     <p class="muted">${n} equipo(s) inscritos. Configure el formato y realice el sorteo.</p>
     <h3>Formato</h3>
     ${optRadio('format', 'liga', c.format, 'Todos contra todos', 'Todos se enfrentan una vez. Tabla por puntos.')}
@@ -505,13 +524,13 @@ function viewPartidos() {
   const t = T(), c = t.config, adm = isAdmin();
   if (t.stage === 'inscripcion') {
     if (adm) return drawSetupHTML();
-    return `<h1>Partidos ${CATS[S.cat]}</h1><div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
+    return `<h1>Partidos ${catName(S.cat)}</h1><div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
   }
   const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa' }[c.format];
   const mode = S.view === 'fase' ? 'fase' : 'cal';
   const all = t.matches;
   const done = all.filter((m) => m.status === 'done').length;
-  let h = `<h1>Partidos ${CATS[S.cat]}</h1>
+  let h = `<h1>Partidos ${catName(S.cat)}</h1>
     <p class="muted">${fmt} · ${done}/${all.length} jugados${adm ? ' · toque un partido para jugarlo' : ''}</p>
     <div class="seg2">
       <button data-a="view" data-v="cal" class="${mode === 'cal' ? 'on' : ''}">📅 Calendario</button>
@@ -581,8 +600,8 @@ function tableHTML(rows, qualify) {
 
 function viewTabla() {
   const t = T(), c = t.config;
-  if (t.stage === 'inscripcion') return `<h1>Tabla ${CATS[S.cat]}</h1><div class="empty">Aún no se ha realizado el sorteo.</div>`;
-  let h = `<h1>Tabla ${CATS[S.cat]}</h1>`;
+  if (t.stage === 'inscripcion') return `<h1>Tabla ${catName(S.cat)}</h1><div class="empty">Aún no se ha realizado el sorteo.</div>`;
+  let h = `<h1>Tabla ${catName(S.cat)}</h1>`;
   const pod = podium();
   if (pod) h += podiumHTML(pod);
 
@@ -641,11 +660,31 @@ function loginHTML() {
   ${installCard()}`;
 }
 
+function categoriesCard() {
+  const keys = Object.keys(S.cats);
+  return `<div class="card">
+    <h2>Categorías</h2>
+    <p class="muted" style="font-size:14px">Cada categoría tiene sus propios equipos, sorteo, partidos y tabla. Ejemplo: Infantil, Juvenil, Libre, Veteranos.</p>
+    ${keys.map((k) => { const t = S.cats[k]; return `<div class="org">
+      <span class="grow"><span class="dot" data-pal="${(t.color || 0) % PALETTES}"></span> <b>${esc(t.name)}</b> <small>· ${t.teams.length} equipos</small></span>
+      <span class="row" style="flex-wrap:nowrap;flex:none">
+        <button class="btn ghost sm" data-a="colorCat" data-c="${k}" aria-label="Cambiar color">🎨</button>
+        <button class="btn ghost sm" data-a="renameCat" data-c="${k}" aria-label="Renombrar">✏️</button>
+        ${keys.length > 1 ? `<button class="btn danger sm" data-a="delCat" data-c="${k}" aria-label="Eliminar">🗑️</button>` : ''}
+      </span></div>`; }).join('')}
+    <form id="catForm" class="row" style="margin-top:10px;flex-wrap:nowrap" autocomplete="off">
+      <input id="cat-name" maxlength="24" placeholder="Nueva categoría, ej: Veteranos">
+      <button class="btn sm" type="submit" style="flex:none">＋ Agregar</button>
+    </form>
+  </div>`;
+}
+const catNameTaken = (n, except) => Object.entries(S.cats).some(([k, t]) => k !== except && norm(t.name) === norm(n));
+
 function viewAjustes() {
   if (!isAdmin()) return loginHTML();
   const c = T().config;
   const online = sync.mode !== 'local';
-  return `<h1>Ajustes ${CATS[S.cat]}</h1>
+  return `<h1>Ajustes ${catName(S.cat)}</h1>
   ${online ? `<div class="card">
     <h2>Sesión</h2>
     <p style="margin:6px 0 10px">👤 <b>${esc(auth.user)}</b> <small>· organizador</small></p>
@@ -665,6 +704,7 @@ function viewAjustes() {
       <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar organizador</button>
     </form>
   </div>` : ''}
+  ${categoriesCard()}
   <div class="card">
     <h2>Inscripción</h2>
     <div class="grid2">
@@ -675,7 +715,7 @@ function viewAjustes() {
       <label class="fl">Cuota de inscripción<input type="number" inputmode="decimal" min="0" data-cfg="fee" value="${c.fee}"></label>
       <label class="fl">Minutos por partido<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
     </div>
-    <small>Estos ajustes son solo para la categoría ${CATS[S.cat]}.</small>
+    <small>Estos ajustes son solo para la categoría ${catName(S.cat)}.</small>
   </div>
   <div class="card">
     <h2>Base de datos en línea</h2>
@@ -692,9 +732,9 @@ function viewAjustes() {
     </div>
   </div>
   <div class="card">
-    <h2>Borrar</h2>
-    <p class="muted" style="font-size:14px">Elimina equipos, sorteo y resultados de la categoría ${CATS[S.cat]}.</p>
-    <button class="btn danger block" data-a="resetCat">Borrar categoría ${CATS[S.cat]}</button>
+    <h2>Vaciar categoría</h2>
+    <p class="muted" style="font-size:14px">Elimina equipos, sorteo y resultados de ${esc(catName(S.cat))}, pero conserva la categoría.</p>
+    <button class="btn danger block" data-a="resetCat">Vaciar ${esc(catName(S.cat))}</button>
   </div>
   <p class="muted" style="text-align:center;font-size:12px">Torneo Fútbol · funciona sin internet</p>`;
 }
@@ -891,10 +931,8 @@ function saveTeam() {
   const id = modal.id;
   const name = $('#f-name').value.trim().replace(/\s+/g, ' ');
   if (!name) return toast('Escriba el nombre del equipo');
-  for (const k of Object.keys(S.cats)) {
-    const dup = S.cats[k].teams.find((x) => x.id !== id && norm(x.name) === norm(name));
-    if (dup) return toast(`Ya existe un equipo "${dup.name}" en ${CATS[k]}`);
-  }
+  const dup = t.teams.find((x) => x.id !== id && norm(x.name) === norm(name));
+  if (dup) return toast(`Ya existe un equipo "${dup.name}" en ${catName(S.cat)}`);
   if (checkPlayers() > 0) return toast('Hay integrantes repetidos (marcados en rojo)');
   const players = [];
   document.querySelectorAll('#f-players .prow').forEach((row) => {
@@ -1135,10 +1173,21 @@ function mergeList(L, B, R) {
 }
 function rebase(local, base, remote) {
   const out = { cats: {} };
-  for (const k of Object.keys(CATS)) {
-    const L = local.cats[k], B = (base && base.cats && base.cats[k]) || newTournament();
-    const R = (remote && remote.cats && remote.cats[k]) || newTournament();
+  const bc = (base && base.cats) || {}, rc = (remote && remote.cats) || {};
+  const keys = [...new Set([...Object.keys(rc), ...Object.keys(local.cats)])].filter((k) => {
+    const inL = k in local.cats, inB = k in bc, inR = k in rc;
+    if (inB && !inL) return false;                                 // eliminada aquí
+    if (inB && !inR) return !same(local.cats[k], bc[k]);           // eliminada en otro teléfono (salvo cambios aquí)
+    return true;
+  });
+  for (const k of keys) {
+    const L = local.cats[k], R = rc[k];
+    if (!R) { out.cats[k] = clone(L); continue; }                  // nueva aquí
+    if (!L) { out.cats[k] = clone(R); continue; }                  // nueva en otro teléfono
+    const B = bc[k] || newTournament();
     const o = clone(R);
+    if (L.name !== B.name) o.name = L.name;
+    if (L.color !== B.color) o.color = L.color;
     if (!same(L.config, B.config)) o.config = L.config;
     if (!same(L.groups, B.groups)) {             // sorteo hecho/deshecho aquí
       o.groups = L.groups; o.stage = L.stage; o.matches = L.matches;
@@ -1163,10 +1212,12 @@ function requestRender() {
 }
 
 function adopt(j) {
-  if (!sync.known && S.cats.M.teams.length + S.cats.F.teams.length > 0 && !same(payload(), j.data)) {
+  if (!sync.known && totalTeams(S) > 0 && !same(payload(), j.data)) {
     try { localStorage.setItem('torneo-respaldo-local', JSON.stringify(S)); } catch (e) { /* nada */ }
   }
-  S.cats = { M: j.data.cats.M || newTournament(), F: j.data.cats.F || newTournament() };
+  const d = normalizeData(clone(j.data));
+  if (d) S.cats = d.cats;
+  if (!S.cats[S.cat]) S.cat = Object.keys(S.cats)[0];
   Object.assign(sync, { rev: j.rev, base: clone(payload()), dirty: false, known: true });
   saveLocal(); saveSync();
   requestRender();
@@ -1202,7 +1253,7 @@ async function pull(full) {
     setMode('online');
     if (j.same) { if (sync.dirty) schedulePush(0); return; }
     if (!j.data) {                                   // base vacía: subir lo de este teléfono
-      if (isAdmin() && S.cats.M.teams.length + S.cats.F.teams.length > 0) { sync.dirty = true; sync.rev = j.rev; schedulePush(0); }
+      if (isAdmin() && totalTeams(S) > 0) { sync.dirty = true; sync.rev = j.rev; schedulePush(0); }
       return;
     }
     if (sync.dirty && sync.known && isAdmin()) return schedulePush(0); // push combina si hay conflicto
@@ -1381,9 +1432,25 @@ const actions = {
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   },
   resetCat: () => {
-    if (!confirm(`¿Borrar TODO de la categoría ${CATS[S.cat]}? No se puede deshacer.`)) return;
+    if (!confirm(`¿Borrar TODO de la categoría ${catName(S.cat)}? No se puede deshacer.`)) return;
     if (!confirm('¿Seguro? Se perderán equipos, pagos y resultados.')) return;
-    S.cats[S.cat] = newTournament(); save(); render(); toast('Categoría borrada');
+    S.cats[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
+  },
+  renameCat: (d) => {
+    const t = S.cats[d.c]; if (!t) return;
+    const n = (prompt('Nuevo nombre de la categoría:', t.name) || '').trim().slice(0, 24);
+    if (!n || n === t.name) return;
+    if (catNameTaken(n, d.c)) return toast('Ya existe una categoría con ese nombre');
+    t.name = n; save(); render();
+  },
+  colorCat: (d) => { const t = S.cats[d.c]; if (!t) return; t.color = ((t.color || 0) + 1) % PALETTES; save(); render(); },
+  delCat: (d) => {
+    const t = S.cats[d.c]; if (!t || Object.keys(S.cats).length < 2) return;
+    if (!confirm(`¿Eliminar la categoría "${t.name}"?${t.teams.length ? ` Tiene ${t.teams.length} equipos inscritos.` : ''}`)) return;
+    if (t.teams.length && !confirm('Se borrarán sus equipos, pagos, partidos y resultados. No se puede deshacer. ¿Seguro?')) return;
+    delete S.cats[d.c];
+    if (S.cat === d.c) S.cat = Object.keys(S.cats)[0];
+    save(); render(); toast('Categoría eliminada');
   },
   syncInfo: () => toast(syncText()),
   syncNow: () => { if (sync.dirty) push(); else pull(true); },
@@ -1399,6 +1466,21 @@ const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'open
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
+  if (e.target.id === 'catForm') {
+    e.preventDefault();
+    if (!isAdmin()) return;
+    const n = $('#cat-name').value.trim().slice(0, 24);
+    if (!n) return toast('Escriba el nombre de la categoría');
+    if (catNameTaken(n)) return toast('Ya existe una categoría con ese nombre');
+    const used = Object.values(S.cats).map((t) => t.color);
+    let color = Object.keys(S.cats).length % PALETTES;
+    for (let i = 0; i < PALETTES; i++) if (!used.includes(i)) { color = i; break; }
+    const id = 'c' + uid();
+    S.cats[id] = newTournament(n, color);
+    S.cat = id;
+    save(); render(); toast('✅ Categoría ' + n + ' creada');
+    return;
+  }
   if (e.target.id === 'orgForm') {
     e.preventDefault();
     const user = $('#o-user').value.trim().toLowerCase(), pass = $('#o-pass').value;
@@ -1466,7 +1548,8 @@ document.addEventListener('change', (e) => {
     r.onload = () => {
       try {
         const d = JSON.parse(r.result);
-        if (!d || !d.cats || !d.cats.M || !d.cats.F) throw new Error('formato');
+        if (!normalizeData(d)) throw new Error('formato');
+        if (!d.cats[d.cat]) d.cat = Object.keys(d.cats)[0];
         if (!confirm('¿Reemplazar los datos actuales con el respaldo?')) return;
         S = d; save(); render(); toast('✅ Respaldo importado');
       } catch (err) { toast('Archivo no válido'); }

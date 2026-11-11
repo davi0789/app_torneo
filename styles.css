@@ -15,7 +15,13 @@
   --radius: 14px;
   --safe-b: env(safe-area-inset-bottom, 0px);
 }
-body[data-cat="F"] { --acc: #c026d3; --acc-soft: #fae8ff; }
+/* Colores por categoría: 0 cyan, 1 fucsia, 2 naranja, 3 verde, 4 violeta, 5 azul */
+[data-pal="0"] { --acc: #0891b2; --acc-soft: #cffafe; --on-acc: #fff; }
+[data-pal="1"] { --acc: #c026d3; --acc-soft: #fae8ff; --on-acc: #fff; }
+[data-pal="2"] { --acc: #ea580c; --acc-soft: #ffedd5; --on-acc: #fff; }
+[data-pal="3"] { --acc: #15803d; --acc-soft: #dcfce7; --on-acc: #fff; }
+[data-pal="4"] { --acc: #7c3aed; --acc-soft: #ede9fe; --on-acc: #fff; }
+[data-pal="5"] { --acc: #2563eb; --acc-soft: #dbeafe; --on-acc: #fff; }
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -23,8 +29,14 @@ body[data-cat="F"] { --acc: #c026d3; --acc-soft: #fae8ff; }
     --line: #2a332e; --acc-soft: #083344; --bad-soft: #3b1414;
   }
   :root { --acc: #22d3ee; --on-acc: #042f3a; }
-  body[data-cat="F"] { --acc: #e879f9; --acc-soft: #3a1240; --on-acc: #2e0634; }
+  [data-pal="0"] { --acc: #22d3ee; --acc-soft: #083344; --on-acc: #042f3a; }
+  [data-pal="1"] { --acc: #e879f9; --acc-soft: #3a1240; --on-acc: #2e0634; }
+  [data-pal="2"] { --acc: #fb923c; --acc-soft: #431407; --on-acc: #2a0d02; }
+  [data-pal="3"] { --acc: #4ade80; --acc-soft: #12331f; --on-acc: #052e16; }
+  [data-pal="4"] { --acc: #a78bfa; --acc-soft: #2e1065; --on-acc: #1e0a45; }
+  [data-pal="5"] { --acc: #60a5fa; --acc-soft: #172554; --on-acc: #0b1a3a; }
 }
+.dot { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: var(--acc); vertical-align: -2px; }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; }
@@ -51,10 +63,15 @@ button, input, select { font: inherit; color: inherit; }
 .sync.saving { background: #facc15; }
 .sync.offline { background: #ef4444; }
 .sync.local { background: transparent; opacity: .6; }
-.seg { display: flex; background: rgba(255,255,255,.2); border-radius: 999px; padding: 3px; }
+.brand { flex: none; }
+.seg {
+  display: flex; background: rgba(255,255,255,.2); border-radius: 999px; padding: 3px;
+  min-width: 0; overflow-x: auto; scrollbar-width: none; position: relative;
+}
+.seg::-webkit-scrollbar { display: none; }
 .seg button {
   border: 0; background: transparent; color: var(--on-acc); padding: 6px 12px; border-radius: 999px;
-  font-size: 14px; font-weight: 600; cursor: pointer;
+  font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; flex: none;
 }
 .seg button.on { background: var(--on-acc); color: var(--acc); }
 
