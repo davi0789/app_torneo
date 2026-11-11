@@ -396,7 +396,8 @@ function render() {
   const sub = $('#brand-sub');
   if (sub) {
     const nT = Object.values(CATS_()).reduce((a, t) => a + t.teams.length, 0);
-    sub.textContent = Object.keys(S.torneos).length > 1 ? 'Toca para cambiar de torneo' : `${Object.keys(CATS_()).length} categorías · ${nT} equipos`;
+    sub.textContent = TOR().org ? 'Organiza: ' + TOR().org
+      : Object.keys(S.torneos).length > 1 ? 'Toca para cambiar de torneo' : `${Object.keys(CATS_()).length} categorías · ${nT} equipos`;
   }
   const nb = document.querySelector('.nav-brand span');
   if (nb) nb.textContent = TOR().name;
@@ -540,7 +541,8 @@ function viewInicio() {
   let h = `<section class="hero">
     <div class="hero-chips"><span class="hero-chip solid">${esc(catName(S.cat))}</span><span class="hero-chip">${esc(phaseText())}</span></div>
     <h1>${esc(tor.name)}</h1>
-    <p>${t.teams.length} equipos · ${TC().starters} titulares + ${TC().subs} suplentes</p>
+    <p>${tor.org ? `Organiza: <b>${esc(tor.org)}</b> · ` : ''}${t.teams.length} equipos · ${TC().starters} titulares + ${TC().subs} suplentes</p>
+    ${tor.contact ? `<p style="margin-top:2px">📞 Contacto: ${esc(tor.contact)}</p>` : ''}
     <div class="hero-stats">
       <div><b>${t.teams.length}</b><span>Equipos</span></div>
       <div><b>${done.length}<small style="color:inherit;opacity:.7;font-size:13px;display:inline">/${all.length}</small></b><span>Jugados</span></div>
@@ -898,6 +900,8 @@ function torneoCard() {
   return `<div class="card">
     <h2>🏆 Torneo</h2>
     <label class="fl">Nombre del torneo<input id="t-name" maxlength="40" value="${esc(tor.name)}" placeholder="Ej: Copa Navidad 2026"></label>
+    <label class="fl">Organizado por <small>(ONG, iglesia, comunidad, empresa…)</small><input id="t-org" maxlength="60" value="${esc(tor.org || '')}" placeholder="Ej: Iglesia San José"></label>
+    <label class="fl">Contacto para el público <small>(opcional: teléfono, WhatsApp o correo)</small><input id="t-contact" maxlength="60" value="${esc(tor.contact || '')}" placeholder="Ej: 7777-7777"></label>
     <div class="fl">Tamaño de los equipos <small>(para todas las categorías)</small></div>
     <div class="grid3b">
       <label class="fl">Titulares<input type="number" inputmode="numeric" min="1" max="30" data-tcfg="starters" value="${g.starters}"></label>
@@ -939,21 +943,21 @@ function viewAjustes() {
   return `<h1>Ajustes ${catName(S.cat)}</h1>
   ${online ? `<div class="card">
     <h2>Sesión</h2>
-    <p style="margin:6px 0 10px">👤 <b>${esc(auth.user)}</b> <small>· organizador</small></p>
+    <p style="margin:6px 0 10px">👤 Usuario: <b>${esc(auth.user)}</b>${TOR().org ? ` <small>· ${esc(TOR().org)}</small>` : ''}</p>
     <div class="row">
       <button class="btn ghost sm" data-a="changePass">Cambiar contraseña</button>
       <button class="btn danger sm" data-a="logout">Cerrar sesión</button>
     </div>
   </div>
   <div class="card">
-    <h2>Organizadores</h2>
-    <p class="muted" style="font-size:14px">Pueden inscribir, sortear y anotar resultados. El público solo ve.</p>
+    <h2>Usuarios con acceso</h2>
+    <p class="muted" style="font-size:14px">Personas que pueden ingresar para inscribir, sortear y anotar resultados. El público solo ve.</p>
     <div id="orgList">${orgs ? orgs.users.map((u) => `<div class="org"><span>👤 ${esc(u)}${u === orgs.me ? ' <small>(usted)</small>' : ''}</span>
       ${u === orgs.me ? '' : `<button class="btn danger sm" data-a="delOrg" data-u="${esc(u)}">Quitar</button>`}</div>`).join('') : '<p class="muted">Cargando…</p>'}</div>
     <form id="orgForm" class="grid2" style="margin-top:8px" autocomplete="off">
       <input id="o-user" placeholder="Nuevo usuario" autocapitalize="none" spellcheck="false" autocomplete="off">
       <input id="o-pass" type="password" placeholder="Contraseña" autocomplete="new-password">
-      <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar organizador</button>
+      <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar usuario</button>
     </form>
   </div>` : ''}
   ${torneoCard()}
@@ -1027,7 +1031,7 @@ function torneosHTML() {
       return `<div class="org">
         <button class="list-item" style="margin:0;flex:1" data-a="switchTorneo" data-id="${id}">
           <div class="grow"><div class="t">${id === S.tor ? '✅ ' : ''}${esc(tor.name)}</div>
-          <small>${Object.keys(tor.cats).length} categorías · ${nTeams} equipos</small></div></button>
+          <small>${tor.org ? esc(tor.org) + ' · ' : ''}${Object.keys(tor.cats).length} categorías · ${nTeams} equipos</small></div></button>
         ${adm && ids.length > 1 ? `<button class="btn danger sm" data-a="delTorneo" data-id="${id}" aria-label="Eliminar">🗑️</button>` : ''}
       </div>`; }).join('')}
   </div>
@@ -1540,7 +1544,7 @@ function mergeKeyed(L, B, R, mergeItem) {
 function mergeTorneo(L, B, R) {
   B = B || {};
   const o = clone(R);
-  if (L.name !== B.name) o.name = L.name;
+  for (const k of ['name', 'org', 'contact']) if (L[k] !== B[k]) o[k] = L[k];
   if (!same(L.config, B.config)) o.config = L.config;
   o.cats = mergeKeyed(L.cats, B.cats, R.cats, mergeCat);
   return o;
@@ -1718,11 +1722,11 @@ const actions = {
     toast(status === 200 ? '✅ Contraseña cambiada' : (j && j.error) || 'No se pudo cambiar');
   },
   delOrg: async (d) => {
-    if (!confirm('¿Quitar al organizador "' + d.u + '"? Ya no podrá editar.')) return;
+    if (!confirm('¿Quitar al usuario "' + d.u + '"? Ya no podrá ingresar ni editar.')) return;
     const { status, j } = await authCall({ action: 'remove', user: d.u });
     if (status === 401) return sessionExpired();
     if (status !== 200) return toast((j && j.error) || 'No se pudo quitar');
-    orgs = j; render(); toast('Organizador quitado');
+    orgs = j; render(); toast('Usuario quitado');
   },
   newTeam: () => openModal('team', null),
   editTeam: (d) => openModal('team', d.id),
@@ -1898,7 +1902,7 @@ document.addEventListener('submit', async (e) => {
     const { status, j } = await authCall({ action: 'add', user, pass });
     if (status === 401) return sessionExpired();
     if (status !== 200) return toast((j && j.error) || 'No se pudo agregar');
-    orgs = j; render(); toast('✅ Organizador ' + user + ' agregado');
+    orgs = j; render(); toast('✅ Usuario ' + user + ' agregado');
   }
 });
 
@@ -1920,6 +1924,12 @@ document.addEventListener('input', (e) => {
 
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.id === 't-org' || el.id === 't-contact') {
+    if (!isAdmin()) return;
+    TOR()[el.id === 't-org' ? 'org' : 'contact'] = el.value.trim().slice(0, 60);
+    save(); render(); toast(el.id === 't-org' ? 'Organizador guardado' : 'Contacto guardado');
+    return;
+  }
   if (el.id === 't-name') {
     if (!isAdmin()) return;
     const n = el.value.trim().slice(0, 40);
