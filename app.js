@@ -759,10 +759,15 @@ function viewPartidos() {
     </div>`;
   if (adm) h += `<button class="btn ghost block sm" data-a="openSchedule" style="margin-bottom:10px">🗓️ Programar fechas y horarios</button>`;
 
-  const live = all.filter((m) => m.status === 'live');
-  if (live.length) { h += `<h3>🔴 En juego ahora</h3>`; for (const m of live) h += matchCard(m); }
-
-  h += mode === 'cal' ? calendarHTML(all) : phasesHTML();
+  // En el calendario, los partidos en vivo van solo arriba (no se repiten en la lista).
+  // En la vista por fase se quedan en su jornada.
+  if (mode === 'cal') {
+    const live = all.filter((m) => m.status === 'live');
+    if (live.length) { h += `<h3>🔴 En juego ahora</h3>`; for (const m of live) h += matchCard(m); }
+    h += calendarHTML(all.filter((m) => m.status !== 'live'));
+  } else {
+    h += phasesHTML();
+  }
 
   if (adm) {
     if (t.stage === 'fase1' && needsFinal()) {
