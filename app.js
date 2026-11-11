@@ -316,8 +316,8 @@ function podium() {
     if (c.podium >= 3) {
       const th = ko.find((m) => m.ko === 'third');
       if (th) p.push(winner(th));
-      else if (c.format === 'liga' && t.groups[0]) {
-        const tab = standings(t.groups[0].teams, 'liga', '');
+      else if ((c.format === 'liga' || t.groups.length === 1) && t.groups[0]) {
+        const tab = standings(t.groups[0].teams, c.format === 'liga' ? 'liga' : 'grupo', t.groups[0].name);
         const third = tab.find((r) => !p.includes(r.id));
         p.push(third ? third.id : null);
       }
@@ -331,13 +331,19 @@ function podium() {
 }
 
 /* ---------------- Sorteo ---------------- */
+const groupCount = (n, size) => Math.max(1, Math.min(Math.floor(n / 2), Math.round(n / size)));
 function doDraw() {
   const t = T(), c = t.config;
   const n = t.teams.length;
   if (n < 2) return toast('Se necesitan al menos 2 equipos');
   const short = t.teams.filter((x) => x.players.length < TC().minPlayers);
   if (short.length) return toast(`Faltan integrantes en: ${short.map((x) => x.name).join(', ')}`);
-  if (c.format === 'grupos' && n < 4) return toast('Para grupos se necesitan al menos 4 equipos');
+  if (c.format === 'grupos' && n < 3) return toast('Para grupos se necesitan al menos 3 equipos');
+  if (c.format === 'grupos') {
+    const ng = groupCount(n, c.groupSize);
+    if (ng * c.perGroup < 2) return toast('Deben clasificar al menos 2 equipos: aumente "Clasifican por grupo"');
+    if (Math.min(...Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0))) < c.perGroup) return toast('Hay grupos con menos equipos que los que clasifican');
+  }
   if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
   if (!confirm(`¿Realizar el sorteo de ${n} equipos (${catName(S.cat)})?`)) return;
 
@@ -351,7 +357,7 @@ function doDraw() {
     t.matches = roundRobin(ids, 'liga', '');
     t.stage = 'fase1';
   } else {
-    const ng = Math.max(2, Math.floor(n / c.groupSize));
+    const ng = groupCount(n, c.groupSize);
     const letters = 'ABCDEFGHIJ';
     t.groups = Array.from({ length: ng }, (_, i) => ({ name: letters[i], teams: [] }));
     ids.forEach((id, i) => t.groups[i % ng].teams.push(id));
@@ -693,7 +699,7 @@ function drawSetupHTML() {
         <label class="fl">Clasifican por grupo<select data-cfg="perGroup">
           ${[1, 2, 3, 4].map((v) => `<option value="${v}" ${c.perGroup == v ? 'selected' : ''}>${v}</option>`).join('')}
         </select></label></div>`;
-    if (n >= 4) h += `<p class="muted"><small>Con ${n} equipos se formarán ${Math.max(2, Math.floor(n / c.groupSize))} grupos.</small></p>`;
+    if (n >= 3) { const ng = groupCount(n, c.groupSize); h += `<p class="muted"><small>Con ${n} equipos: ${ng === 1 ? '1 grupo de ' + n + ' (todos contra todos) y luego fase final' : ng + ' grupos'}. Clasifican ${ng * c.perGroup} a la fase final.</small></p>`; }
   }
   h += `<h3>Premiación</h3>
       ${optRadio('podium', 1, c.podium, 'Solo campeón (1 lugar)', '')}
