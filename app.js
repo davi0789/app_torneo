@@ -165,7 +165,7 @@ function mkMatch(o) {
     id: uid(), phase: '', group: '', round: 1, ko: '', label: '',
     home: null, away: null, srcH: null, srcA: null,
     hs: 0, as: 0, ph: null, pa: null,
-    status: 'pend', duration: T().config.duration, elapsed: 0, runAt: null, alerted: false,
+    status: 'pend', duration: T().config.duration, added: 0, elapsed: 0, runAt: null, alerted: false, alertedAdd: false,
     cards: [],
   }, o);
 }
@@ -480,7 +480,7 @@ function featureMatch(m, title) {
       ${live || done ? `<div class="vs-score">${m.hs} - ${m.as}</div>` : '<div class="vs-score vs">VS</div>'}
       ${side(m.away, m.srcA)}</div>
     <div class="feature-meta">
-      ${live ? `<span class="live-clock" data-clock="${m.id}"></span><span>de ${m.duration} min</span>` : `<span>📅 ${esc(whenText(m))}</span>`}
+      ${live ? `<span class="live-clock" data-clock="${m.id}"></span><span>de ${m.duration} min${m.added ? ` +${m.added}'` : ''}</span>` : `<span>📅 ${esc(whenText(m))}</span>`}
       ${m.field ? `<span>📍 Cancha ${esc(m.field)}</span>` : ''}
     </div>
     ${!live && iso ? `<span class="countdown" data-countdown="${iso}"></span>` : ''}
@@ -605,15 +605,16 @@ function tickLive() {
   document.querySelectorAll('[data-clock]').forEach((el) => {
     const m = mById(el.dataset.clock);
     if (!m) return;
-    const over = elapsedMs(m) >= m.duration * 60000;
-    el.textContent = over ? `⏱ ${m.duration}:00 · tiempo cumplido` : '⏱ ' + fmtClock(elapsedMs(m));
-    el.classList.toggle('over', over);
+    const st = clockState(m);
+    el.textContent = st.phase === 'reg' ? '⏱ ' + fmtClock(st.ms)
+      : st.phase === 'add' ? `⏱ ${m.duration}:00 + ${fmtClock(st.extra)} (agregado +${m.added}')`
+        : `⏱ ${minuteText(m)} · tiempo cumplido`;
+    el.classList.toggle('over', st.phase === 'over');
   });
   document.querySelectorAll('[data-cmin]').forEach((el) => {
     const m = mById(el.dataset.cmin);
     if (!m) return;
-    const min = Math.floor(elapsedMs(m) / 60000) + 1;
-    el.textContent = min > m.duration ? m.duration + "'+" : min + "'";
+    el.textContent = minuteText(m);
   });
   document.querySelectorAll('[data-countdown]').forEach((el) => {
     const diff = new Date(el.dataset.countdown).getTime() - Date.now();
@@ -1272,19 +1273,46 @@ function saveTeam() {
 const elapsedMs = (m) => m.elapsed + (m.runAt ? Date.now() - m.runAt : 0);
 const fmtClock = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
 
+/** Estado del reloj: normal, en tiempo agregado o tiempo cumplido. */
+function clockState(m) {
+  const ms = elapsedMs(m), reg = m.duration * 60000, add = (m.added || 0) * 60000;
+  if (ms < reg) return { phase: 'reg', ms };
+  if (add && ms < reg + add) return { phase: 'add', ms, extra: ms - reg };
+  return { phase: 'over', ms, extra: ms - reg };
+}
+/** Minuto para mostrar: 13', 20+2', 20'+ */
+function minuteText(m) {
+  const st = clockState(m), d = m.duration;
+  if (st.phase === 'reg') return Math.floor(st.ms / 60000) + 1 + "'";
+  if (st.phase === 'add') return `${d}+${Math.floor(st.extra / 60000) + 1}'`;
+  return m.added ? `${d}+${m.added}'` : d + "'+";
+}
+
 function updateClock() {
   if (!modal || modal.type !== 'match') return;
   const m = mById(modal.id);
   const el = $('#clock');
   if (!m || !el) return;
-  const ms = elapsedMs(m);
-  el.textContent = fmtClock(ms);
-  const over = ms >= m.duration * 60000;
-  el.classList.toggle('over', over);
-  if (over && m.runAt && !m.alerted && isAdmin()) {
+  const st = clockState(m);
+  el.textContent = fmtClock(st.ms);
+  el.classList.toggle('add', st.phase === 'add');
+  el.classList.toggle('over', st.phase === 'over');
+  const lab = $('#clock-lab');
+  if (lab) {
+    lab.textContent = st.phase === 'add' ? `Tiempo agregado · ${minuteText(m)}`
+      : st.phase === 'over' ? (m.added ? `Terminó el tiempo agregado (+${m.added}')` : 'Tiempo cumplido')
+        : m.runAt ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar';
+  }
+  if (!m.runAt || !isAdmin()) return;
+  if (st.ms >= m.duration * 60000 && !m.alerted) {
     m.alerted = true; save();
     if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 600]);
-    toast(`⏰ Se cumplieron los ${m.duration} minutos`);
+    toast(`⏰ Se cumplieron los ${m.duration} minutos${m.added ? ` · +${m.added}' de agregado` : ' · ¿agregar tiempo?'}`);
+  }
+  if (m.added && st.phase === 'over' && !m.alertedAdd) {
+    m.alertedAdd = true; save();
+    if (navigator.vibrate) navigator.vibrate([600, 200, 600]);
+    toast(`⏰ Terminó el tiempo agregado (+${m.added}')`);
   }
 }
 
@@ -1323,15 +1351,25 @@ function matchHTML(m) {
   if (!done && (adm || m.status === 'live')) {
     const running = !!m.runAt;
     h += `<div class="timer">
-      <div><div class="clock" id="clock">00:00</div><small>${running ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar'}</small></div>
+      <div><div class="clock" id="clock">00:00</div><small id="clock-lab">${running ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar'}</small></div>
       ${adm ? `<div class="dur">Tiempo<input type="number" inputmode="numeric" min="1" id="m-dur" value="${m.duration}">min</div>
       <div class="row" style="width:100%">
         ${running ? `<button class="btn ghost sm" data-a="pause">⏸ Pausar</button>`
         : `<button class="btn sm" data-a="start" ${ready ? '' : 'disabled'}>▶ ${m.elapsed ? 'Reanudar' : 'Iniciar'}</button>`}
         ${m.elapsed || running ? `<button class="btn ghost sm" data-a="resetClock">↺ Reiniciar reloj</button>` : ''}
-      </div>` : `<div class="dur">de ${m.duration} min</div>`}</div>`;
+      </div>
+      <div class="added">
+        <span>Tiempo agregado: <b>+${m.added || 0}'</b></span>
+        <span class="row" style="flex-wrap:nowrap">
+          <button class="btn ghost sm" data-a="addTime" data-n="-1" ${m.added ? '' : 'disabled'} aria-label="Quitar un minuto">−1'</button>
+          <button class="btn ghost sm" data-a="addTime" data-n="1">+1'</button>
+          <button class="btn ghost sm" data-a="addTime" data-n="2">+2'</button>
+          <button class="btn ghost sm" data-a="addTime" data-n="3">+3'</button>
+          <button class="btn ghost sm" data-a="addTime" data-n="5">+5'</button>
+        </span>
+      </div>` : `<div class="dur">de ${m.duration} min${m.added ? ` <b>+${m.added}'</b>` : ''}</div>`}</div>`;
   } else if (done) {
-    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${m.duration} min</p>`;
+    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${m.duration} min${m.added ? ` + ${m.added}' agregado` : ''}</p>`;
   }
 
   if (isKO && ready && m.hs === m.as && (edit || m.ph != null)) {
@@ -1728,9 +1766,16 @@ const actions = {
     m.elapsed += Date.now() - m.runAt; m.runAt = null;
     save(); renderModal();
   },
+  addTime: (d) => {
+    const m = curMatch(); if (!m) return;
+    m.added = Math.max(0, Math.min(30, (m.added || 0) + Number(d.n)));
+    m.alertedAdd = false;
+    save(); renderModal();
+    toast(m.added ? `⏱ Tiempo agregado: +${m.added}'` : 'Sin tiempo agregado');
+  },
   resetClock: () => {
-    const m = curMatch(); if (!m || !confirm('¿Reiniciar el reloj a 00:00?')) return;
-    m.elapsed = 0; m.runAt = m.runAt ? Date.now() : null; m.alerted = false;
+    const m = curMatch(); if (!m || !confirm('¿Reiniciar el reloj a 00:00? También se quita el tiempo agregado.')) return;
+    m.elapsed = 0; m.runAt = m.runAt ? Date.now() : null; m.alerted = false; m.added = 0; m.alertedAdd = false;
     save(); renderModal();
   },
   card: (d) => {
