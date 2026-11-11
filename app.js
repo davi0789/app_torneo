@@ -604,11 +604,16 @@ function viewInicio() {
 function tickLive() {
   document.querySelectorAll('[data-clock]').forEach((el) => {
     const m = mById(el.dataset.clock);
-    if (m) el.textContent = '⏱ ' + fmtClock(elapsedMs(m));
+    if (!m) return;
+    const over = elapsedMs(m) >= m.duration * 60000;
+    el.textContent = over ? `⏱ ${m.duration}:00 · tiempo cumplido` : '⏱ ' + fmtClock(elapsedMs(m));
+    el.classList.toggle('over', over);
   });
   document.querySelectorAll('[data-cmin]').forEach((el) => {
     const m = mById(el.dataset.cmin);
-    if (m) el.textContent = Math.min(m.duration, Math.floor(elapsedMs(m) / 60000) + 1) + "'";
+    if (!m) return;
+    const min = Math.floor(elapsedMs(m) / 60000) + 1;
+    el.textContent = min > m.duration ? m.duration + "'+" : min + "'";
   });
   document.querySelectorAll('[data-countdown]').forEach((el) => {
     const diff = new Date(el.dataset.countdown).getTime() - Date.now();
