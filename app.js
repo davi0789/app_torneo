@@ -1356,7 +1356,6 @@ function matchHTML(m) {
       <div class="row" style="width:100%">
         ${running ? `<button class="btn ghost sm" data-a="pause">⏸ Pausar</button>`
         : `<button class="btn sm" data-a="start" ${ready ? '' : 'disabled'}>▶ ${m.elapsed ? 'Reanudar' : 'Iniciar'}</button>`}
-        ${m.elapsed || running ? `<button class="btn ghost sm" data-a="resetClock">↺ Reiniciar reloj</button>` : ''}
       </div>
       <div class="added">
         <span>Tiempo agregado: <b>+${m.added || 0}'</b></span>
@@ -1772,11 +1771,6 @@ const actions = {
     m.alertedAdd = false;
     save(); renderModal();
     toast(m.added ? `⏱ Tiempo agregado: +${m.added}'` : 'Sin tiempo agregado');
-  },
-  resetClock: () => {
-    const m = curMatch(); if (!m || !confirm('¿Reiniciar el reloj a 00:00? También se quita el tiempo agregado.')) return;
-    m.elapsed = 0; m.runAt = m.runAt ? Date.now() : null; m.alerted = false; m.added = 0; m.alertedAdd = false;
-    save(); renderModal();
   },
   card: (d) => {
     const m = curMatch(); if (!m) return;
