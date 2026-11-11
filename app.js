@@ -20,6 +20,9 @@ function newTournament(name = '', color = 0) {
     name, color,
     config: {
       fee: 0, duration: 20,
+      tiebreak: 'h2h',     // h2h = enfrentamiento directo primero | dg = diferencia de goles primero
+      suspRed: 1,          // partidos de suspensión por tarjeta roja
+      yellowLimit: 0,      // amarillas acumuladas que suspenden 1 partido (0 = no aplica)
       format: 'liga',      // liga | grupos | elim
       ligaFinal: 0,        // 0 = gana la tabla, 2 = final, 4 = semifinales
       groupSize: 4, perGroup: 2,
@@ -165,6 +168,7 @@ function mkMatch(o) {
     id: uid(), phase: '', group: '', round: 1, ko: '', label: '',
     home: null, away: null, srcH: null, srcA: null,
     hs: 0, as: 0, ph: null, pa: null,
+    goals: [],
     status: 'pend', duration: T().config.duration, added: 0, elapsed: 0, runAt: null, alerted: false, alertedAdd: false,
     cards: [],
   }, o);
@@ -297,9 +301,87 @@ function standings(ids, phase, group) {
     else if (m.hs < m.as) { a.pg++; h.pp++; a.pts += 3; }
     else { h.pe++; a.pe++; h.pts++; a.pts++; }
   }
-  return [...rows.values()].sort((x, y) =>
-    y.pts - x.pts || (y.gf - y.gc) - (x.gf - x.gc) || y.gf - x.gf ||
-    (x.ta + 3 * x.tr) - (y.ta + 3 * y.tr) || tname(x.id).localeCompare(tname(y.id)));
+  const tb = T().config.tiebreak || 'h2h';
+  const general = (x, y) => (y.gf - y.gc) - (x.gf - x.gc) || y.gf - x.gf;
+  const tail = (x, y) => (x.ta + 3 * x.tr) - (y.ta + 3 * y.tr) || tname(x.id).localeCompare(tname(y.id));
+  const all = [...rows.values()].sort((x, y) => y.pts - x.pts);
+  // Ordenar cada bloque de equipos empatados en puntos
+  const out = [];
+  for (let i = 0; i < all.length;) {
+    let j = i; while (j < all.length && all[j].pts === all[i].pts) j++;
+    const block = all.slice(i, j);
+    if (block.length > 1 && tb === 'h2h') {
+      const ids = new Set(block.map((r) => r.id));
+      const mini = new Map(block.map((r) => [r.id, { pts: 0, dg: 0, gf: 0 }]));
+      for (const m of T().matches) {
+        if (m.phase !== phase || m.group !== group || m.status !== 'done' || !ids.has(m.home) || !ids.has(m.away)) continue;
+        const h = mini.get(m.home), a = mini.get(m.away);
+        h.gf += m.hs; a.gf += m.as; h.dg += m.hs - m.as; a.dg += m.as - m.hs;
+        if (m.hs > m.as) h.pts += 3; else if (m.hs < m.as) a.pts += 3; else { h.pts++; a.pts++; }
+      }
+      block.forEach((r) => { r.h2h = mini.get(r.id); });
+      block.sort((x, y) => y.h2h.pts - x.h2h.pts || y.h2h.dg - x.h2h.dg || y.h2h.gf - x.h2h.gf || general(x, y) || tail(x, y));
+    } else {
+      block.sort((x, y) => general(x, y) || tail(x, y));
+    }
+    out.push(...block); i = j;
+  }
+  return out;
+}
+
+/* ============ Suspensiones (roja y amarillas acumuladas) ============ */
+/** Partidos de un equipo en orden de juego. */
+const teamMatches = (teamId, t = T()) => t.matches.filter((m) => m.home === teamId || m.away === teamId);
+/** Devuelve [{player, reason}] de jugadores suspendidos para este partido y equipo. */
+function suspendedIn(match, teamId) {
+  const c = T().config;
+  const suspRed = c.suspRed ?? 1, yl = c.yellowLimit || 0;
+  const list = teamMatches(teamId);
+  const pos = list.findIndex((m) => m.id === match.id);
+  if (pos <= 0) return [];
+  const out = new Map();
+  const yellows = new Map();
+  for (let p = 0; p < pos; p++) {
+    const m = list[p];
+    const mine = m.cards.filter((cd) => cd.team === teamId);
+    const reds = new Set(mine.filter((cd) => cd.type === 'R').map((cd) => cd.player));
+    for (const pl of reds) if (suspRed > 0 && pos - p <= suspRed) out.set(pl, `Roja vs ${tname(m.home === teamId ? m.away : m.home)}`);
+    if (yl > 0) {
+      for (const cd of mine) {
+        if (cd.type !== 'Y' || reds.has(cd.player)) continue; // la doble amarilla ya cuenta como roja
+        const n = (yellows.get(cd.player) || 0) + 1;
+        yellows.set(cd.player, n);
+        if (n % yl === 0 && pos - p === 1) out.set(cd.player, `${yl} amarillas acumuladas`);
+      }
+    }
+  }
+  return [...out.entries()].map(([player, reason]) => ({ player, reason }));
+}
+/** Próximo partido pendiente del equipo en el que un jugador está suspendido (para la ficha). */
+function nextSuspension(teamId, player) {
+  const next = teamMatches(teamId).find((m) => m.status !== 'done');
+  if (!next) return null;
+  const s = suspendedIn(next, teamId).find((x) => x.player === player);
+  return s ? { match: next, reason: s.reason } : null;
+}
+
+/* ============ Goleadores ============ */
+function scorers(t = T()) {
+  const map = new Map();
+  for (const m of t.matches) for (const g of m.goals || []) {
+    if (!g.player || g.own) continue;
+    const k = g.team + '|' + g.player;
+    const r = map.get(k) || { team: g.team, player: g.player, n: 0 };
+    r.n++; map.set(k, r);
+  }
+  return [...map.values()].sort((a, b) => b.n - a.n || a.player.localeCompare(b.player));
+}
+function scorersHTML(limit) {
+  const rows = scorers();
+  if (!rows.length) return '<p class="muted">Aún no hay goles con jugador registrado.</p>';
+  const list = limit ? rows.slice(0, limit) : rows;
+  return `<div class="tbl-wrap"><table><tr><th>#</th><th class="tn">Jugador</th><th class="tn">Equipo</th><th>⚽</th></tr>
+    ${list.map((r, i) => `<tr><td>${i === 0 ? '🥇' : i + 1}</td><td class="tn"><b>${esc(r.player)}</b></td><td class="tn">${miniCrest(r.team)}${esc(tname(r.team))}</td><td class="pts">${r.n}</td></tr>`).join('')}</table></div>`;
 }
 
 const phase1 = () => T().matches.filter((m) => m.phase !== 'ko');
@@ -602,6 +684,7 @@ function viewInicio() {
   if (!left) left = `<div class="empty"><span class="big-ic">⚽</span>Pronto se publicarán los partidos.</div>`;
 
   let right = miniStandings();
+  if (scorers().length) right += `<div class="sec-head"><h2>⚽ Goleadores</h2><button class="link" data-a="tab" data-t="tabla">Ver todos →</button></div>${scorersHTML(5)}`;
   right += `<div class="sec-head"><h2>🛡️ Equipos</h2><button class="link" data-a="tab" data-t="equipos">Ver todos →</button></div>${teamsGrid(8)}`;
 
   h += `<div class="home-grid"><div>${left}</div><div>${right}</div></div>`;
@@ -856,6 +939,16 @@ function viewTabla() {
     for (const m of ko) h += matchCard(m);
   }
 
+  h += `<h3>⚽ Goleadores</h3>` + scorersHTML();
+
+  // Suspendidos para su próximo partido
+  const susp = [];
+  for (const tm of t.teams) for (const p of tm.players) { const s = nextSuspension(tm.id, p.name); if (s) susp.push({ tm, p, s }); }
+  if (susp.length) {
+    h += `<h3>⛔ Suspendidos próximo partido</h3><div class="tbl-wrap"><table><tr><th class="tn">Jugador</th><th class="tn">Equipo</th><th class="tn">Motivo</th></tr>
+      ${susp.map(({ tm, p, s }) => `<tr><td class="tn"><b>${esc(p.name)}</b></td><td class="tn">${miniCrest(tm.id)}${esc(tm.name)}</td><td class="tn">${esc(s.reason)}</td></tr>`).join('')}</table></div>`;
+  }
+
   // Tarjetas por jugador
   const map = new Map();
   for (const m of t.matches) for (const cd of m.cards) {
@@ -977,6 +1070,22 @@ function viewAjustes() {
     <small>Estos ajustes son solo para la categoría ${catName(S.cat)}.</small>
   </div>
   <div class="card">
+    <h2>Reglas · ${esc(catName(S.cat))}</h2>
+    <label class="fl">Desempate cuando hay igualdad de puntos<select data-cfg="tiebreak">
+      <option value="h2h" ${(c.tiebreak || 'h2h') === 'h2h' ? 'selected' : ''}>1° Enfrentamiento directo, 2° diferencia de goles</option>
+      <option value="dg" ${c.tiebreak === 'dg' ? 'selected' : ''}>1° Diferencia de goles, 2° goles a favor</option>
+    </select></label>
+    <div class="grid2">
+      <label class="fl">Suspensión por roja<select data-cfg="suspRed">
+        ${[0, 1, 2, 3].map((v) => `<option value="${v}" ${(c.suspRed ?? 1) === v ? 'selected' : ''}>${v === 0 ? 'Sin suspensión' : v + ' partido' + (v > 1 ? 's' : '')}</option>`).join('')}
+      </select></label>
+      <label class="fl">Amarillas acumuladas<select data-cfg="yellowLimit">
+        ${[0, 2, 3, 4, 5].map((v) => `<option value="${v}" ${(c.yellowLimit || 0) === v ? 'selected' : ''}>${v === 0 ? 'No suspenden' : v + ' = 1 partido'}</option>`).join('')}
+      </select></label>
+    </div>
+    <small>Doble amarilla en un partido = roja automática. Luego: puntos → ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</small>
+  </div>
+  <div class="card">
     <h2>Base de datos en línea</h2>
     <p class="muted" style="font-size:14px" id="sync-status">${esc(syncText())}</p>
     ${online ? '<button class="btn ghost block sm" data-a="syncNow">🔄 Sincronizar ahora</button>' : ''}
@@ -1061,7 +1170,8 @@ function teamViewHTML(id) {
     ${ms.length ? ms.map(matchCard).join('') : '<p class="muted">Aún no tiene partidos asignados.</p>'}
     ${[['Titulares', tm.players.filter((p) => !p.sub)], ['Suplentes', tm.players.filter((p) => p.sub)]].filter(([, l]) => l.length).map(([title, list]) => `
     <h3>${title} (${list.length})</h3>
-    <ul class="cardlist">${list.map((p) => `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}</span></li>`).join('')}</ul>`).join('')}
+    <ul class="cardlist">${list.map((p) => { const g = scorers().find((x) => x.team === id && x.player === p.name); const su = nextSuspension(id, p.name);
+      return `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${su ? ` <span class="badge b-bad">⛔ Suspendido</span>` : ''}</span>${g ? `<small>⚽ ${g.n}</small>` : ''}</li>`; }).join('')}</ul>`).join('')}
   </div>`;
 }
 
@@ -1336,12 +1446,27 @@ function matchHTML(m) {
     ${id && teamById(id) && teamById(id).crest ? `<div class="mcrest-big">${crestHTML(teamById(id).crest, tname(id), 56)}</div>` : ''}
     <div class="tn">${esc(id ? tname(id) : srcLabel(src))}</div>
     <span class="big">${m.status === 'pend' && !adm ? '–' : val}</span>
-    ${edit ? `<div class="stepper"><button class="minus" data-a="goal" data-s="${s}" data-d="-1">−</button><button data-a="goal" data-s="${s}" data-d="1">+</button></div>` : ''}
+    ${edit ? `<div class="stepper"><button class="minus" data-a="goal" data-s="${s}" data-d="-1" aria-label="Quitar gol">−</button><button data-a="goalPick" data-s="${s}" aria-label="Gol">+</button></div>` : ''}
   </div>`;
 
   let h = `<div class="mh"><h2>${esc(phaseLabel(m))}</h2><button class="x" data-a="close">✕</button></div><div class="mb">`;
   if (!ready) h += `<div class="note warn" style="margin-top:12px">Este partido se define cuando terminen los partidos anteriores.</div>`;
   h += `<div class="score">${side(m.home, m.srcH, 'h', m.hs)}<div class="vs">-</div>${side(m.away, m.srcA, 'a', m.as)}</div>`;
+  if (edit && modal && modal.goalPick) {
+    const tid = modal.goalPick === 'h' ? m.home : m.away, rival = modal.goalPick === 'h' ? m.away : m.home;
+    const tm = teamById(tid), off = new Set(suspendedIn(m, tid).map((x) => x.player));
+    h += `<div class="pick"><div class="pick-h">⚽ Gol de <b>${esc(tname(tid))}</b> · ¿quién anotó?</div>
+      <div class="pick-grid">${(tm ? tm.players : []).map((p, i) => `<button data-a="scorer" data-i="${i}" ${off.has(p.name) ? 'class="off"' : ''}>${p.num ? `<b>${esc(p.num)}</b> ` : ''}${esc(p.name)}${off.has(p.name) ? ' ⛔' : ''}</button>`).join('')}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost sm" data-a="scorer" data-i="-1">Sin especificar</button>
+        <button class="btn ghost sm" data-a="scorer" data-i="own">Autogol de ${esc(tname(rival))}</button>
+        <button class="btn danger sm" data-a="goalCancel">Cancelar</button>
+      </div></div>`;
+  }
+  const goalsList = (m.goals || []).filter((g) => g.player || g.own);
+  if (goalsList.length) {
+    h += `<ul class="goals">${[...goalsList].sort((a, b) => a.min - b.min).map((g) => `<li class="${g.team === m.home ? 'gh' : 'ga'}">⚽ <b>${esc(g.own ? 'Autogol' : g.player)}</b> <small>${g.min}'${g.own ? ' · de ' + esc(g.from || 'rival') : ''}</small></li>`).join('')}</ul>`;
+  }
   if (done) {
     const w = winner(m);
     h += `<p style="text-align:center;margin:0 0 6px;font-weight:700">${w ? `🏆 Ganó ${esc(tname(w))}${m.ph != null && m.hs === m.as ? ` (penales ${m.ph}-${m.pa})` : ''}` : '🤝 Empate'}</p>`;
@@ -1388,11 +1513,17 @@ function matchHTML(m) {
       <input type="number" inputmode="numeric" min="0" id="m-pa" value="${m.pa ?? ''}" ${edit ? '' : 'disabled'} placeholder="0"></div>`;
   }
 
+  // Suspendidos para este partido
+  if (ready && m.status !== 'done') {
+    const sus = [m.home, m.away].flatMap((tid) => suspendedIn(m, tid).map((x) => ({ ...x, tid })));
+    if (sus.length) h += `<div class="note warn" style="margin-top:12px"><b>⛔ No pueden jugar este partido:</b><br>${sus.map((x) => `${esc(x.player)} (${esc(tname(x.tid))}) · ${esc(x.reason)}`).join('<br>')}</div>`;
+  }
+
   // Tarjetas
   if (ready && (adm || m.cards.length)) {
     h += `<h3>Tarjetas</h3>`;
     if (edit) {
-      const selTeam = modal.cardTeam && [m.home, m.away].includes(modal.cardTeam) ? modal.cardTeam : m.home;
+      const selTeam = modal && modal.cardTeam && [m.home, m.away].includes(modal.cardTeam) ? modal.cardTeam : m.home;
       const tm = teamById(selTeam);
       h += `<div class="cardform">
         <select id="c-team" class="inp">${[m.home, m.away].map((id) => `<option value="${id}" ${id === selTeam ? 'selected' : ''}>${esc(tname(id))}</option>`).join('')}</select>
@@ -1405,7 +1536,7 @@ function matchHTML(m) {
     const list = [...m.cards].sort((a, b) => a.min - b.min);
     h += list.length ? `<ul class="cardlist">${list.map((cd) => `<li><span class="chip ${cd.type}"></span>
       <span class="grow"><b>${esc(cd.player)}</b> <small>${esc(tname(cd.team))}</small></span>
-      <small>${cd.min}'</small>${edit ? `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>` : ''}</li>`).join('')}</ul>`
+      <small>${cd.min}'${cd.auto ? ' · doble amarilla' : ''}</small>${edit && !cd.auto ? `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>` : ''}</li>`).join('')}</ul>`
       : `<p class="muted" style="font-size:14px">Sin tarjetas.</p>`;
   }
   h += `</div><div class="mf">`;
@@ -1759,11 +1890,32 @@ const actions = {
   },
   openMatch: (d) => openModal('match', d.id),
   goal: (d) => {
+    // Quitar el último gol del equipo
     const m = curMatch(); if (!m) return;
-    const k = d.s === 'h' ? 'hs' : 'as';
-    m[k] = Math.max(0, m[k] + Number(d.d));
-    if (m.status === 'pend') m.status = 'live';
+    const k = d.s === 'h' ? 'hs' : 'as', tid = d.s === 'h' ? m.home : m.away;
+    if (!m[k]) return;
+    m[k]--;
+    m.goals = m.goals || [];
+    for (let i = m.goals.length - 1; i >= 0; i--) if (m.goals[i].team === tid) { m.goals.splice(i, 1); break; }
+    modal.goalPick = null;
     save(); renderModal();
+  },
+  goalPick: (d) => { if (modal) { modal.goalPick = d.s; renderModal(); } },
+  goalCancel: () => { if (modal) { modal.goalPick = null; renderModal(); } },
+  scorer: (d) => {
+    const m = curMatch(); if (!m || !modal.goalPick) return;
+    const side = modal.goalPick, tid = side === 'h' ? m.home : m.away, rival = side === 'h' ? m.away : m.home;
+    const min = Math.floor(elapsedMs(m) / 60000) + 1;
+    let player = '', own = false;
+    if (d.i === 'own') own = true;
+    else if (+d.i >= 0) player = ((teamById(tid) || {}).players || [])[+d.i]?.name || '';
+    m.goals = m.goals || [];
+    m.goals.push({ id: uid(), team: tid, player, own, min, ...(own ? { player: '', from: tname(rival) } : {}) });
+    m[side === 'h' ? 'hs' : 'as']++;
+    if (m.status === 'pend') m.status = 'live';
+    modal.goalPick = null;
+    save(); renderModal();
+    toast(`⚽ Gol de ${tname(tid)}${player ? ' · ' + player : own ? ' (autogol)' : ''}`);
   },
   start: () => {
     const m = curMatch(); if (!m) return;
@@ -1788,16 +1940,21 @@ const actions = {
     if (!player) return toast('Seleccione un jugador');
     let min = $('#c-min').value;
     min = min === '' ? Math.floor(elapsedMs(m) / 60000) + 1 : Math.max(0, parseInt(min, 10) || 0);
-    const yellows = m.cards.filter((c) => c.team === team && c.player === player && c.type === 'Y').length;
-    m.cards.push({ id: uid(), team, player, type: d.type, min });
+    const mine = m.cards.filter((c) => c.team === team && c.player === player);
+    if (mine.some((c) => c.type === 'R')) return toast(`${player} ya fue expulsado en este partido`);
+    const yellows = mine.filter((c) => c.type === 'Y').length;
+    const id = uid();
+    m.cards.push({ id, team, player, type: d.type, min });
+    // Doble amarilla = roja automática
+    if (d.type === 'Y' && yellows >= 1) m.cards.push({ id: uid(), team, player, type: 'R', min, auto: true, from: id });
     if (m.status === 'pend') m.status = 'live';
     save(); renderModal();
-    if (d.type === 'Y' && yellows >= 1) toast(`⚠️ Segunda amarilla para ${player}: corresponde roja`);
+    if (d.type === 'Y' && yellows >= 1) toast(`🟥 Segunda amarilla: ${player} expulsado (roja automática)`);
     else toast(`${d.type === 'Y' ? '🟨 Amarilla' : '🟥 Roja'} · ${player}`);
   },
   delCard: (d) => {
     const m = curMatch(); if (!m) return;
-    m.cards = m.cards.filter((c) => c.id !== d.id);
+    m.cards = m.cards.filter((c) => c.id !== d.id && c.from !== d.id); // si se quita la 2ª amarilla, se quita su roja
     save(); renderModal();
   },
   finish: () => finishMatch(),
@@ -1965,7 +2122,7 @@ document.addEventListener('change', (e) => {
     const c = T().config;
     const k = el.dataset.cfg;
     let v = num(el.value);
-    if (k === 'format') v = el.value;
+    if (k === 'format' || k === 'tiebreak') v = el.value;
     if (k === 'duration') v = Math.max(1, Math.min(200, Math.round(v)));
     if (k === 'fee') v = Math.max(0, v);
     c[k] = v;
