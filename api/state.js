@@ -36,8 +36,11 @@ module.exports = async function handler(req, res) {
       if (!(await verify(req))) return res.status(401).json({ error: 'Debe ingresar como organizador' });
       const body = readBody(req);
       const data = body.data;
-      const cats = data && data.cats && typeof data.cats === 'object' ? Object.values(data.cats) : [];
-      if (!cats.length || cats.length > 30 || !cats.every((t) => t && Array.isArray(t.teams) && Array.isArray(t.matches))) {
+      const tors = data && data.torneos && typeof data.torneos === 'object' ? Object.values(data.torneos) : [];
+      const validCat = (t) => t && Array.isArray(t.teams) && Array.isArray(t.matches);
+      const validTor = (tor) => tor && tor.cats && typeof tor.cats === 'object'
+        && Object.values(tor.cats).length > 0 && Object.values(tor.cats).length <= 30 && Object.values(tor.cats).every(validCat);
+      if (!tors.length || tors.length > 50 || !tors.every(validTor)) {
         return res.status(400).json({ error: 'Datos no válidos' });
       }
       const json = JSON.stringify(data);

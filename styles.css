@@ -281,3 +281,31 @@ td.pts { font-weight: 800; }
 .org { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 input[type="date"], input[type="time"] { min-width: 0; }
 .tabs button[hidden] { display: none; }
+
+/* torneo y escudos */
+.brand { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 45%; }
+#brand-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+#brand-name::before { content: "⚽ "; }
+.grid3b { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.grid3b .fl { margin-top: 4px; font-size: 13px; }
+.psec { font-size: 13px; font-weight: 800; color: var(--acc); margin: 12px 0 6px; text-transform: uppercase; letter-spacing: .03em; }
+.tcrest { display: inline-grid; place-items: center; flex: none; }
+.tcrest .crest { max-width: 100%; max-height: 100%; }
+.mcrest { display: inline-grid; place-items: center; width: 22px; height: 22px; flex: none; }
+.mcrest .crest { max-height: 22px; max-width: 22px; }
+.mcrest-big { display: grid; place-items: center; height: 60px; }
+.match .h, .match .a { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.match .h { justify-content: flex-end; text-align: right; }
+.match .a { justify-content: flex-start; }
+td.tn .mcrest { width: 18px; height: 18px; margin-right: 6px; vertical-align: middle; }
+td.tn .mcrest .crest { max-height: 18px; max-width: 18px; }
+.crest-edit { display: grid; grid-template-columns: 96px 1fr; gap: 12px; align-items: start; }
+.crest-prev { width: 96px; height: 104px; display: grid; place-items: center; background: var(--bg); border-radius: 12px; }
+.crest-none { font-size: 12px; color: var(--muted); text-align: center; }
+.crest-ctrl .row { gap: 6px; margin-bottom: 6px; }
+.crest-ctrl .row .btn { flex: none; padding: 6px 10px; }
+.crest-sel { display: grid; gap: 6px; }
+.crest-sel select { min-height: 38px; padding: 6px 8px; font-size: 14px; }
+.crest-gallery { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 4px; scrollbar-width: thin; }
+.crest-gallery button { flex: none; width: 52px; height: 58px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); display: grid; place-items: center; cursor: pointer; padding: 0; }
+.crest-gallery button:active { border-color: var(--acc); }

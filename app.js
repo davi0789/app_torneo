@@ -4,8 +4,8 @@
    ========================================================= */
 const KEY = 'torneo-futbol-v1';
 const PALETTES = 6; // colores disponibles para categorías
-const catName = (k) => (S.cats[k] && S.cats[k].name) || 'Categoría';
-const totalTeams = (d) => Object.values(d.cats).reduce((a, t) => a + ((t && t.teams) || []).length, 0);
+const catName = (k) => (CATS_()[k] && CATS_()[k].name) || 'Categoría';
+const totalTeams = (d) => Object.values(d.torneos || {}).reduce((a, tor) => a + Object.values(tor.cats || {}).reduce((b, t) => b + ((t && t.teams) || []).length, 0), 0);
 
 const $ = (s) => document.querySelector(s);
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
@@ -19,7 +19,7 @@ function newTournament(name = '', color = 0) {
   return {
     name, color,
     config: {
-      minPlayers: 8, maxPlayers: 10, fee: 0, duration: 20,
+      fee: 0, duration: 20,
       format: 'liga',      // liga | grupos | elim
       ligaFinal: 0,        // 0 = gana la tabla, 2 = final, 4 = semifinales
       groupSize: 4, perGroup: 2,
@@ -32,25 +32,59 @@ function newTournament(name = '', color = 0) {
   };
 }
 
-/** Valida los datos y completa nombre/color de categorías antiguas. */
+/** Configuración general del torneo (aplica a todos los equipos). */
+const defaultTorConfig = () => ({ starters: 8, subs: 4, minPlayers: 8 });
+function newTorneo(name, catsFrom) {
+  const cats = {};
+  if (catsFrom) Object.entries(catsFrom).forEach(([k, t]) => { cats[k] = newTournament(t.name, t.color); cats[k].config = Object.assign(clone(t.config), {}); });
+  else { cats.M = newTournament('Masculino', 0); cats.F = newTournament('Femenino', 1); }
+  return { name, createdAt: Date.now(), config: defaultTorConfig(), cats };
+}
+
+/** Valida los datos, migra el formato antiguo ({cats}) y completa valores faltantes. */
 function normalizeData(d) {
-  if (!d || !d.cats || typeof d.cats !== 'object') return null;
+  if (!d || typeof d !== 'object') return null;
+  if (!d.torneos && d.cats && typeof d.cats === 'object') {
+    const m = Object.values(d.cats)[0] || {};
+    const oc = m.config || {};
+    d.torneos = { t1: { name: 'Mi Torneo', createdAt: 0, config: { starters: 8, subs: Math.max(0, (oc.maxPlayers || 12) - 8), minPlayers: oc.minPlayers || 8 }, cats: d.cats } };
+    delete d.cats;
+  }
+  if (!d.torneos || typeof d.torneos !== 'object') return null;
   const defaults = { M: ['Masculino', 0], F: ['Femenino', 1] };
-  Object.keys(d.cats).forEach((k, i) => {
-    const t = d.cats[k];
-    if (!t || !Array.isArray(t.teams) || !Array.isArray(t.matches)) { delete d.cats[k]; return; }
-    if (!t.name) t.name = defaults[k] ? defaults[k][0] : 'Categoría ' + (i + 1);
-    if (t.color == null) t.color = defaults[k] ? defaults[k][1] : i % PALETTES;
-  });
-  return Object.keys(d.cats).length ? d : null;
+  for (const [tid, tor] of Object.entries(d.torneos)) {
+    if (!tor || !tor.cats || typeof tor.cats !== 'object') { delete d.torneos[tid]; continue; }
+    if (!tor.name) tor.name = 'Mi Torneo';
+    if (tor.createdAt == null) tor.createdAt = 0;
+    tor.config = Object.assign(defaultTorConfig(), tor.config || {});
+    Object.keys(tor.cats).forEach((k, i) => {
+      const t = tor.cats[k];
+      if (!t || !Array.isArray(t.teams) || !Array.isArray(t.matches)) { delete tor.cats[k]; return; }
+      if (!t.name) t.name = defaults[k] ? defaults[k][0] : 'Categoría ' + (i + 1);
+      if (t.color == null) t.color = defaults[k] ? defaults[k][1] : i % PALETTES;
+    });
+    if (!Object.keys(tor.cats).length) tor.cats.M = newTournament('General', 0);
+  }
+  return Object.keys(d.torneos).length ? d : null;
+}
+/** Torneo que se muestra por defecto: el más reciente. */
+const latestTorneo = (d) => Object.keys(d.torneos).sort((a, b) => (d.torneos[b].createdAt || 0) - (d.torneos[a].createdAt || 0))[0];
+function fixSelection(d) {
+  if (!d.torneos[d.tor]) d.tor = latestTorneo(d);
+  const cats = d.torneos[d.tor].cats;
+  if (!cats[d.cat]) d.cat = Object.keys(cats)[0];
 }
 function load() {
   try {
     const d = normalizeData(JSON.parse(localStorage.getItem(KEY)));
-    if (d) { if (!d.cats[d.cat]) d.cat = Object.keys(d.cats)[0]; return d; }
+    if (d) { fixSelection(d); return d; }
   } catch (e) { /* sin datos */ }
-  return { cats: { M: newTournament('Masculino', 0), F: newTournament('Femenino', 1) }, cat: 'M', tab: 'partidos', view: 'cal' };
+  const d = { torneos: { t1: newTorneo('Mi Torneo') }, tab: 'partidos', view: 'cal' };
+  d.torneos.t1.createdAt = 0;
+  fixSelection(d);
+  return d;
 }
+const clone = (o) => JSON.parse(JSON.stringify(o));
 let S = load();
 
 /* Estado de sincronización con la base de datos en línea */
@@ -59,7 +93,7 @@ const AUTH_KEY = 'torneo-auth';
 const sync = { mode: 'init', rev: 0, base: null, dirty: false, known: false, needSetup: false, last: 0, pushing: false, timer: null, pendingRender: false };
 try {
   const d = JSON.parse(localStorage.getItem(SYNC_KEY));
-  if (d) Object.assign(sync, { rev: d.rev || 0, base: d.base || null, dirty: !!d.dirty, known: true });
+  if (d) Object.assign(sync, { rev: d.rev || 0, base: d.base ? normalizeData(d.base) : null, dirty: !!d.dirty, known: true });
 } catch (e) { /* nada */ }
 
 /* Sesión de organizador. Sin sesión = vista pública (solo lectura). */
@@ -91,7 +125,16 @@ let modal = null;      // { type: 'team'|'match', id }
 let tick = null;
 let installEvt = null;
 
-const T = () => S.cats[S.cat];
+const TOR = () => S.torneos[S.tor];
+const CATS_ = () => TOR().cats;
+const TC = () => TOR().config;
+const T = () => CATS_()[S.cat];
+/** Escudo pequeño + nombre, o avatar con inicial si el equipo no tiene escudo. */
+function teamBadge(tm, size = 40) {
+  if (tm && tm.crest) { const h = crestHTML(tm.crest, tm.name, size); if (h) return `<span class="tcrest" style="width:${size}px;height:${size}px">${h}</span>`; }
+  return `<div class="avatar" style="width:${size}px;height:${size}px;font-size:${Math.round(size * 0.42)}px">${esc(((tm && tm.name) || '?').slice(0, 1).toUpperCase())}</div>`;
+}
+const miniCrest = (id) => { const tm = teamById(id); return tm && tm.crest ? `<span class="mcrest">${crestHTML(tm.crest, tm.name, 22)}</span>` : ''; };
 const teamById = (id) => T().teams.find((x) => x.id === id);
 const tname = (id) => (teamById(id) || {}).name || 'Por definir';
 const mById = (id, t = T()) => t.matches.find((m) => m.id === id);
@@ -107,8 +150,8 @@ function toast(msg) {
 /* ---------------- Jugadores únicos ---------------- */
 function playerIndex(exceptTeamId) {
   const map = new Map();
-  for (const k of Object.keys(S.cats)) {
-    for (const tm of S.cats[k].teams) {
+  for (const k of Object.keys(CATS_())) {
+    for (const tm of CATS_()[k].teams) {
       if (tm.id === exceptTeamId) continue;
       for (const p of tm.players) map.set(norm(p.name), `${tm.name} (${catName(k)})`);
     }
@@ -292,7 +335,7 @@ function doDraw() {
   const t = T(), c = t.config;
   const n = t.teams.length;
   if (n < 2) return toast('Se necesitan al menos 2 equipos');
-  const short = t.teams.filter((x) => x.players.length < c.minPlayers);
+  const short = t.teams.filter((x) => x.players.length < TC().minPlayers);
   if (short.length) return toast(`Faltan integrantes en: ${short.map((x) => x.name).join(', ')}`);
   if (c.format === 'grupos' && n < 4) return toast('Para grupos se necesitan al menos 4 equipos');
   if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
@@ -345,11 +388,13 @@ const views = { equipos: viewEquipos, partidos: viewPartidos, tabla: viewTabla, 
 function render() {
   sync.pendingRender = false;
   const adm = isAdmin();
-  if (!S.cats[S.cat]) S.cat = Object.keys(S.cats)[0];
+  fixSelection(S);
+  const brand = $('#brand-name');
+  if (brand) brand.textContent = TOR().name;
   document.body.dataset.pal = String((T().color || 0) % PALETTES);
   document.body.classList.toggle('public', !adm);
   const cats = $('#cats');
-  cats.innerHTML = Object.keys(S.cats).map((k) => `<button data-a="cat" data-c="${k}" class="${k === S.cat ? 'on' : ''}">${esc(catName(k))}</button>`).join('');
+  cats.innerHTML = Object.keys(CATS_()).map((k) => `<button data-a="cat" data-c="${k}" class="${k === S.cat ? 'on' : ''}">${esc(catName(k))}</button>`).join('');
   const onBtn = cats.querySelector('.on');
   if (onBtn) cats.scrollLeft = onBtn.offsetLeft - cats.clientWidth / 2 + onBtn.clientWidth / 2;
   const t4 = document.querySelector('#tabs [data-t="ajustes"]');
@@ -401,7 +446,7 @@ function viewEquipos() {
     h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos</p>`;
     for (const tm of t.teams) {
       h += `<button class="list-item" data-a="viewTeam" data-id="${tm.id}">
-        <div class="avatar">${esc(tm.name.slice(0, 1).toUpperCase())}</div>
+        ${teamBadge(tm, 40)}
         <div class="grow"><div class="t">${esc(tm.name)}</div><small>${tm.players.length} integrantes</small></div>
         ${recordHTML(teamRecord(tm.id))}</button>`;
     }
@@ -421,7 +466,7 @@ function viewEquipos() {
     h += `<div class="note">Sorteo realizado: aún puede editar integrantes y pagos, pero no agregar ni eliminar equipos.</div>`;
   }
   if (!t.teams.length) {
-    h += `<div class="empty">Aún no hay equipos inscritos.<br><small>Cuota de inscripción: ${money(c.fee)} · ${c.minPlayers} a ${c.maxPlayers} integrantes</small></div>`;
+    h += `<div class="empty">Aún no hay equipos inscritos.<br><small>Cuota de inscripción: ${money(c.fee)} · ${TC().starters} titulares + ${TC().subs} suplentes · mínimo ${TC().minPlayers}</small></div>`;
   }
   for (const tm of t.teams) {
     const owes = num(c.fee) - num(tm.paid);
@@ -429,7 +474,7 @@ function viewEquipos() {
       : owes <= 0 ? `<span class="badge b-ok">Pagado</span>`
         : `<span class="badge b-bad">Debe ${money(owes)}</span>`;
     h += `<button class="list-item" data-a="editTeam" data-id="${tm.id}">
-      <div class="avatar">${esc(tm.name.slice(0, 1).toUpperCase())}</div>
+      ${teamBadge(tm, 40)}
       <div class="grow"><div class="t">${esc(tm.name)}</div><small>${tm.players.length} integrantes · pagó ${money(tm.paid)}</small></div>
       ${badge}</button>`;
   }
@@ -561,7 +606,7 @@ function matchCard(m) {
   const done = m.status === 'done';
   const w = winner(m);
   const side = (id, src, cls) => id
-    ? `<div class="${cls} ${done && w === id ? 'win' : ''}">${esc(tname(id))}</div>`
+    ? `<div class="${cls} ${done && w === id ? 'win' : ''}">${cls === 'a' ? miniCrest(id) : ''}<span>${esc(tname(id))}</span>${cls === 'h' ? miniCrest(id) : ''}</div>`
     : `<div class="${cls} tbd">${esc(srcLabel(src))}</div>`;
   const status = done ? (w ? '<span class="badge b-ok">Final</span>' : '<span class="badge b-ok">Empate</span>')
     : m.status === 'live' ? '<span class="badge b-live">En juego</span>'
@@ -592,7 +637,7 @@ function podiumHTML(p) {
 function tableHTML(rows, qualify) {
   return `<div class="tbl-wrap"><table>
     <tr><th>#</th><th class="tn">Equipo</th><th>PJ</th><th>G</th><th>E</th><th>P</th><th>GF</th><th>GC</th><th>DG</th><th>🟨</th><th>🟥</th><th>Pts</th></tr>
-    ${rows.map((r, i) => `<tr class="${i < qualify ? 'q' : ''}"><td>${i + 1}</td><td class="tn">${esc(tname(r.id))}</td>
+    ${rows.map((r, i) => `<tr class="${i < qualify ? 'q' : ''}"><td>${i + 1}</td><td class="tn">${miniCrest(r.id)}${esc(tname(r.id))}</td>
       <td>${r.pj}</td><td>${r.pg}</td><td>${r.pe}</td><td>${r.pp}</td><td>${r.gf}</td><td>${r.gc}</td><td>${r.gf - r.gc}</td>
       <td>${r.ta}</td><td>${r.tr}</td><td class="pts">${r.pts}</td></tr>`).join('')}
   </table></div>`;
@@ -660,12 +705,32 @@ function loginHTML() {
   ${installCard()}`;
 }
 
+function torneoCard() {
+  const tor = TOR(), g = tor.config;
+  const others = Object.keys(S.torneos).length;
+  return `<div class="card">
+    <h2>🏆 Torneo</h2>
+    <label class="fl">Nombre del torneo<input id="t-name" maxlength="40" value="${esc(tor.name)}" placeholder="Ej: Copa Navidad 2026"></label>
+    <div class="fl">Tamaño de los equipos <small>(para todas las categorías)</small></div>
+    <div class="grid3b">
+      <label class="fl">Titulares<input type="number" inputmode="numeric" min="1" max="30" data-tcfg="starters" value="${g.starters}"></label>
+      <label class="fl">Suplentes<input type="number" inputmode="numeric" min="0" max="30" data-tcfg="subs" value="${g.subs}"></label>
+      <label class="fl">Mínimo<input type="number" inputmode="numeric" min="1" max="60" data-tcfg="minPlayers" value="${g.minPlayers}"></label>
+    </div>
+    <p class="muted" style="font-size:14px;margin:8px 0 0">Total por equipo: <b>${g.starters + g.subs}</b> integrantes (${g.starters} titulares + ${g.subs} suplentes). Un equipo necesita al menos <b>${g.minPlayers}</b> para inscribirse.</p>
+    <div class="row" style="margin-top:12px">
+      <button class="btn ghost sm" data-a="openTorneos">🔁 ${others > 1 ? 'Cambiar de torneo (' + others + ')' : 'Torneos'}</button>
+      <button class="btn ghost sm" data-a="newTorneo">＋ Nuevo torneo</button>
+    </div>
+  </div>`;
+}
+
 function categoriesCard() {
-  const keys = Object.keys(S.cats);
+  const keys = Object.keys(CATS_());
   return `<div class="card">
     <h2>Categorías</h2>
     <p class="muted" style="font-size:14px">Cada categoría tiene sus propios equipos, sorteo, partidos y tabla. Ejemplo: Infantil, Juvenil, Libre, Veteranos.</p>
-    ${keys.map((k) => { const t = S.cats[k]; return `<div class="org">
+    ${keys.map((k) => { const t = CATS_()[k]; return `<div class="org">
       <span class="grow"><span class="dot" data-pal="${(t.color || 0) % PALETTES}"></span> <b>${esc(t.name)}</b> <small>· ${t.teams.length} equipos</small></span>
       <span class="row" style="flex-wrap:nowrap;flex:none">
         <button class="btn ghost sm" data-a="colorCat" data-c="${k}" aria-label="Cambiar color">🎨</button>
@@ -678,7 +743,7 @@ function categoriesCard() {
     </form>
   </div>`;
 }
-const catNameTaken = (n, except) => Object.entries(S.cats).some(([k, t]) => k !== except && norm(t.name) === norm(n));
+const catNameTaken = (n, except) => Object.entries(CATS_()).some(([k, t]) => k !== except && norm(t.name) === norm(n));
 
 function viewAjustes() {
   if (!isAdmin()) return loginHTML();
@@ -704,13 +769,10 @@ function viewAjustes() {
       <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar organizador</button>
     </form>
   </div>` : ''}
+  ${torneoCard()}
   ${categoriesCard()}
   <div class="card">
-    <h2>Inscripción</h2>
-    <div class="grid2">
-      <label class="fl">Mínimo integrantes<input type="number" inputmode="numeric" min="1" max="30" data-cfg="minPlayers" value="${c.minPlayers}"></label>
-      <label class="fl">Máximo integrantes<input type="number" inputmode="numeric" min="1" max="30" data-cfg="maxPlayers" value="${c.maxPlayers}"></label>
-    </div>
+    <h2>Inscripción · ${esc(catName(S.cat))}</h2>
     <div class="grid2">
       <label class="fl">Cuota de inscripción<input type="number" inputmode="decimal" min="0" data-cfg="fee" value="${c.fee}"></label>
       <label class="fl">Minutos por partido<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
@@ -753,6 +815,7 @@ function renderModal() {
   const scroll = sheet.scrollTop;
   if (modal.type === 'team') sheet.innerHTML = teamFormHTML(modal.id);
   else if (modal.type === 'schedule') sheet.innerHTML = scheduleHTML();
+  else if (modal.type === 'torneos') sheet.innerHTML = torneosHTML();
   else if (modal.type === 'teamView') {
     if (!teamById(modal.id)) { modal = null; return renderModal(); }
     sheet.innerHTML = teamViewHTML(modal.id);
@@ -766,6 +829,22 @@ function renderModal() {
   el.hidden = false;
   document.body.style.overflow = 'hidden';
   sheet.scrollTop = scroll;
+}
+
+function torneosHTML() {
+  const ids = Object.keys(S.torneos).sort((a, b) => (S.torneos[b].createdAt || 0) - (S.torneos[a].createdAt || 0));
+  const adm = isAdmin();
+  return `<div class="mh"><h2>Torneos</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb" style="padding-top:12px">
+    ${ids.map((id) => { const tor = S.torneos[id]; const nTeams = Object.values(tor.cats).reduce((a, t) => a + t.teams.length, 0);
+      return `<div class="org">
+        <button class="list-item" style="margin:0;flex:1" data-a="switchTorneo" data-id="${id}">
+          <div class="grow"><div class="t">${id === S.tor ? '✅ ' : ''}${esc(tor.name)}</div>
+          <small>${Object.keys(tor.cats).length} categorías · ${nTeams} equipos</small></div></button>
+        ${adm && ids.length > 1 ? `<button class="btn danger sm" data-a="delTorneo" data-id="${id}" aria-label="Eliminar">🗑️</button>` : ''}
+      </div>`; }).join('')}
+  </div>
+  ${adm ? '<div class="mf"><button class="btn block" data-a="newTorneo">＋ Nuevo torneo</button></div>' : ''}`;
 }
 
 function teamViewHTML(id) {
@@ -783,8 +862,9 @@ function teamViewHTML(id) {
     <p class="muted" style="margin:0 0 6px">Goles a favor ${r.gf} · en contra ${r.gc}</p>
     <h3>Partidos</h3>
     ${ms.length ? ms.map(matchCard).join('') : '<p class="muted">Aún no tiene partidos asignados.</p>'}
-    <h3>Integrantes</h3>
-    <ul class="cardlist">${tm.players.map((p) => `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}</span></li>`).join('')}</ul>
+    ${[['Titulares', tm.players.filter((p) => !p.sub)], ['Suplentes', tm.players.filter((p) => p.sub)]].filter(([, l]) => l.length).map(([title, list]) => `
+    <h3>${title} (${list.length})</h3>
+    <ul class="cardlist">${list.map((p) => `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}</span></li>`).join('')}</ul>`).join('')}
   </div>`;
 }
 
@@ -873,22 +953,30 @@ function applySchedule() {
 }
 
 function teamFormHTML(id) {
-  const t = T(), c = t.config;
+  const t = T(), c = t.config, g = TC();
   const tm = id ? teamById(id) : null;
   const players = tm ? tm.players : [];
-  const rows = Math.max(c.maxPlayers, players.length);
+  const tit = players.filter((p) => !p.sub), sup = players.filter((p) => p.sub);
+  const nTit = Math.max(g.starters, tit.length), nSup = Math.max(g.subs, sup.length);
+  if (modal.crest === undefined) modal.crest = tm ? (tm.crest || null) : randomCrest();
+  let n = 0;
+  const row = (p, sub, req) => {
+    n++;
+    return `<div class="prow" data-sub="${sub ? 1 : 0}"><span class="pn">${n}</span>
+      <input class="pl-name" data-pl autocomplete="off" placeholder="Nombre y apellido${req ? ' *' : ''}" value="${esc(p.name || '')}">
+      <input class="pl-num" type="number" inputmode="numeric" placeholder="N°" value="${esc(p.num ?? '')}">
+      <div class="perr"></div></div>`;
+  };
   let h = `<div class="mh"><h2>${tm ? 'Editar equipo' : 'Inscribir equipo'}</h2><button class="x" data-a="close">✕</button></div>
   <div class="mb">
     <label class="fl">Nombre del equipo<input id="f-name" maxlength="40" placeholder="Ej: Los Tigres" value="${esc(tm ? tm.name : '')}"></label>
-    <div class="fl">Integrantes <small id="f-count">(mínimo ${c.minPlayers}, máximo ${c.maxPlayers})</small></div>
-    <div id="f-players">`;
-  for (let i = 0; i < rows; i++) {
-    const p = players[i] || {};
-    h += `<div class="prow"><span class="pn">${i + 1}</span>
-      <input class="pl-name" data-pl autocomplete="off" placeholder="Nombre y apellido${i < c.minPlayers ? ' *' : ''}" value="${esc(p.name || '')}">
-      <input class="pl-num" type="number" inputmode="numeric" placeholder="N°" value="${esc(p.num ?? '')}">
-      <div class="perr"></div></div>`;
-  }
+    ${crestEditorHTML(tm ? tm.name : '')}
+    <div class="fl">Integrantes <small id="f-count"></small></div>
+    <div id="f-players">
+      <div class="psec">Titulares <small>(${g.starters})</small></div>`;
+  for (let i = 0; i < nTit; i++) h += row(tit[i] || {}, false, i < g.minPlayers);
+  if (nSup > 0) h += `<div class="psec">Suplentes <small>(${g.subs})</small></div>`;
+  for (let i = 0; i < nSup; i++) h += row(sup[i] || {}, true, nTit + i < g.minPlayers);
   h += `</div>
     <label class="fl">Monto de inscripción pagado ${num(c.fee) > 0 ? `<small>(cuota ${money(c.fee)})</small>` : ''}
       <input id="f-paid" type="number" inputmode="decimal" min="0" placeholder="0" value="${esc(tm ? tm.paid : '')}"></label>
@@ -899,6 +987,43 @@ function teamFormHTML(id) {
   </div>`;
   setTimeout(checkPlayers, 0);
   return h;
+}
+
+/* ---- editor de escudo ---- */
+function crestEditorHTML(name) {
+  const cr = modal.crest;
+  const sel = (key, opts) => `<select data-crest="${key}" class="inp">${opts.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select>`;
+  return `<div class="fl">Escudo</div>
+  <div class="crest-edit">
+    <div id="crest-preview" class="crest-prev">${crestPreview(cr, name)}</div>
+    <div class="crest-ctrl">
+      <div class="row">
+        <button type="button" class="btn ghost sm" data-a="crestRandom">🎲 Al azar</button>
+        <label class="btn ghost sm">📷 Subir<input type="file" accept="image/*" id="crestFile" hidden></label>
+        <button type="button" class="btn ghost sm" data-a="crestNone" aria-label="Quitar escudo">✕</button>
+      </div>
+      <div class="crest-sel">
+        ${sel('s', Object.entries(CREST_SHAPES).map(([k, v]) => [k, 'Forma: ' + v[0]]))}
+        ${sel('p', Object.entries(CREST_PATTERNS).map(([k, v]) => [k, 'Diseño: ' + v]))}
+        ${sel('c1', CREST_COLORS.map(([c, l]) => [c, 'Color 1: ' + l]))}
+        ${sel('c2', CREST_COLORS.map(([c, l]) => [c, 'Color 2: ' + l]))}
+        ${sel('e', Object.entries(CREST_EMBLEMS).map(([k, v]) => [k, 'Emblema: ' + v]))}
+      </div>
+    </div>
+  </div>
+  <div class="crest-gallery">${CREST_PRESETS.map((p, i) => `<button type="button" data-a="crestPreset" data-i="${i}" aria-label="Escudo ${i + 1}">${crestHTML(p, name || 'FC', 46)}</button>`).join('')}</div>`;
+}
+const crestPreview = (cr, name) => (cr ? crestHTML(cr, name || '?', 96) : '<div class="crest-none">Sin escudo</div>');
+function updateCrestUI() {
+  if (!modal || modal.type !== 'team') return;
+  const name = ($('#f-name') || {}).value || '';
+  const prev = $('#crest-preview');
+  if (prev) prev.innerHTML = crestPreview(modal.crest, name);
+  const cr = modal.crest;
+  document.querySelectorAll('[data-crest]').forEach((s) => {
+    if (cr && !cr.img && cr[s.dataset.crest]) s.value = cr[s.dataset.crest];
+    s.disabled = !!(cr && cr.img);
+  });
 }
 
 function checkPlayers() {
@@ -920,14 +1045,15 @@ function checkPlayers() {
     row.querySelector('.perr').textContent = msg;
     if (msg) errors++;
   });
-  const c = T().config;
+  const g = TC();
   const cnt = $('#f-count');
-  if (cnt) cnt.textContent = `(${filled} de ${c.maxPlayers} · mínimo ${c.minPlayers})`;
+  if (cnt) cnt.textContent = `(${filled} de ${g.starters + g.subs} · mínimo ${g.minPlayers} para participar)`;
+  updateCrestUI();
   return errors;
 }
 
 function saveTeam() {
-  const t = T(), c = t.config;
+  const t = T(), g = TC();
   const id = modal.id;
   const name = $('#f-name').value.trim().replace(/\s+/g, ' ');
   if (!name) return toast('Escriba el nombre del equipo');
@@ -938,16 +1064,19 @@ function saveTeam() {
   document.querySelectorAll('#f-players .prow').forEach((row) => {
     const pn = row.querySelector('.pl-name').value.trim().replace(/\s+/g, ' ');
     const nb = row.querySelector('.pl-num').value.trim();
-    if (pn) players.push({ name: pn, num: nb });
+    if (pn) players.push({ name: pn, num: nb, sub: row.dataset.sub === '1' });
   });
-  if (players.length < c.minPlayers) return toast(`Se requieren al menos ${c.minPlayers} integrantes (hay ${players.length})`);
-  if (players.length > c.maxPlayers) return toast(`Máximo ${c.maxPlayers} integrantes`);
+  const nTit = players.filter((p) => !p.sub).length, nSup = players.length - nTit;
+  if (players.length < g.minPlayers) return toast(`Para participar se requieren al menos ${g.minPlayers} integrantes (hay ${players.length})`);
+  if (nTit > g.starters) return toast(`Máximo ${g.starters} titulares`);
+  if (nSup > g.subs) return toast(`Máximo ${g.subs} suplentes`);
   const paid = num($('#f-paid').value);
+  const crest = modal.crest || null;
   if (id) {
-    Object.assign(teamById(id), { name, players, paid });
+    Object.assign(teamById(id), { name, players, paid, crest });
   } else {
     if (t.stage !== 'inscripcion') return toast('El sorteo ya se realizó');
-    t.teams.push({ id: uid(), name, players, paid, createdAt: Date.now() });
+    t.teams.push({ id: uid(), name, players, paid, crest, createdAt: Date.now() });
   }
   save(); closeModal(); render();
   toast(id ? 'Equipo actualizado' : `✅ ${name} inscrito`);
@@ -980,6 +1109,7 @@ function matchHTML(m) {
   const edit = adm && !done && ready;      // puede anotar
   const isKO = m.phase === 'ko';
   const side = (id, src, s, val) => `<div>
+    ${id && teamById(id) && teamById(id).crest ? `<div class="mcrest-big">${crestHTML(teamById(id).crest, tname(id), 56)}</div>` : ''}
     <div class="tn">${esc(id ? tname(id) : srcLabel(src))}</div>
     <span class="big">${m.status === 'pend' && !adm ? '–' : val}</span>
     ${edit ? `<div class="stepper"><button class="minus" data-a="goal" data-s="${s}" data-d="-1">−</button><button data-a="goal" data-s="${s}" data-d="1">+</button></div>` : ''}
@@ -1090,8 +1220,7 @@ function reopenMatch() {
 }
 
 /* ---------------- Base de datos en línea ---------------- */
-const clone = (o) => JSON.parse(JSON.stringify(o));
-const payload = () => ({ cats: S.cats });
+const payload = () => ({ torneos: S.torneos });
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function saveSync() {
   try { localStorage.setItem(SYNC_KEY, JSON.stringify({ rev: sync.rev, base: sync.base, dirty: sync.dirty })); } catch (e) { /* nada */ }
@@ -1171,20 +1300,34 @@ function mergeList(L, B, R) {
   }
   return out;
 }
+/** Combina objetos por clave (torneos o categorías): altas, bajas y cambios de ambos lados. */
+function mergeKeyed(L, B, R, mergeItem) {
+  L = L || {}; B = B || {}; R = R || {};
+  const out = {};
+  for (const k of [...new Set([...Object.keys(R), ...Object.keys(L)])]) {
+    const inL = k in L, inB = k in B, inR = k in R;
+    if (inB && !inL) continue;                                    // eliminado aquí
+    if (inB && !inR) { if (!same(L[k], B[k])) out[k] = clone(L[k]); continue; } // eliminado en otro teléfono
+    if (!inR) { out[k] = clone(L[k]); continue; }                 // nuevo aquí
+    if (!inL) { out[k] = clone(R[k]); continue; }                 // nuevo en otro teléfono
+    out[k] = mergeItem(L[k], B[k], R[k]);
+  }
+  return out;
+}
+function mergeTorneo(L, B, R) {
+  B = B || {};
+  const o = clone(R);
+  if (L.name !== B.name) o.name = L.name;
+  if (!same(L.config, B.config)) o.config = L.config;
+  o.cats = mergeKeyed(L.cats, B.cats, R.cats, mergeCat);
+  return o;
+}
 function rebase(local, base, remote) {
-  const out = { cats: {} };
-  const bc = (base && base.cats) || {}, rc = (remote && remote.cats) || {};
-  const keys = [...new Set([...Object.keys(rc), ...Object.keys(local.cats)])].filter((k) => {
-    const inL = k in local.cats, inB = k in bc, inR = k in rc;
-    if (inB && !inL) return false;                                 // eliminada aquí
-    if (inB && !inR) return !same(local.cats[k], bc[k]);           // eliminada en otro teléfono (salvo cambios aquí)
-    return true;
-  });
-  for (const k of keys) {
-    const L = local.cats[k], R = rc[k];
-    if (!R) { out.cats[k] = clone(L); continue; }                  // nueva aquí
-    if (!L) { out.cats[k] = clone(R); continue; }                  // nueva en otro teléfono
-    const B = bc[k] || newTournament();
+  return { torneos: mergeKeyed(local.torneos, base && base.torneos, remote && remote.torneos, mergeTorneo) };
+}
+function mergeCat(L, B, R) {
+  {
+    B = B || newTournament();
     const o = clone(R);
     if (L.name !== B.name) o.name = L.name;
     if (L.color !== B.color) o.color = L.color;
@@ -1197,9 +1340,8 @@ function rebase(local, base, remote) {
     }
     o.teams = mergeList(L.teams, B.teams, R.teams);
     syncKO(o);
-    out.cats[k] = o;
+    return o;
   }
-  return out;
 }
 
 function isBusy() {
@@ -1216,8 +1358,8 @@ function adopt(j) {
     try { localStorage.setItem('torneo-respaldo-local', JSON.stringify(S)); } catch (e) { /* nada */ }
   }
   const d = normalizeData(clone(j.data));
-  if (d) S.cats = d.cats;
-  if (!S.cats[S.cat]) S.cat = Object.keys(S.cats)[0];
+  if (d) S.torneos = d.torneos;
+  fixSelection(S);
   Object.assign(sync, { rev: j.rev, base: clone(payload()), dirty: false, known: true });
   saveLocal(); saveSync();
   requestRender();
@@ -1276,8 +1418,10 @@ async function push() {
         sync.dirty = JSON.stringify(payload()) !== sent;
       } else if (status === 409) {
         if (j && j.data) {
-          S.cats = rebase(payload(), sync.base, j.data).cats;
-          sync.base = j.data;
+          const remote = normalizeData(clone(j.data)) || { torneos: {} };
+          S.torneos = rebase(payload(), sync.base, remote).torneos;
+          fixSelection(S);
+          sync.base = remote;
           saveLocal(); requestRender();
         }
         sync.rev = j ? j.rev : 0;
@@ -1434,22 +1578,50 @@ const actions = {
   resetCat: () => {
     if (!confirm(`¿Borrar TODO de la categoría ${catName(S.cat)}? No se puede deshacer.`)) return;
     if (!confirm('¿Seguro? Se perderán equipos, pagos y resultados.')) return;
-    S.cats[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
+    CATS_()[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
+  },
+  crestRandom: () => { if (modal) { modal.crest = randomCrest(); updateCrestUI(); } },
+  crestNone: () => { if (modal) { modal.crest = null; updateCrestUI(); } },
+  crestPreset: (d) => { if (modal) { modal.crest = clone(CREST_PRESETS[+d.i]); updateCrestUI(); } },
+  openTorneos: () => openModal('torneos', null),
+  switchTorneo: (d) => {
+    if (!S.torneos[d.id]) return;
+    S.tor = d.id; S.cat = Object.keys(CATS_())[0];
+    saveLocal(); closeModal(); render(); window.scrollTo(0, 0);
+  },
+  newTorneo: () => {
+    const n = (prompt('Nombre del nuevo torneo (ej: Copa Navidad 2026):') || '').trim().slice(0, 40);
+    if (!n) return;
+    const id = 't' + uid();
+    S.torneos[id] = newTorneo(n, CATS_());
+    S.torneos[id].config = clone(TC());
+    S.tor = id; S.cat = Object.keys(CATS_())[0];
+    save(); closeModal(); render();
+    toast('🏆 Torneo "' + n + '" creado con las mismas categorías');
+  },
+  delTorneo: (d) => {
+    const tor = S.torneos[d.id];
+    if (!tor || Object.keys(S.torneos).length < 2) return;
+    if (!confirm('¿Eliminar el torneo "' + tor.name + '" con todas sus categorías, equipos y resultados?')) return;
+    if (!confirm('Esta acción no se puede deshacer. ¿Seguro?')) return;
+    delete S.torneos[d.id];
+    fixSelection(S);
+    save(); closeModal(); render(); toast('Torneo eliminado');
   },
   renameCat: (d) => {
-    const t = S.cats[d.c]; if (!t) return;
+    const t = CATS_()[d.c]; if (!t) return;
     const n = (prompt('Nuevo nombre de la categoría:', t.name) || '').trim().slice(0, 24);
     if (!n || n === t.name) return;
     if (catNameTaken(n, d.c)) return toast('Ya existe una categoría con ese nombre');
     t.name = n; save(); render();
   },
-  colorCat: (d) => { const t = S.cats[d.c]; if (!t) return; t.color = ((t.color || 0) + 1) % PALETTES; save(); render(); },
+  colorCat: (d) => { const t = CATS_()[d.c]; if (!t) return; t.color = ((t.color || 0) + 1) % PALETTES; save(); render(); },
   delCat: (d) => {
-    const t = S.cats[d.c]; if (!t || Object.keys(S.cats).length < 2) return;
+    const t = CATS_()[d.c]; if (!t || Object.keys(CATS_()).length < 2) return;
     if (!confirm(`¿Eliminar la categoría "${t.name}"?${t.teams.length ? ` Tiene ${t.teams.length} equipos inscritos.` : ''}`)) return;
     if (t.teams.length && !confirm('Se borrarán sus equipos, pagos, partidos y resultados. No se puede deshacer. ¿Seguro?')) return;
-    delete S.cats[d.c];
-    if (S.cat === d.c) S.cat = Object.keys(S.cats)[0];
+    delete CATS_()[d.c];
+    if (S.cat === d.c) S.cat = Object.keys(CATS_())[0];
     save(); render(); toast('Categoría eliminada');
   },
   syncInfo: () => toast(syncText()),
@@ -1462,7 +1634,7 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install']);
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
@@ -1472,11 +1644,11 @@ document.addEventListener('submit', async (e) => {
     const n = $('#cat-name').value.trim().slice(0, 24);
     if (!n) return toast('Escriba el nombre de la categoría');
     if (catNameTaken(n)) return toast('Ya existe una categoría con ese nombre');
-    const used = Object.values(S.cats).map((t) => t.color);
-    let color = Object.keys(S.cats).length % PALETTES;
+    const used = Object.values(CATS_()).map((t) => t.color);
+    let color = Object.keys(CATS_()).length % PALETTES;
     for (let i = 0; i < PALETTES; i++) if (!used.includes(i)) { color = i; break; }
     const id = 'c' + uid();
-    S.cats[id] = newTournament(n, color);
+    CATS_()[id] = newTournament(n, color);
     S.cat = id;
     save(); render(); toast('✅ Categoría ' + n + ' creada');
     return;
@@ -1505,25 +1677,48 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('input', (e) => {
   if (e.target.matches('[data-pl]')) checkPlayers();
+  if (e.target.id === 'f-name' && modal && modal.crest && modal.crest.e === 'inicial') updateCrestUI();
 });
 
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.id === 't-name') {
+    if (!isAdmin()) return;
+    const n = el.value.trim().slice(0, 40);
+    if (n) { TOR().name = n; save(); render(); toast('Nombre del torneo guardado'); }
+    return;
+  }
+  if (el.dataset.tcfg) {
+    if (!isAdmin()) return;
+    const g = TC(), k = el.dataset.tcfg;
+    g[k] = Math.max(k === 'subs' ? 0 : 1, Math.min(k === 'minPlayers' ? 60 : 30, Math.round(num(el.value, g[k]))));
+    if (g.minPlayers > g.starters + g.subs) { g.minPlayers = g.starters + g.subs; toast('El mínimo no puede superar el total del equipo'); }
+    save(); render();
+    return;
+  }
+  if (el.dataset.crest) {
+    const k = el.dataset.crest;
+    modal.crest = Object.assign(modal.crest && !modal.crest.img ? modal.crest : randomCrest(), { [k]: el.value });
+    updateCrestUI();
+    return;
+  }
+  if (el.id === 'crestFile' && el.files[0]) {
+    crestFromFile(el.files[0]).then((img) => { modal.crest = { img }; updateCrestUI(); }).catch(() => toast('No se pudo leer la imagen'));
+    return;
+  }
   if (el.dataset.cfg) {
     if (!isAdmin()) return;
     const c = T().config;
     const k = el.dataset.cfg;
     let v = num(el.value);
     if (k === 'format') v = el.value;
-    if (['minPlayers', 'maxPlayers', 'duration'].includes(k)) v = Math.max(1, Math.min(k === 'duration' ? 200 : 30, Math.round(v)));
+    if (k === 'duration') v = Math.max(1, Math.min(200, Math.round(v)));
     if (k === 'fee') v = Math.max(0, v);
     c[k] = v;
-    if (c.minPlayers > c.maxPlayers) {
-      if (k === 'minPlayers') c.maxPlayers = c.minPlayers; else c.minPlayers = c.maxPlayers;
-    }
+
     if (k === 'format' && c.format !== 'liga') c.ligaFinal = c.ligaFinal || 0;
     save();
-    if (el.type === 'radio' || el.tagName === 'SELECT' || ['minPlayers', 'maxPlayers'].includes(k)) render();
+    if (el.type === 'radio' || el.tagName === 'SELECT') render();
     return;
   }
   if (el.id === 'm-dur') {
@@ -1549,7 +1744,7 @@ document.addEventListener('change', (e) => {
       try {
         const d = JSON.parse(r.result);
         if (!normalizeData(d)) throw new Error('formato');
-        if (!d.cats[d.cat]) d.cat = Object.keys(d.cats)[0];
+        fixSelection(d);
         if (!confirm('¿Reemplazar los datos actuales con el respaldo?')) return;
         S = d; save(); render(); toast('✅ Respaldo importado');
       } catch (err) { toast('Archivo no válido'); }
