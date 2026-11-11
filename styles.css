@@ -62,7 +62,7 @@ main { max-width: 720px; margin: 0 auto; padding: 14px 16px; }
 
 .tabs {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
-  display: grid; grid-template-columns: repeat(4, 1fr);
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
   background: var(--card); border-top: 1px solid var(--line);
   padding-bottom: var(--safe-b);
 }
@@ -263,3 +263,4 @@ td.pts { font-weight: 800; }
 .grid3 .fl { margin-top: 6px; }
 .org { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 input[type="date"], input[type="time"] { min-width: 0; }
+.tabs button[hidden] { display: none; }

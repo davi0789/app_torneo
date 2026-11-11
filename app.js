@@ -52,6 +52,9 @@ let auth = null;
 try { auth = JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) { /* nada */ }
 let orgs = null; // lista de organizadores (se carga en Ajustes)
 const isAdmin = () => sync.mode === 'local' || !!(auth && auth.token);
+// El acceso de organizadores solo se muestra entrando por /admin (o ?admin)
+const ADMIN_URL = /\/admin\/?$/.test(location.pathname) || /(^|[?&#])admin(\b|$)/.test(location.search + location.hash);
+const showAccess = () => isAdmin() || ADMIN_URL;
 function setAuth(a) {
   auth = a;
   try { if (a) localStorage.setItem(AUTH_KEY, JSON.stringify(a)); else localStorage.removeItem(AUTH_KEY); } catch (e) { /* nada */ }
@@ -331,7 +334,11 @@ function render() {
   document.body.classList.toggle('public', !adm);
   document.querySelectorAll('#cats button').forEach((b) => b.classList.toggle('on', b.dataset.c === S.cat));
   const t4 = document.querySelector('#tabs [data-t="ajustes"]');
-  if (t4) t4.innerHTML = adm ? '<span>⚙️</span>Ajustes' : '<span>🔑</span>Ingresar';
+  if (!showAccess() && S.tab === 'ajustes') S.tab = 'partidos';
+  if (t4) {
+    t4.hidden = !showAccess();
+    t4.innerHTML = adm ? '<span>⚙️</span>Ajustes' : '<span>🔑</span>Ingresar';
+  }
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.t === S.tab));
   $('#view').innerHTML = (views[S.tab] || viewEquipos)();
   renderModal();
@@ -1280,7 +1287,7 @@ const actions = {
     if (sync.dirty && !confirm('Hay cambios que aún no se guardaron en línea. ¿Cerrar sesión de todos modos?')) return;
     setAuth(null); orgs = null;
     sync.dirty = false; sync.rev = -1;
-    S.tab = 'partidos'; render(); pull(true);
+    S.tab = ADMIN_URL ? 'ajustes' : 'partidos'; render(); pull(true);
     toast('Sesión cerrada');
   },
   changePass: async () => {
@@ -1479,5 +1486,6 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
 
+if (ADMIN_URL && !auth) S.tab = 'ajustes';
 render();
 startSync();
