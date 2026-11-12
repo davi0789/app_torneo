@@ -12,7 +12,17 @@ const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(3
 const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (n) => '$' + (Number(n) || 0).toLocaleString('es', { maximumFractionDigits: 2 });
-const shuffle = (arr) => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+/** Número aleatorio 0..n-1 usando el generador criptográfico del navegador (sin sesgo). */
+function randInt(n) {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const buf = new Uint32Array(1), lim = Math.floor(0x100000000 / n) * n;
+    let x; do { crypto.getRandomValues(buf); x = buf[0]; } while (x >= lim);
+    return x % n;
+  }
+  return Math.floor(Math.random() * n);
+}
+/** Mezcla de Fisher-Yates: todas las combinaciones tienen la misma probabilidad. */
+const shuffle = (arr) => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = randInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const num = (v, d = 0) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
 
 function newTournament(name = '', color = 0) {
@@ -219,12 +229,25 @@ function bracketOrder(P) {
 const roundName = (slots) => ({ 2: 'Final', 4: 'Semifinal', 8: 'Cuartos de final', 16: 'Octavos de final', 32: 'Dieciseisavos' }[slots] || `Ronda de ${slots}`);
 
 /** Crea la llave de eliminación. seeds = ids de equipos ordenados por siembra. */
-function buildKO(seeds) {
+function buildKO(seeds, groupOf) {
   const t = T();
   const n = seeds.length;
   if (n < 2) return;
   let P = 1; while (P < n) P *= 2;
   let prev = bracketOrder(P).map((s) => (s <= n ? { t: seeds[s - 1] } : null));
+  // Evitar que dos equipos del mismo grupo se crucen en la primera ronda
+  if (groupOf) {
+    const G = (x) => x && groupOf[x.t];
+    for (let i = 0; i < prev.length; i += 2) {
+      const a = prev[i], b = prev[i + 1];
+      if (!a || !b || G(a) !== G(b)) continue;
+      for (let j = 0; j < prev.length; j += 2) {
+        const c = prev[j], d = prev[j + 1];
+        if (j === i || !c || !d) continue;
+        if (G(a) !== G(d) && G(c) !== G(b)) { prev[i + 1] = d; prev[j + 1] = b; break; }
+      }
+    }
+  }
   let round = 1;
   while (prev.length > 1) {
     const name = roundName(prev.length);
@@ -269,7 +292,7 @@ function srcLabel(src) {
   return (src.w ? 'Ganador ' : 'Perdedor ') + (m ? m.label : '');
 }
 function resetMatch(m) {
-  Object.assign(m, { hs: 0, as: 0, ph: null, pa: null, status: 'pend', elapsed: 0, runAt: null, alerted: false, cards: [] });
+  Object.assign(m, { hs: 0, as: 0, ph: null, pa: null, status: 'pend', elapsed: 0, runAt: null, alerted: false, alertedAdd: false, added: 0, cards: [], goals: [] });
 }
 /** Actualiza los equipos de la llave según los resultados. */
 function syncKO(t = T()) {
@@ -303,7 +326,9 @@ function standings(ids, phase, group) {
   }
   const tb = T().config.tiebreak || 'h2h';
   const general = (x, y) => (y.gf - y.gc) - (x.gf - x.gc) || y.gf - x.gf;
-  const tail = (x, y) => (x.ta + 3 * x.tr) - (y.ta + 3 * y.tr) || tname(x.id).localeCompare(tname(y.id));
+  const ov = T().tieOverride || {};
+  const manual = (x, y) => { const w = ov[[x.id, y.id].sort().join('|')]; return w ? (w === x.id ? -1 : 1) : 0; };
+  const tail = (x, y) => (x.ta + 3 * x.tr) - (y.ta + 3 * y.tr) || manual(x, y) || tname(x.id).localeCompare(tname(y.id));
   const all = [...rows.values()].sort((x, y) => y.pts - x.pts);
   // Ordenar cada bloque de equipos empatados en puntos
   const out = [];
@@ -329,9 +354,26 @@ function standings(ids, phase, group) {
   return out;
 }
 
+/** Qué criterio separó a dos equipos consecutivos de la tabla. */
+function decidedBy(x, y) {
+  if (x.pts !== y.pts) return 'puntos';
+  const ov = (T().tieOverride || {})[[x.id, y.id].sort().join('|')];
+  if (ov) { const rest = decidedBy(Object.assign({}, x, { id: '_' }), Object.assign({}, y, { id: '__' })); if (rest === 'empate total') return 'decisión del organizador'; }
+  if (x.h2h && y.h2h && (x.h2h.pts !== y.h2h.pts || x.h2h.dg !== y.h2h.dg || x.h2h.gf !== y.h2h.gf)) return 'enfrentamiento directo';
+  if ((x.gf - x.gc) !== (y.gf - y.gc)) return 'diferencia de goles';
+  if (x.gf !== y.gf) return 'goles a favor';
+  if ((x.ta + 3 * x.tr) !== (y.ta + 3 * y.tr)) return 'juego limpio (menos tarjetas)';
+  return 'empate total';
+}
+
 /* ============ Suspensiones (roja y amarillas acumuladas) ============ */
 /** Partidos de un equipo en orden de juego. */
-const teamMatches = (teamId, t = T()) => t.matches.filter((m) => m.home === teamId || m.away === teamId);
+function teamMatches(teamId, t = T()) {
+  const list = t.matches.map((m, i) => ({ m, i })).filter(({ m }) => m.home === teamId || m.away === teamId);
+  // si todos tienen fecha, se usa el orden del calendario; si no, el orden de las jornadas
+  if (list.length && list.every(({ m }) => m.date)) list.sort((a, b) => (a.m.date + (a.m.time || '')).localeCompare(b.m.date + (b.m.time || '')) || a.i - b.i);
+  return list.map((x) => x.m);
+}
 /** Devuelve [{player, reason}] de jugadores suspendidos para este partido y equipo. */
 function suspendedIn(match, teamId) {
   const c = T().config;
@@ -430,7 +472,8 @@ function doDraw() {
   if (!confirm(`¿Realizar el sorteo de ${n} equipos (${catName(S.cat)})?`)) return;
 
   const ids = shuffle(t.teams.map((x) => x.id));
-  t.matches = []; t.groups = [];
+  t.matches = []; t.groups = []; t.tieOverride = {}; t.finalInfo = null;
+  t.drawInfo = { at: Date.now(), by: auth ? auth.user : 'local', n, format: c.format };
   if (c.format === 'elim') {
     t.stage = 'final';
     buildKO(ids);
@@ -452,7 +495,7 @@ function doDraw() {
   toast('🎲 Sorteo realizado');
 }
 
-function genFinal() {
+function genFinal(prevNotes = []) {
   const t = T(), c = t.config;
   if (!phase1Done()) return toast('Terminen todos los partidos primero');
   let seeds = [];
@@ -463,9 +506,34 @@ function genFinal() {
     for (let pos = 0; pos < c.perGroup; pos++) for (const tab of tabs) if (tab[pos]) seeds.push(tab[pos].id);
   }
   if (seeds.length < 2) return toast('No hay suficientes clasificados');
+
+  // Revisar el último cupo de cada tabla: avisar cómo se decidió y pedir decisión si hay empate total
+  const cuts = c.format === 'liga'
+    ? [{ tab: standings(t.groups[0].teams, 'liga', ''), cut: c.ligaFinal, g: '' }]
+    : t.groups.map((g) => ({ tab: standings(g.teams, 'grupo', g.name), cut: c.perGroup, g: g.name }));
+  const notes = [...prevNotes];
+  for (const { tab, cut, g } of cuts) {
+    const x = tab[cut - 1], y = tab[cut];
+    if (!x || !y) continue;
+    const why = decidedBy(x, y);
+    if (why === 'empate total') {
+      const ans = (prompt(`Empate TOTAL por el último cupo${g ? ' del Grupo ' + g : ''}:\n\n1 = ${tname(x.id)}\n2 = ${tname(y.id)}\nS = sortear al azar\n\n¿Quién clasifica? (definan en la cancha, por ejemplo con penales, y escriban 1 o 2)`) || '').trim().toUpperCase();
+      let w = ans === '1' ? x.id : ans === '2' ? y.id : ans === 'S' ? [x.id, y.id][randInt(2)] : null;
+      if (!w) return toast('Fase final no generada: falta decidir el empate');
+      t.tieOverride = Object.assign({}, t.tieOverride, { [[x.id, y.id].sort().join('|')]: w });
+      notes.push(`${tname(w)} clasificó por decisión ${ans === 'S' ? 'de sorteo' : 'del organizador'}`);
+      return genFinal(notes); // recalcular con la decisión aplicada
+    }
+    if (why === 'juego limpio (menos tarjetas)') notes.push(`${tname(x.id)} clasificó sobre ${tname(y.id)} por juego limpio (menos tarjetas)`);
+  }
+  const qual = seeds.map(tname).join(', ');
+  if (!confirm(`Clasificados a la fase final:\n${qual}${notes.length ? '\n\n⚠️ ' + notes.join('\n⚠️ ') : ''}\n\n¿Generar la fase final?`)) return;
+
   t.matches = t.matches.filter((m) => m.phase !== 'ko');
-  buildKO(seeds);
+  const groupOf = c.format === 'grupos' && t.groups.length > 1 ? Object.fromEntries(t.groups.flatMap((g) => g.teams.map((id) => [id, g.name]))) : null;
+  buildKO(seeds, groupOf);
   t.stage = 'final';
+  t.finalInfo = { at: Date.now(), by: auth ? auth.user : 'local', qualified: seeds };
   save(); render();
   toast('🏁 Fase final generada');
 }
@@ -794,6 +862,15 @@ function drawSetupHTML() {
   return h;
 }
 
+/** Transparencia: cuándo y quién hizo el sorteo y la fase final. */
+function drawInfoHTML(t) {
+  const fmtAt = (ms) => new Date(ms).toLocaleString('es', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  let h = '';
+  if (t.drawInfo) h += `🎲 Sorteo realizado el ${fmtAt(t.drawInfo.at)}${t.drawInfo.by && t.drawInfo.by !== 'local' ? ' por ' + esc(t.drawInfo.by) : ''}`;
+  if (t.finalInfo) h += `${h ? '<br>' : ''}🏁 Fase final generada el ${fmtAt(t.finalInfo.at)}${t.finalInfo.by && t.finalInfo.by !== 'local' ? ' por ' + esc(t.finalInfo.by) : ''}`;
+  return h ? `<p class="muted" style="font-size:13px;margin:-6px 0 12px">${h}</p>` : '';
+}
+
 function calendarHTML(list) {
   const key = (m) => m.date + ' ' + (m.time || '99:99') + ' ' + String(m.field || '').padStart(3, '0');
   const dated = list.filter((m) => m.date).sort((a, b) => key(a).localeCompare(key(b)));
@@ -850,6 +927,8 @@ function viewPartidos() {
   const done = all.filter((m) => m.status === 'done').length;
   let h = `<h1>Partidos ${catName(S.cat)}</h1>
     <p class="muted">${fmt} · ${done}/${all.length} jugados${adm ? ' · toque un partido para jugarlo' : ''}</p>
+    ${drawInfoHTML(t)}`;
+  h += `
     <div class="seg2">
       <button data-a="view" data-v="cal" class="${mode === 'cal' ? 'on' : ''}">📅 Calendario</button>
       <button data-a="view" data-v="fase" class="${mode === 'fase' ? 'on' : ''}">🗂️ Por fase</button>
@@ -924,12 +1003,13 @@ function tableHTML(rows, qualify) {
 function viewTabla() {
   const t = T(), c = t.config;
   if (t.stage === 'inscripcion') return `<h1>Tabla ${catName(S.cat)}</h1><div class="empty">Aún no se ha realizado el sorteo.</div>`;
-  let h = `<h1>Tabla ${catName(S.cat)}</h1>`;
+  let h = `<h1>Tabla ${catName(S.cat)}</h1>${drawInfoHTML(t)}`;
   const pod = podium();
   if (pod) h += podiumHTML(pod);
 
   if (c.format === 'liga') {
     h += `<h3>Posiciones</h3>` + tableHTML(standings(t.groups[0].teams, 'liga', ''), c.ligaFinal || c.podium);
+    h += `<p class="muted" style="font-size:12.5px;margin-top:-4px">Desempate: ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</p>`;
   } else if (c.format === 'grupos') {
     for (const g of t.groups) h += `<h3>Grupo ${g.name}</h3>` + tableHTML(standings(g.teams, 'grupo', g.name), c.perGroup);
   }
@@ -1085,6 +1165,11 @@ function viewAjustes() {
     </div>
     <small>Doble amarilla en un partido = roja automática. Luego: puntos → ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</small>
   </div>
+  ${online ? `<div class="card">
+    <h2>🕘 Historial y restauración</h2>
+    <p class="muted" style="font-size:14px">Cada cambio guarda una copia de la versión anterior (últimas 40). Si algo se borra o se cambia por error, puede volver a una versión anterior.</p>
+    <button class="btn ghost block sm" data-a="openHistory">Ver versiones anteriores</button>
+  </div>` : ''}
   <div class="card">
     <h2>Base de datos en línea</h2>
     <p class="muted" style="font-size:14px" id="sync-status">${esc(syncText())}</p>
@@ -1122,6 +1207,7 @@ function renderModal() {
   if (modal.type === 'team') sheet.innerHTML = teamFormHTML(modal.id);
   else if (modal.type === 'schedule') sheet.innerHTML = scheduleHTML();
   else if (modal.type === 'torneos') sheet.innerHTML = torneosHTML();
+  else if (modal.type === 'history') sheet.innerHTML = historyHTML();
   else if (modal.type === 'teamView') {
     if (!teamById(modal.id)) { modal = null; return renderModal(); }
     sheet.innerHTML = teamViewHTML(modal.id);
@@ -1135,6 +1221,22 @@ function renderModal() {
   el.hidden = false;
   document.body.style.overflow = 'hidden';
   sheet.scrollTop = scroll;
+}
+
+let historyList = null;
+function historyHTML() {
+  const fmtAt = (ms) => (ms ? new Date(ms).toLocaleString('es', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—');
+  let body;
+  if (!historyList) body = '<p class="muted">Cargando…</p>';
+  else if (!historyList.length) body = '<p class="muted">Aún no hay versiones anteriores guardadas. Se irán guardando con cada cambio.</p>';
+  else body = historyList.map((v) => v.error ? '' : `<div class="org">
+      <span class="grow"><b>${fmtAt(v.at)}</b><br><small>${v.by ? 'guardada por ' + esc(v.by) + ' · ' : ''}${v.teams} equipos · ${v.done} partidos finalizados${v.live ? ' · ' + v.live + ' en vivo' : ''}</small></span>
+      <button class="btn ghost sm" data-a="restoreVersion" data-i="${v.i}">Restaurar</button></div>`).join('');
+  return `<div class="mh"><h2>🕘 Versiones anteriores</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb" style="padding-top:10px">
+    <div class="note">Restaurar reemplaza los datos actuales de TODOS los torneos por los de esa versión. La versión actual también queda guardada, así que puede deshacer la restauración.</div>
+    ${body}
+  </div>`;
 }
 
 function torneosHTML() {
@@ -1651,7 +1753,8 @@ function sessionExpired() {
 }
 
 /** Combina cambios locales (local vs base) sobre lo que hay en el servidor (remote). */
-function mergeList(L, B, R) {
+function mergeList(L, B, R, itemMerge) {
+  L = L || []; B = B || []; R = R || [];
   const bm = new Map(B.map((x) => [x.id, x]));
   const lm = new Map(L.map((x) => [x.id, x]));
   let out = R.filter((x) => !(bm.has(x.id) && !lm.has(x.id))); // borrados aquí
@@ -1659,11 +1762,36 @@ function mergeList(L, B, R) {
     const b = bm.get(l.id);
     if (b && same(b, l)) continue;                // sin cambios locales
     const i = out.findIndex((x) => x.id === l.id);
-    if (i >= 0) out[i] = l;                       // modificado aquí
+    if (i >= 0) out[i] = itemMerge && b ? itemMerge(l, b, out[i]) : l; // modificado aquí
     else if (!b) out.push(l);                     // nuevo aquí
   }
   return out;
 }
+/** Combina campo por campo: solo se aplican los campos que cambiaron en este teléfono. */
+function mergeFields(L, B, R, lists = [], deltas = []) {
+  const o = clone(R);
+  for (const k of new Set([...Object.keys(L), ...Object.keys(B)])) {
+    if (same(L[k], B[k])) continue;
+    if (lists.includes(k)) o[k] = mergeList(L[k], B[k], R[k]);
+    else if (deltas.includes(k) && typeof L[k] === 'number' && typeof B[k] === 'number') o[k] = Math.max(0, (R[k] || 0) + (L[k] - B[k]));
+    else o[k] = clone(L[k]);
+  }
+  return o;
+}
+/** Partido: goles y tarjetas se suman de ambos lados; el marcador se combina por diferencia. */
+const mergeMatch = (L, B, R) => {
+  const o = mergeFields(L, B, R, ['cards', 'goals'], ['hs', 'as']);
+  // Un partido FINALIZADO en el servidor no se reabre por cambios de otro teléfono
+  // (solo si este organizador lo había finalizado y lo reabrió con "Corregir resultado").
+  if (R.status === 'done' && L.status !== 'done' && B.status !== 'done') {
+    for (const k of ['status', 'runAt', 'elapsed', 'ph', 'pa']) o[k] = R[k];
+    mergeNotices.push('Un partido ya había sido finalizado por otro organizador; se mantuvo su resultado.');
+  }
+  // Si aquí se finalizó, el marcador final es el de este teléfono más los goles que el otro haya sumado
+  return o;
+};
+const mergeTeam = (L, B, R) => mergeFields(L, B, R);
+let mergeNotices = [];
 /** Combina objetos por clave (torneos o categorías): altas, bajas y cambios de ambos lados. */
 function mergeKeyed(L, B, R, mergeItem) {
   L = L || {}; B = B || {}; R = R || {};
@@ -1696,13 +1824,27 @@ function mergeCat(L, B, R) {
     if (L.name !== B.name) o.name = L.name;
     if (L.color !== B.color) o.color = L.color;
     if (!same(L.config, B.config)) o.config = L.config;
-    if (!same(L.groups, B.groups)) {             // sorteo hecho/deshecho aquí
+    const drawL = !same(L.groups, B.groups), drawR = !same(R.groups, B.groups);
+    const koIds = (x) => (x.matches || []).filter((m) => m.phase === 'ko').map((m) => m.id).sort().join();
+    const koL = koIds(L) !== koIds(B), koR = koIds(R) !== koIds(B);
+    const meta = ['drawInfo', 'finalInfo', 'tieOverride'];
+    if (drawL && drawR) {
+      // Ambos sortearon a la vez: se mantiene el sorteo que llegó primero al servidor
+      mergeNotices.push(`Otro organizador ya había realizado el sorteo de ${R.name || 'la categoría'}. Se mantiene ese sorteo.`);
+    } else if (drawL) {
       o.groups = L.groups; o.stage = L.stage; o.matches = L.matches;
+      meta.forEach((k) => { o[k] = L[k]; });
+    } else if (koL && koR) {
+      // Ambos generaron o deshicieron la fase final: se mantiene la del servidor, se combina la fase 1
+      const p1 = (x) => (x.matches || []).filter((m) => m.phase !== 'ko');
+      o.matches = mergeList(p1(L), p1(B), p1(R), mergeMatch).concat(R.matches.filter((m) => m.phase === 'ko'));
+      mergeNotices.push(`Otro organizador ya había cambiado la fase final de ${R.name || 'la categoría'}. Se mantiene la suya.`);
     } else {
       if (L.stage !== B.stage) o.stage = L.stage;
-      o.matches = mergeList(L.matches, B.matches, R.matches);
+      meta.forEach((k) => { if (!same(L[k], B[k])) o[k] = L[k]; });
+      o.matches = mergeList(L.matches, B.matches, R.matches, mergeMatch);
     }
-    o.teams = mergeList(L.teams, B.teams, R.teams);
+    o.teams = mergeList(L.teams, B.teams, R.teams, mergeTeam);
     syncKO(o);
     return o;
   }
@@ -1783,7 +1925,9 @@ async function push() {
       } else if (status === 409) {
         if (j && j.data) {
           const remote = normalizeData(clone(j.data)) || { torneos: {} };
+          mergeNotices = [];
           S.torneos = rebase(payload(), sync.base, remote).torneos;
+          if (mergeNotices.length) toast('ℹ️ ' + mergeNotices.join(' '));
           fixSelection(S);
           sync.base = remote;
           saveLocal(); requestRender();
@@ -1877,15 +2021,22 @@ const actions = {
   draw: () => doDraw(),
   genFinal: () => genFinal(),
   undoFinal: () => {
-    if (!confirm('¿Borrar la fase final y sus resultados?')) return;
     const t = T();
+    const played = t.matches.filter((m) => m.phase === 'ko' && m.status !== 'pend').length;
+    if (played) {
+      if ((prompt(`Hay ${played} partido(s) de la fase final con resultado. Se borrarán.\nEscriba BORRAR para confirmar:`) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
+    } else if (!confirm('¿Borrar la fase final?')) return;
+    t.finalInfo = null; t.tieOverride = {};
     t.matches = t.matches.filter((m) => m.phase !== 'ko');
     t.stage = 'fase1'; save(); render();
   },
   undoDraw: () => {
-    if (!confirm('¿Deshacer el sorteo? Se borrarán TODOS los partidos y resultados de esta categoría.')) return;
     const t = T();
-    t.matches = []; t.groups = []; t.stage = 'inscripcion';
+    const played = t.matches.filter((m) => m.status !== 'pend').length;
+    if (played) {
+      if ((prompt(`Hay ${played} partido(s) jugados o en juego en ${catName(S.cat)}. Se borrarán TODOS los resultados, goles y tarjetas.\nEscriba BORRAR para confirmar:`) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
+    } else if (!confirm('¿Deshacer el sorteo? Se borrarán los partidos programados de esta categoría.')) return;
+    t.matches = []; t.groups = []; t.stage = 'inscripcion'; t.drawInfo = null; t.finalInfo = null; t.tieOverride = {};
     save(); render(); toast('Sorteo deshecho');
   },
   openMatch: (d) => openModal('match', d.id),
@@ -1968,6 +2119,7 @@ const actions = {
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   },
   resetCat: () => {
+    if (T().matches.some((m) => m.status !== 'pend') && (prompt('Esta categoría tiene resultados. Escriba BORRAR para vaciarla:') || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
     if (!confirm(`¿Borrar TODO de la categoría ${catName(S.cat)}? No se puede deshacer.`)) return;
     if (!confirm('¿Seguro? Se perderán equipos, pagos y resultados.')) return;
     CATS_()[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
@@ -1976,6 +2128,33 @@ const actions = {
   crestNone: () => { if (modal) { modal.crest = null; updateCrestUI(); } },
   crestPreset: (d) => { if (modal) { modal.crest = clone(CREST_PRESETS[+d.i]); updateCrestUI(); } },
   openTorneos: () => openModal('torneos', null),
+  openHistory: async () => {
+    historyList = null; openModal('history', null);
+    try {
+      const { status, j } = await apiCall('GET', null, '?history=1');
+      if (status === 401) return sessionExpired();
+      historyList = status === 200 && j ? j.versions : [];
+    } catch (e) { historyList = []; toast('Sin conexión'); }
+    if (modal && modal.type === 'history') renderModal();
+  },
+  restoreVersion: async (d) => {
+    const v = (historyList || []).find((x) => String(x.i) === String(d.i));
+    if (!v || !confirm(`¿Restaurar la versión del ${new Date(v.at).toLocaleString('es')}?\n(${v.teams} equipos, ${v.done} partidos finalizados)\n\nLos datos actuales se reemplazarán, pero quedarán guardados en el historial.`)) return;
+    try {
+      const ver = await apiCall('GET', null, '?version=' + v.i);
+      if (ver.status !== 200 || !ver.j || !ver.j.data) return toast('No se pudo leer esa versión');
+      const data = normalizeData(clone(ver.j.data));
+      if (!data) return toast('Versión no válida');
+      const cur = await apiCall('GET', null, '');
+      const put = await apiCall('PUT', { baseRev: cur.j ? cur.j.rev : 0, data: { torneos: data.torneos } });
+      if (put.status === 401) return sessionExpired();
+      if (put.status !== 200) return toast('No se pudo restaurar, intente de nuevo');
+      sync.dirty = false; sync.rev = -1;
+      closeModal();
+      await pull(true);
+      toast('✅ Versión restaurada');
+    } catch (e) { toast('Sin conexión'); }
+  },
   switchTorneo: (d) => {
     if (!S.torneos[d.id]) return;
     S.tor = d.id; S.cat = Object.keys(CATS_())[0];
