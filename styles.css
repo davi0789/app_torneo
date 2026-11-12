@@ -480,3 +480,15 @@ td.tn .mcrest .crest { max-height: 18px; max-width: 18px; }
 .goals li { font-size: 14px; }
 .goals li.gh { text-align: left; }
 .goals li.ga { text-align: right; }
+
+/* flechas para filas deslizables */
+.arrow {
+  width: 32px; height: 32px; border-radius: 10px; border: 1px solid var(--line); background: var(--card);
+  color: var(--text); font-size: 20px; line-height: 1; cursor: pointer; display: grid; place-items: center; padding: 0 0 2px;
+}
+.arrow:disabled { opacity: .35; cursor: default; }
+.arrow:not(:disabled):active { transform: scale(.94); }
+.hscroll { scroll-behavior: smooth; }
+@media (min-width: 900px) {
+  .hscroll { margin: 0; padding-left: 2px; padding-right: 2px; }
+}

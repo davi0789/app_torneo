@@ -613,6 +613,7 @@ function render() {
   $('#view').innerHTML = (views[S.tab] || viewEquipos)();
   renderModal();
   setMode(sync.mode, false);
+  document.querySelectorAll('.hscroll[id]').forEach(updateArrows);
 }
 
 /* ---- utilidades de fechas ---- */
@@ -781,8 +782,13 @@ function viewInicio() {
     left += `<div class="sec-head"><h2>⏭️ Próximo partido</h2><button class="link" data-a="tab" data-t="partidos">Calendario →</button></div>`;
     left += featureMatch(upcoming[0], 'Próximo');
     if (upcoming.length > 1) {
-      left += `<div class="sec-head"><h2>📅 Siguientes</h2><span class="muted" style="font-size:13px">${upcoming.length - 1} partidos</span></div>
-        <div class="hscroll">${upcoming.slice(1, 12).map(miniMatch).join('')}</div>`;
+      left += `<div class="sec-head"><h2>📅 Siguientes</h2>
+          <span class="row" style="flex-wrap:nowrap;align-items:center;gap:6px">
+            <span class="muted" style="font-size:13px">${upcoming.length - 1} partidos</span>
+            <button class="arrow" data-a="scrollRow" data-row="nextRow" data-dir="-1" aria-label="Anteriores" disabled>‹</button>
+            <button class="arrow" data-a="scrollRow" data-row="nextRow" data-dir="1" aria-label="Siguientes" ${upcoming.length - 1 > 1 ? '' : 'disabled'}>›</button>
+          </span></div>
+        <div class="hscroll" id="nextRow">${upcoming.slice(1, 40).map(miniMatch).join('')}</div>`;
     }
   }
   if (recent.length) {
@@ -2296,6 +2302,13 @@ const actions = {
     if (S.cat === d.c) S.cat = Object.keys(CATS_())[0];
     save(); render(); toast('Categoría eliminada');
   },
+  scrollRow: (d) => {
+    const row = document.getElementById(d.row); if (!row) return;
+    const card = row.firstElementChild;
+    const step = card ? (card.getBoundingClientRect().width + 10) * Math.max(1, Math.floor(row.clientWidth / (card.getBoundingClientRect().width + 10))) : row.clientWidth * 0.8;
+    row.scrollBy({ left: Number(d.dir) * step }); // desplazamiento suave definido en CSS
+    setTimeout(() => updateArrows(row), 450);
+  },
   syncInfo: () => toast(syncText()),
   theme: () => {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -2319,7 +2332,7 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share']);
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
@@ -2443,6 +2456,14 @@ document.addEventListener('change', (e) => {
     r.readAsText(el.files[0]);
   }
 });
+
+/** Activa o desactiva las flechas ‹ › de las filas deslizables según la posición. */
+function updateArrows(row) {
+  const btns = document.querySelectorAll('[data-row="' + row.id + '"]');
+  btns.forEach((b) => { b.disabled = Number(b.dataset.dir) < 0 ? row.scrollLeft <= 20 : row.scrollLeft + row.clientWidth >= row.scrollWidth - 20; });
+}
+document.addEventListener('scroll', (e) => { if (e.target && e.target.classList && e.target.classList.contains('hscroll') && e.target.id) updateArrows(e.target); }, true);
+window.addEventListener('resize', () => document.querySelectorAll('.hscroll[id]').forEach(updateArrows));
 
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal) closeModal(); });
 
