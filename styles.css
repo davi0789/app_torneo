@@ -492,3 +492,21 @@ td.tn .mcrest .crest { max-height: 18px; max-width: 18px; }
 @media (min-width: 900px) {
   .hscroll { margin: 0; padding-left: 2px; padding-right: 2px; }
 }
+
+/* ventanas propias (confirmaciones y preguntas) */
+.dialog {
+  position: fixed; inset: 0; z-index: 35; background: rgba(15, 23, 42, .5); backdrop-filter: blur(4px);
+  display: grid; place-items: center; padding: 16px; animation: fade .15s ease;
+}
+.dialog[hidden] { display: none; }
+.dlg {
+  width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line); border-radius: 22px;
+  padding: 20px; box-shadow: var(--shadow-lg); animation: pop .18s cubic-bezier(.2, .9, .3, 1.2);
+}
+@keyframes pop { from { transform: scale(.94); opacity: 0; } to { transform: none; opacity: 1; } }
+.dlg h2 { font-size: 19px; margin: 0 0 8px; }
+.dlg-msg { color: var(--muted); font-size: 15px; line-height: 1.5; margin-bottom: 14px; max-height: 50vh; overflow-y: auto; }
+.dlg input { margin-bottom: 14px; font-size: 17px; }
+.dlg-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.dlg-btns.col { grid-template-columns: 1fr; }
+.btn.danger-solid { background: var(--bad); color: #fff; box-shadow: 0 4px 14px rgba(220, 38, 38, .3); }

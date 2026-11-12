@@ -153,6 +153,64 @@ const teamById = (id) => T().teams.find((x) => x.id === id);
 const tname = (id) => (teamById(id) || {}).name || 'Por definir';
 const mById = (id, t = T()) => t.matches.find((m) => m.id === id);
 
+/* ---------------- Ventanas propias (reemplazan confirm/prompt del navegador) ---------------- */
+// En pruebas automáticas se usan respuestas inmediatas (sin interfaz).
+const SYNC_DIALOGS = typeof __nativeDialogs !== 'undefined';
+const now = (v) => ({ then: (f) => now(f ? f(v) : v) });
+function openDialog({ title, message, input, options, okText = 'Aceptar', cancelText = 'Cancelar', danger, placeholder, value, type }) {
+  return new Promise((resolve) => {
+    let el = document.getElementById('dialog');
+    if (!el) { el = document.createElement('div'); el.id = 'dialog'; el.className = 'dialog'; document.body.appendChild(el); }
+    const msg = message ? `<div class="dlg-msg">${esc(message).replace(/\n/g, '<br>')}</div>` : '';
+    const btns = options
+      ? options.map((o, i) => `<button class="btn ${o.style || ''}" data-dlg="${i}">${esc(o.label)}</button>`).join('') + `<button class="btn ghost" data-dlg="x">${esc(cancelText)}</button>`
+      : `<button class="btn ghost" data-dlg="x">${esc(cancelText)}</button><button class="btn ${danger ? 'danger-solid' : ''}" data-dlg="ok">${esc(okText)}</button>`;
+    el.innerHTML = `<div class="dlg" role="dialog" aria-modal="true">
+      ${title ? `<h2>${esc(title)}</h2>` : ''}${msg}
+      ${input ? `<input id="dlg-in" type="${type || 'text'}" placeholder="${esc(placeholder || '')}" value="${esc(value || '')}" autocomplete="off" autocapitalize="characters">` : ''}
+      <div class="dlg-btns ${options ? 'col' : ''}">${btns}</div></div>`;
+    el.hidden = false;
+    const inp = el.querySelector('#dlg-in');
+    setTimeout(() => (inp || el.querySelector('[data-dlg="ok"]') || el.querySelector('[data-dlg]')).focus(), 60);
+    const done = (v) => { el.hidden = true; el.innerHTML = ''; document.removeEventListener('keydown', key, true); resolve(v); };
+    const key = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(null); }
+      else if (e.key === 'Enter' && !options) { e.preventDefault(); e.stopPropagation(); done(input ? inp.value : true); }
+    };
+    document.addEventListener('keydown', key, true);
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const b = e.target.closest('[data-dlg]');
+      if (!b) { if (e.target === el) done(null); return; }
+      const k = b.dataset.dlg;
+      if (k === 'x') done(null);
+      else if (k === 'ok') done(input ? inp.value : true);
+      else done(options[+k].value);
+    };
+  });
+}
+/** Confirmación Sí/No. Devuelve true/false. */
+function ask(message, o = {}) {
+  if (SYNC_DIALOGS) return now(!!confirm(message));
+  return openDialog({ title: o.title || '¿Confirmar?', message, okText: o.ok || 'Aceptar', cancelText: o.cancel, danger: o.danger }).then((v) => !!v);
+}
+/** Pide un texto. Devuelve el texto o null. */
+function askText(message, o = {}) {
+  if (SYNC_DIALOGS) return now(prompt(message, o.value));
+  return openDialog({ title: o.title, message, input: true, placeholder: o.placeholder, value: o.value, type: o.type, okText: o.ok || 'Aceptar', danger: o.danger });
+}
+/** Elegir entre varias opciones [{key,label,value,style}]. Devuelve value o null. */
+function askChoice(message, options, o = {}) {
+  if (SYNC_DIALOGS) { const a = (prompt(message) || '').trim().toUpperCase(); const x = options.find((op) => op.key === a); return now(x ? x.value : null); }
+  return openDialog({ title: o.title, message, options });
+}
+/** Acción peligrosa: hay que escribir la palabra (BORRAR). Devuelve true/false. */
+function askWord(message, o = {}) {
+  const word = o.word || 'BORRAR';
+  return askText(message + (SYNC_DIALOGS ? '' : `\n\nEscriba ${word} para confirmar.`), { title: o.title || '⚠️ Acción irreversible', placeholder: word, ok: o.ok || 'Confirmar', danger: true })
+    .then((v) => (v || '').trim().toUpperCase() === word);
+}
+
 function toast(msg) {
   const el = $('#toast');
   el.textContent = msg;
@@ -497,8 +555,11 @@ function doDraw() {
     if (Math.min(...Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0))) < c.perGroup) return toast('Hay grupos con menos equipos que los que clasifican');
   }
   if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
-  if (!confirm(`¿Realizar el sorteo OFICIAL de ${n} equipos (${catName(S.cat)})?\n\nEl sorteo se hace una sola vez y queda registrado con fecha y usuario.`)) return;
-
+  return ask(`Se sortearán ${n} equipos de ${catName(S.cat)}.\n\nEl sorteo se hace una sola vez y queda registrado con fecha y usuario.`, { title: '🎲 Sorteo oficial', ok: '🎲 Realizar sorteo' })
+    .then((ok) => { if (ok) doDrawNow(); });
+}
+function doDrawNow() {
+  const t = T(), c = t.config, n = t.teams.length;
   const ids = shuffle(t.teams.map((x) => x.id));
   t.matches = []; t.groups = []; t.tieOverride = {}; t.finalInfo = null;
   t.drawInfo = { at: Date.now(), by: auth ? auth.user : 'local', n, format: c.format, num: (t.drawLog || []).filter((x) => x.type === 'draw').length + 1 };
@@ -554,18 +615,26 @@ function genFinal(prevNotes = []) {
     if (!x || !y) continue;
     const why = decidedBy(x, y);
     if (why === 'empate total') {
-      const ans = (prompt(`Empate TOTAL por el último cupo${g ? ' del Grupo ' + g : ''}:\n\n1 = ${tname(x.id)}\n2 = ${tname(y.id)}\nS = sortear al azar\n\n¿Quién clasifica? (definan en la cancha, por ejemplo con penales, y escriban 1 o 2)`) || '').trim().toUpperCase();
-      let w = ans === '1' ? x.id : ans === '2' ? y.id : ans === 'S' ? [x.id, y.id][randInt(2)] : null;
-      if (!w) return toast('Fase final no generada: falta decidir el empate');
-      t.tieOverride = Object.assign({}, t.tieOverride, { [[x.id, y.id].sort().join('|')]: w });
-      notes.push(`${tname(w)} clasificó por decisión ${ans === 'S' ? 'de sorteo' : 'del organizador'}`);
-      return genFinal(notes); // recalcular con la decisión aplicada
+      return askChoice(`${tname(x.id)} y ${tname(y.id)} están empatados en todo por el último cupo${g ? ' del Grupo ' + g : ''}.\n\nDefinan en la cancha (por ejemplo con penales) y elijan quién clasifica, o sortéenlo.`, [
+        { key: '1', label: '✅ Clasifica ' + tname(x.id), value: x.id },
+        { key: '2', label: '✅ Clasifica ' + tname(y.id), value: y.id },
+        { key: 'S', label: '🎲 Sortear al azar', value: 'S', style: 'ghost' },
+      ], { title: '⚖️ Empate total' }).then((ans) => {
+        const w = ans === 'S' ? [x.id, y.id][randInt(2)] : ans;
+        if (!w) return toast('Fase final no generada: falta decidir el empate');
+        t.tieOverride = Object.assign({}, t.tieOverride, { [[x.id, y.id].sort().join('|')]: w });
+        notes.push(`${tname(w)} clasificó por ${ans === 'S' ? 'sorteo' : 'decisión del organizador'}`);
+        return genFinal(notes); // recalcular con la decisión aplicada
+      });
     }
     if (why === 'juego limpio (menos tarjetas)') notes.push(`${tname(x.id)} clasificó sobre ${tname(y.id)} por juego limpio (menos tarjetas)`);
   }
   const qual = seeds.map(tname).join(', ');
-  if (!confirm(`Clasificados a la fase final:\n${qual}\n\nCruces: ${PAIRING_TEXT[pairingOf(c)]}${notes.length ? '\n\n⚠️ ' + notes.join('\n⚠️ ') : ''}\n\n¿Generar la fase final?`)) return;
-
+  return ask(`Clasificados: ${qual}\n\nCruces: ${PAIRING_TEXT[pairingOf(c)]}${notes.length ? '\n\n⚠️ ' + notes.join('\n⚠️ ') : ''}`, { title: '🏁 Generar fase final', ok: 'Generar fase final' })
+    .then((ok) => { if (ok) genFinalNow(seeds); });
+}
+function genFinalNow(seeds) {
+  const t = T(), c = t.config;
   t.matches = t.matches.filter((m) => m.phase !== 'ko');
   const groupOf = c.format === 'grupos' && t.groups.length > 1 ? Object.fromEntries(t.groups.flatMap((g) => g.teams.map((id) => [id, g.name]))) : null;
   const pairing = pairingOf(c);
@@ -1764,7 +1833,10 @@ function finishMatch() {
     if (ph === '' || pa === '' || +ph === +pa) return toast('En eliminación debe haber ganador: ingrese los penales');
     m.ph = +ph; m.pa = +pa;
   } else { m.ph = null; m.pa = null; }
-  if (!confirm(`Finalizar: ${tname(m.home)} ${m.hs} - ${m.as} ${tname(m.away)}${m.ph != null ? ` (pen ${m.ph}-${m.pa})` : ''}`)) return;
+  return ask(`${tname(m.home)} ${m.hs} - ${m.as} ${tname(m.away)}${m.ph != null ? `  (penales ${m.ph}-${m.pa})` : ''}`, { title: '✅ ¿Finalizar el partido?', ok: 'Finalizar' })
+    .then((ok) => { if (ok) finishNow(m); });
+}
+function finishNow(m) {
   if (m.runAt) { m.elapsed += Date.now() - m.runAt; m.runAt = null; }
   m.status = 'done';
   syncKO();
@@ -1779,14 +1851,12 @@ function reopenMatch() {
   if (m.phase !== 'ko' && t.stage === 'final' && t.config.format !== 'elim') {
     return toast('Primero use "Deshacer fase final" en Partidos para corregir esta fase');
   }
+  const go = () => { m.status = 'live'; m.ph = null; m.pa = null; syncKO(); save(); render(); };
   if (m.phase === 'ko') {
     const dep = t.matches.some((x) => x.status !== 'pend' && [x.srcH, x.srcA].some((s) => s && (s.w === m.id || s.l === m.id)));
-    if (dep && !confirm('Los partidos siguientes que dependen de este se reiniciarán. ¿Continuar?')) return;
+    if (dep) return ask('Los partidos siguientes que dependen de este se reiniciarán.', { title: '✏️ Corregir resultado', ok: 'Continuar' }).then((ok) => { if (ok) go(); });
   }
-  m.status = 'live';
-  m.ph = null; m.pa = null;
-  syncKO();
-  save(); render();
+  go();
 }
 
 /* ---------------- Base de datos en línea ---------------- */
@@ -2086,28 +2156,33 @@ const actions = {
   clearSchedule: () => {
     const ms = T().matches.filter((m) => m.status === 'pend' && m.date);
     if (!ms.length) return toast('No hay partidos pendientes con fecha');
-    if (!confirm('¿Quitar fecha, hora y cancha de ' + ms.length + ' partidos pendientes?')) return;
-    ms.forEach((m) => { m.date = ''; m.time = ''; m.field = ''; });
-    save(); closeModal(); render();
+    ask('Se quitará la fecha, hora y cancha de ' + ms.length + ' partidos pendientes.', { title: '🗓️ Quitar fechas', ok: 'Quitar fechas' }).then((ok) => {
+      if (!ok) return;
+      ms.forEach((m) => { m.date = ''; m.time = ''; m.field = ''; });
+      save(); closeModal(); render();
+    });
   },
   logout: () => {
-    if (sync.dirty && !confirm('Hay cambios que aún no se guardaron en línea. ¿Cerrar sesión de todos modos?')) return;
-    setAuth(null); orgs = null;
-    sync.dirty = false; sync.rev = -1;
-    S.tab = ADMIN_URL ? 'ajustes' : 'inicio'; render(); pull(true);
-    toast('Sesión cerrada');
+    const go = () => {
+      setAuth(null); orgs = null;
+      sync.dirty = false; sync.rev = -1;
+      S.tab = ADMIN_URL ? 'ajustes' : 'inicio'; render(); pull(true);
+      toast('Sesión cerrada');
+    };
+    if (sync.dirty) return ask('Hay cambios que aún no se guardaron en línea.', { title: 'Cerrar sesión', ok: 'Cerrar de todos modos', danger: true }).then((ok) => { if (ok) go(); });
+    go();
   },
   changePass: async () => {
-    const p1 = prompt('Nueva contraseña (mínimo 6 caracteres):');
+    const p1 = await askText('Mínimo 6 caracteres.', { title: '🔑 Nueva contraseña', type: 'password', ok: 'Siguiente' });
     if (!p1) return;
     if (p1.length < 6) return toast('Mínimo 6 caracteres');
-    if (prompt('Repita la nueva contraseña:') !== p1) return toast('Las contraseñas no coinciden');
+    if ((await askText('Escríbala otra vez para confirmar.', { title: '🔑 Repetir contraseña', type: 'password', ok: 'Cambiar' })) !== p1) return toast('Las contraseñas no coinciden');
     const { status, j } = await authCall({ action: 'password', pass: p1 });
     if (status === 401) return sessionExpired();
     toast(status === 200 ? '✅ Contraseña cambiada' : (j && j.error) || 'No se pudo cambiar');
   },
   delOrg: async (d) => {
-    if (!confirm('¿Quitar al usuario "' + d.u + '"? Ya no podrá ingresar ni editar.')) return;
+    if (!(await ask('"' + d.u + '" ya no podrá ingresar ni editar.', { title: 'Quitar usuario', ok: 'Quitar', danger: true }))) return;
     const { status, j } = await authCall({ action: 'remove', user: d.u });
     if (status === 401) return sessionExpired();
     if (status !== 200) return toast((j && j.error) || 'No se pudo quitar');
@@ -2118,9 +2193,12 @@ const actions = {
   saveTeam: () => saveTeam(),
   delTeam: (d) => {
     const tm = teamById(d.id);
-    if (!tm || !confirm(`¿Eliminar el equipo ${tm.name}?`)) return;
-    T().teams = T().teams.filter((x) => x.id !== d.id);
-    save(); closeModal(); render(); toast('Equipo eliminado');
+    if (!tm) return;
+    ask(`Se eliminará el equipo "${tm.name}" con sus integrantes.`, { title: 'Eliminar equipo', ok: 'Eliminar', danger: true }).then((ok) => {
+      if (!ok) return;
+      T().teams = T().teams.filter((x) => x.id !== d.id);
+      save(); closeModal(); render(); toast('Equipo eliminado');
+    });
   },
   draw: () => doDraw(),
   genFinal: () => genFinal(),
@@ -2128,23 +2206,28 @@ const actions = {
     const t = T();
     const played = t.matches.filter((m) => m.phase === 'ko' && m.status !== 'pend').length;
     const drawn = t.finalInfo && t.finalInfo.pairing === 'sorteo';
-    if (played || drawn) {
-      const msg = `${drawn ? 'Los cruces se definieron por sorteo. Si los anula, quedará registrado públicamente.' : ''}${played ? `\nHay ${played} partido(s) de la fase final con resultado. Se borrarán.` : ''}\n\nEscriba BORRAR para confirmar:`;
-      if ((prompt(msg) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
-    } else if (!confirm('¿Borrar la fase final?')) return;
+    const go = () => {
     if (t.finalInfo) t.drawLog = [...(t.drawLog || []), { type: 'final', at: t.finalInfo.at, by: t.finalInfo.by, annulledAt: Date.now(), annulledBy: auth ? auth.user : 'local' }];
     t.finalInfo = null; t.tieOverride = {};
     t.matches = t.matches.filter((m) => m.phase !== 'ko');
-    t.stage = 'fase1'; save(); render();
+    t.stage = 'fase1'; save(); render(); toast('Fase final deshecha');
+    };
+    if (played || drawn) {
+      const msg = `${drawn ? 'Los cruces se definieron por sorteo. Si los anula, quedará registrado públicamente.' : ''}${played ? `${drawn ? '\n\n' : ''}Hay ${played} partido(s) de la fase final con resultado. Se borrarán.` : ''}`;
+      return askWord(msg, { title: '⚠️ Deshacer fase final', ok: 'Deshacer' }).then((ok) => (ok ? go() : toast('No se borró nada')));
+    }
+    ask('Se borrará la fase final (todavía no tiene resultados).', { title: 'Deshacer fase final', ok: 'Deshacer', danger: true }).then((ok) => { if (ok) go(); });
   },
   undoDraw: () => {
     const t = T();
     const played = t.matches.filter((m) => m.status !== 'pend').length;
-    const msg = `El sorteo es oficial y se hace una sola vez. Si lo anula, quedará registrado públicamente que fue anulado (por ${auth ? auth.user : 'este dispositivo'}).${played ? `\n\nTambién se borrarán ${played} partido(s) con resultados, goles y tarjetas.` : ''}\n\nEscriba BORRAR para anular el sorteo:`;
-    if ((prompt(msg) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se anuló el sorteo');
+    const msg = `El sorteo es oficial y se hace una sola vez. Si lo anula, quedará registrado públicamente que fue anulado (por ${auth ? auth.user : 'este dispositivo'}).${played ? `\n\nTambién se borrarán ${played} partido(s) con resultados, goles y tarjetas.` : ''}`;
+    askWord(msg, { title: '⚠️ Anular sorteo oficial', ok: 'Anular sorteo' }).then((ok) => {
+    if (!ok) return toast('No se anuló el sorteo');
     if (t.drawInfo) t.drawLog = [...(t.drawLog || []), { type: 'draw', at: t.drawInfo.at, by: t.drawInfo.by, annulledAt: Date.now(), annulledBy: auth ? auth.user : 'local' }];
     t.matches = []; t.groups = []; t.stage = 'inscripcion'; t.drawInfo = null; t.finalInfo = null; t.tieOverride = {};
-    save(); render(); toast('Sorteo deshecho');
+    save(); render(); toast('Sorteo anulado');
+    });
   },
   openMatch: (d) => openModal('match', d.id),
   goal: (d) => {
@@ -2226,10 +2309,10 @@ const actions = {
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   },
   resetCat: () => {
-    if (T().matches.some((m) => m.status !== 'pend') && (prompt('Esta categoría tiene resultados. Escriba BORRAR para vaciarla:') || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
-    if (!confirm(`¿Borrar TODO de la categoría ${catName(S.cat)}? No se puede deshacer.`)) return;
-    if (!confirm('¿Seguro? Se perderán equipos, pagos y resultados.')) return;
-    CATS_()[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
+    askWord(`Se borrarán TODOS los equipos, pagos, partidos y resultados de ${catName(S.cat)}. La categoría se conserva vacía.`, { title: '⚠️ Vaciar ' + catName(S.cat), ok: 'Vaciar' }).then((ok) => {
+      if (!ok) return toast('No se borró nada');
+      CATS_()[S.cat] = newTournament(T().name, T().color); save(); render(); toast('Categoría vaciada');
+    });
   },
   crestRandom: () => { if (modal) { modal.crest = randomCrest(); updateCrestUI(); } },
   crestNone: () => { if (modal) { modal.crest = null; updateCrestUI(); } },
@@ -2246,7 +2329,7 @@ const actions = {
   },
   restoreVersion: async (d) => {
     const v = (historyList || []).find((x) => String(x.i) === String(d.i));
-    if (!v || !confirm(`¿Restaurar la versión del ${new Date(v.at).toLocaleString('es')}?\n(${v.teams} equipos, ${v.done} partidos finalizados)\n\nLos datos actuales se reemplazarán, pero quedarán guardados en el historial.`)) return;
+    if (!v || !(await ask(`Versión del ${new Date(v.at).toLocaleString('es')}: ${v.teams} equipos, ${v.done} partidos finalizados.\n\nLos datos actuales se reemplazarán, pero quedarán guardados en el historial.`, { title: '🕘 Restaurar versión', ok: 'Restaurar' }))) return;
     try {
       const ver = await apiCall('GET', null, '?version=' + v.i);
       if (ver.status !== 200 || !ver.j || !ver.j.data) return toast('No se pudo leer esa versión');
@@ -2268,39 +2351,42 @@ const actions = {
     saveLocal(); closeModal(); render(); window.scrollTo(0, 0);
   },
   newTorneo: () => {
-    const n = (prompt('Nombre del nuevo torneo (ej: Copa Navidad 2026):') || '').trim().slice(0, 40);
-    if (!n) return;
-    const id = 't' + uid();
-    S.torneos[id] = newTorneo(n, CATS_());
-    S.torneos[id].config = clone(TC());
-    S.tor = id; S.cat = Object.keys(CATS_())[0];
-    save(); closeModal(); render();
-    toast('🏆 Torneo "' + n + '" creado con las mismas categorías');
+    askText('Se creará con las mismas categorías y configuración, pero sin equipos.', { title: '🏆 Nuevo torneo', placeholder: 'Ej: Copa Navidad 2026', ok: 'Crear torneo' }).then((v) => {
+      const n = (v || '').trim().slice(0, 40);
+      if (!n) return;
+      const id = 't' + uid();
+      S.torneos[id] = newTorneo(n, CATS_());
+      S.torneos[id].config = clone(TC());
+      S.tor = id; S.cat = Object.keys(CATS_())[0];
+      save(); closeModal(); render();
+      toast('🏆 Torneo "' + n + '" creado con las mismas categorías');
+    });
   },
   delTorneo: (d) => {
     const tor = S.torneos[d.id];
     if (!tor || Object.keys(S.torneos).length < 2) return;
-    if (!confirm('¿Eliminar el torneo "' + tor.name + '" con todas sus categorías, equipos y resultados?')) return;
-    if (!confirm('Esta acción no se puede deshacer. ¿Seguro?')) return;
-    delete S.torneos[d.id];
-    fixSelection(S);
-    save(); closeModal(); render(); toast('Torneo eliminado');
+    askWord('Se eliminará el torneo "' + tor.name + '" con todas sus categorías, equipos y resultados.', { title: '⚠️ Eliminar torneo', ok: 'Eliminar' }).then((ok) => {
+      if (!ok) return toast('No se eliminó nada');
+      delete S.torneos[d.id];
+      fixSelection(S);
+      save(); closeModal(); render(); toast('Torneo eliminado');
+    });
   },
   renameCat: (d) => {
     const t = CATS_()[d.c]; if (!t) return;
-    const n = (prompt('Nuevo nombre de la categoría:', t.name) || '').trim().slice(0, 24);
-    if (!n || n === t.name) return;
-    if (catNameTaken(n, d.c)) return toast('Ya existe una categoría con ese nombre');
-    t.name = n; save(); render();
+    askText('', { title: '✏️ Nombre de la categoría', value: t.name, ok: 'Guardar' }).then((v) => {
+      const n = (v || '').trim().slice(0, 24);
+      if (!n || n === t.name) return;
+      if (catNameTaken(n, d.c)) return toast('Ya existe una categoría con ese nombre');
+      t.name = n; save(); render();
+    });
   },
   colorCat: (d) => { const t = CATS_()[d.c]; if (!t) return; t.color = ((t.color || 0) + 1) % PALETTES; save(); render(); },
   delCat: (d) => {
     const t = CATS_()[d.c]; if (!t || Object.keys(CATS_()).length < 2) return;
-    if (!confirm(`¿Eliminar la categoría "${t.name}"?${t.teams.length ? ` Tiene ${t.teams.length} equipos inscritos.` : ''}`)) return;
-    if (t.teams.length && !confirm('Se borrarán sus equipos, pagos, partidos y resultados. No se puede deshacer. ¿Seguro?')) return;
-    delete CATS_()[d.c];
-    if (S.cat === d.c) S.cat = Object.keys(CATS_())[0];
-    save(); render(); toast('Categoría eliminada');
+    const go = () => { delete CATS_()[d.c]; if (S.cat === d.c) S.cat = Object.keys(CATS_())[0]; save(); render(); toast('Categoría eliminada'); };
+    if (t.teams.length) return askWord(`La categoría "${t.name}" tiene ${t.teams.length} equipos. Se borrarán sus equipos, pagos, partidos y resultados.`, { title: '⚠️ Eliminar categoría', ok: 'Eliminar' }).then((ok) => (ok ? go() : toast('No se eliminó nada')));
+    ask(`Se eliminará la categoría "${t.name}" (no tiene equipos).`, { title: 'Eliminar categoría', ok: 'Eliminar', danger: true }).then((ok) => { if (ok) go(); });
   },
   scrollRow: (d) => {
     const row = document.getElementById(d.row); if (!row) return;
@@ -2449,8 +2535,10 @@ document.addEventListener('change', (e) => {
         const d = JSON.parse(r.result);
         if (!normalizeData(d)) throw new Error('formato');
         fixSelection(d);
-        if (!confirm('¿Reemplazar los datos actuales con el respaldo?')) return;
-        S = d; save(); render(); toast('✅ Respaldo importado');
+        ask('Los datos actuales se reemplazarán por los del archivo.', { title: '⬆️ Importar respaldo', ok: 'Importar', danger: true }).then((ok) => {
+          if (!ok) return;
+          S = d; save(); render(); toast('✅ Respaldo importado');
+        });
       } catch (err) { toast('Archivo no válido'); }
     };
     r.readAsText(el.files[0]);
