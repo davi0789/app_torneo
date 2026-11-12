@@ -36,6 +36,7 @@ function newTournament(name = '', color = 0) {
       format: 'liga',      // liga | grupos | elim
       ligaFinal: 0,        // 0 = gana la tabla, 2 = final, 4 = semifinales
       groupSize: 4, perGroup: 2,
+      koPairing: 'cruzado', // cruzado = 1° vs 2° de otro grupo | sorteo = cruces sorteados | ranking = mejor vs peor
       podium: 3,           // 1, 2 o 3 lugares
     },
     teams: [],
@@ -229,12 +230,13 @@ function bracketOrder(P) {
 const roundName = (slots) => ({ 2: 'Final', 4: 'Semifinal', 8: 'Cuartos de final', 16: 'Octavos de final', 32: 'Dieciseisavos' }[slots] || `Ronda de ${slots}`);
 
 /** Crea la llave de eliminación. seeds = ids de equipos ordenados por siembra. */
-function buildKO(seeds, groupOf) {
+function buildKO(seeds, groupOf, slots) {
   const t = T();
-  const n = seeds.length;
+  const n = slots ? slots.filter(Boolean).length : seeds.length;
   if (n < 2) return;
   let P = 1; while (P < n) P *= 2;
-  let prev = bracketOrder(P).map((s) => (s <= n ? { t: seeds[s - 1] } : null));
+  let prev = slots ? slots.map((id) => (id ? { t: id } : null)) : bracketOrder(P).map((s) => (s <= n ? { t: seeds[s - 1] } : null));
+  if (slots) groupOf = null; // los cruces sorteados ya evitan el mismo grupo
   // Evitar que dos equipos del mismo grupo se crucen en la primera ronda
   if (groupOf) {
     const G = (x) => x && groupOf[x.t];
@@ -455,6 +457,32 @@ function podium() {
 }
 
 /* ---------------- Sorteo ---------------- */
+const nextPow2 = (n) => { let p = 1; while (p < n) p *= 2; return p; };
+/**
+ * Cruces por sorteo: los mejor ubicados ("cabezas", p. ej. los 1° de grupo) se sortean contra
+ * el resto (los 2°), evitando que se crucen equipos del mismo grupo. Si sobran cabezas, pasan directo.
+ */
+function drawPairs(seeds, groupOf, ng = 1) {
+  const Q = seeds.length, P = nextPow2(Q), nb = P - Q;
+  // nivel de cada clasificado: 0 = primeros de grupo, 1 = segundos, etc. (en liga, su puesto)
+  const lvl = (id) => { const i = seeds.indexOf(id); return groupOf ? Math.floor(i / ng) : i; };
+  const levels = [...new Set(seeds.map(lvl))].sort((x, y) => x - y);
+  // Pases directos: para los mejor ubicados; si hay más candidatos que pases, se sortea entre ellos
+  const byes = [];
+  for (const L of levels) {
+    if (byes.length >= nb) break;
+    byes.push(...shuffle(seeds.filter((id) => lvl(id) === L)).slice(0, nb - byes.length));
+  }
+  // El resto se cruza: mitad mejor ubicada contra mitad peor ubicada, por sorteo y sin repetir grupo
+  const remaining = seeds.filter((id) => !byes.includes(id));
+  const half = remaining.length / 2;
+  const heads = shuffle(remaining.slice(0, half)), rest0 = remaining.slice(half);
+  let rest = shuffle(rest0);
+  const clash = (r) => r.some((id, i) => groupOf && groupOf[id] && groupOf[id] === groupOf[heads[i]]);
+  for (let k = 0; k < 500 && clash(rest); k++) rest = shuffle(rest0);
+  const pairs = [...byes.map((b) => [b, null]), ...heads.map((h, i) => [h, rest[i]])];
+  return shuffle(pairs).flat();
+}
 const groupCount = (n, size) => Math.max(1, Math.min(Math.floor(n / 2), Math.round(n / size)));
 function doDraw() {
   const t = T(), c = t.config;
@@ -469,11 +497,11 @@ function doDraw() {
     if (Math.min(...Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0))) < c.perGroup) return toast('Hay grupos con menos equipos que los que clasifican');
   }
   if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
-  if (!confirm(`¿Realizar el sorteo de ${n} equipos (${catName(S.cat)})?`)) return;
+  if (!confirm(`¿Realizar el sorteo OFICIAL de ${n} equipos (${catName(S.cat)})?\n\nEl sorteo se hace una sola vez y queda registrado con fecha y usuario.`)) return;
 
   const ids = shuffle(t.teams.map((x) => x.id));
   t.matches = []; t.groups = []; t.tieOverride = {}; t.finalInfo = null;
-  t.drawInfo = { at: Date.now(), by: auth ? auth.user : 'local', n, format: c.format };
+  t.drawInfo = { at: Date.now(), by: auth ? auth.user : 'local', n, format: c.format, num: (t.drawLog || []).filter((x) => x.type === 'draw').length + 1 };
   if (c.format === 'elim') {
     t.stage = 'final';
     buildKO(ids);
@@ -503,7 +531,16 @@ function genFinal(prevNotes = []) {
     seeds = standings(t.groups[0].teams, 'liga', '').slice(0, c.ligaFinal).map((r) => r.id);
   } else {
     const tabs = t.groups.map((g) => standings(g.teams, 'grupo', g.name));
-    for (let pos = 0; pos < c.perGroup; pos++) for (const tab of tabs) if (tab[pos]) seeds.push(tab[pos].id);
+    if (pairingOf(c) === 'ranking') {
+      // Tabla general de clasificados: primero la posición en el grupo, luego promedio de puntos, DG y goles
+      const rows = [];
+      tabs.forEach((tab) => tab.slice(0, c.perGroup).forEach((r, pos) => rows.push({ ...r, pos })));
+      const avg = (r, k) => (r.pj ? r[k] / r.pj : 0);
+      rows.sort((x, y) => x.pos - y.pos || avg(y, 'pts') - avg(x, 'pts') || (avg(y, 'gf') - avg(y, 'gc')) - (avg(x, 'gf') - avg(x, 'gc')) || avg(y, 'gf') - avg(x, 'gf'));
+      seeds = rows.map((r) => r.id);
+    } else {
+      for (let pos = 0; pos < c.perGroup; pos++) for (const tab of tabs) if (tab[pos]) seeds.push(tab[pos].id);
+    }
   }
   if (seeds.length < 2) return toast('No hay suficientes clasificados');
 
@@ -527,15 +564,18 @@ function genFinal(prevNotes = []) {
     if (why === 'juego limpio (menos tarjetas)') notes.push(`${tname(x.id)} clasificó sobre ${tname(y.id)} por juego limpio (menos tarjetas)`);
   }
   const qual = seeds.map(tname).join(', ');
-  if (!confirm(`Clasificados a la fase final:\n${qual}${notes.length ? '\n\n⚠️ ' + notes.join('\n⚠️ ') : ''}\n\n¿Generar la fase final?`)) return;
+  if (!confirm(`Clasificados a la fase final:\n${qual}\n\nCruces: ${PAIRING_TEXT[pairingOf(c)]}${notes.length ? '\n\n⚠️ ' + notes.join('\n⚠️ ') : ''}\n\n¿Generar la fase final?`)) return;
 
   t.matches = t.matches.filter((m) => m.phase !== 'ko');
   const groupOf = c.format === 'grupos' && t.groups.length > 1 ? Object.fromEntries(t.groups.flatMap((g) => g.teams.map((id) => [id, g.name]))) : null;
-  buildKO(seeds, groupOf);
+  const pairing = pairingOf(c);
+  if (pairing === 'sorteo') buildKO(null, null, drawPairs(seeds, groupOf, t.groups.length));
+  else buildKO(seeds, pairing === 'cruzado' ? groupOf : null);
   t.stage = 'final';
-  t.finalInfo = { at: Date.now(), by: auth ? auth.user : 'local', qualified: seeds };
+  t.finalInfo = { at: Date.now(), by: auth ? auth.user : 'local', qualified: seeds, pairing };
   save(); render();
-  toast('🏁 Fase final generada');
+  const first = t.matches.filter((m) => m.phase === 'ko' && m.round === 1 && m.home && m.away);
+  toast(`🏁 Fase final generada · ${first.map((m) => tname(m.home) + ' vs ' + tname(m.away)).join(' · ')}`);
 }
 
 /* ---------------- Vistas ---------------- */
@@ -828,6 +868,50 @@ function optRadio(name, value, cur, title, desc) {
     <div><b>${title}</b>${desc ? `<span>${desc}</span>` : ''}</div></label>`;
 }
 
+const PAIRING_TEXT = {
+  cruzado: 'fijos: 1° de un grupo contra 2° de otro grupo',
+  sorteo: 'por sorteo entre los clasificados (1° contra 2°, sin repetir grupo)',
+  ranking: 'por rendimiento: el mejor clasificado contra el peor',
+};
+/** Regla de cruces efectiva según el formato. */
+function pairingOf(c) {
+  const p = c.koPairing || 'cruzado';
+  if (c.format === 'liga') return p === 'sorteo' ? 'sorteo' : 'ranking';
+  if (c.format === 'grupos' && groupCount(T().teams.length, c.groupSize) === 1 && p === 'cruzado') return 'ranking';
+  return p;
+}
+
+/** Explica con palabras cómo quedará el torneo antes de sortear. */
+function formatPreview() {
+  const t = T(), c = t.config, n = t.teams.length;
+  if (n < 2) return '';
+  const parts = [];
+  let Q = 0;
+  if (c.format === 'grupos') {
+    if (n < 3) return '';
+    const ng = groupCount(n, c.groupSize);
+    const sizes = Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0));
+    const gm = sizes.reduce((a, k) => a + (k * (k - 1)) / 2, 0);
+    parts.push(ng === 1 ? `1 grupo de ${n} equipos (${gm} partidos)` : `${ng} grupos de ${sizes.join(', ')} equipos (${gm} partidos de grupos)`);
+    Q = ng * c.perGroup;
+    parts.push(`clasifican ${Q} (${c.perGroup === 1 ? 'el 1°' : 'los ' + c.perGroup + ' primeros'}${ng > 1 ? ' de cada grupo' : ''})`);
+  } else if (c.format === 'liga') {
+    parts.push(`todos contra todos: ${(n * (n - 1)) / 2} partidos en ${n % 2 ? n : n - 1} jornadas${n % 2 ? ' (cada jornada descansa un equipo)' : ''}`);
+    Q = c.ligaFinal;
+    if (!Q) return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}. Gana el 1° de la tabla.</div>`;
+  } else {
+    Q = n;
+  }
+  const P = nextPow2(Q), byes = P - Q;
+  const rounds = []; for (let k = P; k >= 2; k /= 2) rounds.push(roundName(k));
+  let fin = rounds.join(' → ');
+  if (byes) fin = fin.replace(rounds[0], `${rounds[0]} (${byes} pase${byes > 1 ? 's' : ''} directo${byes > 1 ? 's' : ''})`);
+  if (c.podium >= 3 && Q >= 4) fin += ' + partido por el 3er lugar';
+  parts.push('fase final: ' + fin);
+  if (c.format !== 'elim' && Q >= 4) parts.push('cruces ' + PAIRING_TEXT[pairingOf(c)]);
+  return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}.</div>`;
+}
+
 function drawSetupHTML() {
   const t = T(), c = t.config, n = t.teams.length;
   let h = `<h1>Sorteo ${catName(S.cat)}</h1>
@@ -841,6 +925,11 @@ function drawSetupHTML() {
       ${optRadio('ligaFinal', 0, c.ligaFinal, 'Sin fase final', 'Gana el primero de la tabla')}
       ${optRadio('ligaFinal', 2, c.ligaFinal, 'Final', '1° vs 2° de la tabla')}
       ${optRadio('ligaFinal', 4, c.ligaFinal, 'Semifinales', '1° vs 4° y 2° vs 3°, luego final')}`;
+    if (c.ligaFinal === 4) {
+      h += `<h3>Cruces de semifinales</h3>
+      ${optRadio('koPairing', 'ranking', pairingOf(c), 'Por posición', '1° vs 4° y 2° vs 3°')}
+      ${optRadio('koPairing', 'sorteo', pairingOf(c), 'Por sorteo', 'Se sortea contra quién juegan el 1° y el 2° (entre el 3° y el 4°)')}`;
+    }
   }
   if (c.format === 'grupos') {
     h += `<div class="grid2">
@@ -850,8 +939,15 @@ function drawSetupHTML() {
         <label class="fl">Clasifican por grupo<select data-cfg="perGroup">
           ${[1, 2, 3, 4].map((v) => `<option value="${v}" ${c.perGroup == v ? 'selected' : ''}>${v}</option>`).join('')}
         </select></label></div>`;
-    if (n >= 3) { const ng = groupCount(n, c.groupSize); h += `<p class="muted"><small>Con ${n} equipos: ${ng === 1 ? '1 grupo de ' + n + ' (todos contra todos) y luego fase final' : ng + ' grupos'}. Clasifican ${ng * c.perGroup} a la fase final.</small></p>`; }
+    if (n >= 3 && groupCount(n, c.groupSize) * c.perGroup >= 4) {
+      const one = groupCount(n, c.groupSize) === 1;
+      h += `<h3>Cruces de la fase final</h3>
+      ${one ? '' : optRadio('koPairing', 'cruzado', pairingOf(c), 'Cruces fijos', '1° del Grupo A vs 2° del Grupo B, 1° del B vs 2° del A…')}
+      ${optRadio('koPairing', 'sorteo', pairingOf(c), 'Por sorteo', one ? 'Se sortea contra quién juegan los mejores ubicados' : 'Se sortea qué 1° juega contra qué 2° (nunca del mismo grupo)')}
+      ${optRadio('koPairing', 'ranking', pairingOf(c), 'Por rendimiento', 'Tabla general de clasificados: el mejor contra el peor')}`;
+    }
   }
+  h += formatPreview();
   h += `<h3>Premiación</h3>
       ${optRadio('podium', 1, c.podium, 'Solo campeón (1 lugar)', '')}
       ${optRadio('podium', 2, c.podium, 'Campeón y subcampeón (2 lugares)', '')}
@@ -867,7 +963,9 @@ function drawInfoHTML(t) {
   const fmtAt = (ms) => new Date(ms).toLocaleString('es', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
   let h = '';
   if (t.drawInfo) h += `🎲 Sorteo realizado el ${fmtAt(t.drawInfo.at)}${t.drawInfo.by && t.drawInfo.by !== 'local' ? ' por ' + esc(t.drawInfo.by) : ''}`;
-  if (t.finalInfo) h += `${h ? '<br>' : ''}🏁 Fase final generada el ${fmtAt(t.finalInfo.at)}${t.finalInfo.by && t.finalInfo.by !== 'local' ? ' por ' + esc(t.finalInfo.by) : ''}`;
+  if (t.drawInfo && t.drawInfo.num > 1) h = h.replace('🎲 Sorteo realizado', `🎲 Sorteo oficial (n.° ${t.drawInfo.num})`);
+  if (t.finalInfo) h += `${h ? '<br>' : ''}🏁 Fase final generada el ${fmtAt(t.finalInfo.at)}${t.finalInfo.by && t.finalInfo.by !== 'local' ? ' por ' + esc(t.finalInfo.by) : ''}${t.finalInfo.pairing ? ' · cruces ' + esc(PAIRING_TEXT[t.finalInfo.pairing] || '') : ''}`;
+  for (const x of t.drawLog || []) h += `${h ? '<br>' : ''}⚠️ ${x.type === 'draw' ? 'Un sorteo' : 'Una fase final'} del ${fmtAt(x.at)} fue anulado${x.annulledBy && x.annulledBy !== 'local' ? ' por ' + esc(x.annulledBy) : ''} el ${fmtAt(x.annulledAt)}`;
   return h ? `<p class="muted" style="font-size:13px;margin:-6px 0 12px">${h}</p>` : '';
 }
 
@@ -1827,7 +1925,7 @@ function mergeCat(L, B, R) {
     const drawL = !same(L.groups, B.groups), drawR = !same(R.groups, B.groups);
     const koIds = (x) => (x.matches || []).filter((m) => m.phase === 'ko').map((m) => m.id).sort().join();
     const koL = koIds(L) !== koIds(B), koR = koIds(R) !== koIds(B);
-    const meta = ['drawInfo', 'finalInfo', 'tieOverride'];
+    const meta = ['drawInfo', 'finalInfo', 'tieOverride', 'drawLog'];
     if (drawL && drawR) {
       // Ambos sortearon a la vez: se mantiene el sorteo que llegó primero al servidor
       mergeNotices.push(`Otro organizador ya había realizado el sorteo de ${R.name || 'la categoría'}. Se mantiene ese sorteo.`);
@@ -2023,9 +2121,12 @@ const actions = {
   undoFinal: () => {
     const t = T();
     const played = t.matches.filter((m) => m.phase === 'ko' && m.status !== 'pend').length;
-    if (played) {
-      if ((prompt(`Hay ${played} partido(s) de la fase final con resultado. Se borrarán.\nEscriba BORRAR para confirmar:`) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
+    const drawn = t.finalInfo && t.finalInfo.pairing === 'sorteo';
+    if (played || drawn) {
+      const msg = `${drawn ? 'Los cruces se definieron por sorteo. Si los anula, quedará registrado públicamente.' : ''}${played ? `\nHay ${played} partido(s) de la fase final con resultado. Se borrarán.` : ''}\n\nEscriba BORRAR para confirmar:`;
+      if ((prompt(msg) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
     } else if (!confirm('¿Borrar la fase final?')) return;
+    if (t.finalInfo) t.drawLog = [...(t.drawLog || []), { type: 'final', at: t.finalInfo.at, by: t.finalInfo.by, annulledAt: Date.now(), annulledBy: auth ? auth.user : 'local' }];
     t.finalInfo = null; t.tieOverride = {};
     t.matches = t.matches.filter((m) => m.phase !== 'ko');
     t.stage = 'fase1'; save(); render();
@@ -2033,9 +2134,9 @@ const actions = {
   undoDraw: () => {
     const t = T();
     const played = t.matches.filter((m) => m.status !== 'pend').length;
-    if (played) {
-      if ((prompt(`Hay ${played} partido(s) jugados o en juego en ${catName(S.cat)}. Se borrarán TODOS los resultados, goles y tarjetas.\nEscriba BORRAR para confirmar:`) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se borró nada');
-    } else if (!confirm('¿Deshacer el sorteo? Se borrarán los partidos programados de esta categoría.')) return;
+    const msg = `El sorteo es oficial y se hace una sola vez. Si lo anula, quedará registrado públicamente que fue anulado (por ${auth ? auth.user : 'este dispositivo'}).${played ? `\n\nTambién se borrarán ${played} partido(s) con resultados, goles y tarjetas.` : ''}\n\nEscriba BORRAR para anular el sorteo:`;
+    if ((prompt(msg) || '').trim().toUpperCase() !== 'BORRAR') return toast('No se anuló el sorteo');
+    if (t.drawInfo) t.drawLog = [...(t.drawLog || []), { type: 'draw', at: t.drawInfo.at, by: t.drawInfo.by, annulledAt: Date.now(), annulledBy: auth ? auth.user : 'local' }];
     t.matches = []; t.groups = []; t.stage = 'inscripcion'; t.drawInfo = null; t.finalInfo = null; t.tieOverride = {};
     save(); render(); toast('Sorteo deshecho');
   },
@@ -2301,7 +2402,7 @@ document.addEventListener('change', (e) => {
     const c = T().config;
     const k = el.dataset.cfg;
     let v = num(el.value);
-    if (k === 'format' || k === 'tiebreak') v = el.value;
+    if (k === 'format' || k === 'tiebreak' || k === 'koPairing') v = el.value;
     if (k === 'duration') v = Math.max(1, Math.min(200, Math.round(v)));
     if (k === 'fee') v = Math.max(0, v);
     c[k] = v;
