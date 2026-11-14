@@ -70,6 +70,25 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
+    // Reiniciar toda la base de datos: deja un torneo vacío, borra el historial y deja solo al usuario que lo hace.
+    // Exige la contraseña del usuario además de la sesión.
+    if (action === 'resetAll') {
+      const stored = await redis(['HGET', USERS, me]);
+      if (!stored || !checkPass(b.pass || '', stored)) { await sleep(700); return res.status(403).json({ error: 'Contraseña incorrecta' }); }
+      const data = b.data;
+      const tors = data && data.torneos && typeof data.torneos === 'object' ? Object.values(data.torneos) : [];
+      const okData = tors.length === 1 && tors.every((t) => t && t.cats && Object.values(t.cats).every((c) => c && Array.isArray(c.teams) && c.teams.length === 0 && Array.isArray(c.matches) && c.matches.length === 0));
+      if (!okData) return res.status(400).json({ error: 'Datos de reinicio no válidos' });
+      const others = (await redis(['HKEYS', USERS])).filter((u) => u !== me);
+      for (const u of others) await redis(['HDEL', USERS, u]);
+      await redis(['DEL', 'torneo:hist']);
+      const rev = Number((await redis(['GET', 'torneo:rev'])) || 0) + 1;
+      await redis(['SET', 'torneo:data', JSON.stringify(data)]);
+      await redis(['SET', 'torneo:meta', JSON.stringify({ at: Date.now(), by: me, reset: true })]);
+      await redis(['SET', 'torneo:rev', String(rev)]);
+      return res.status(200).json({ ok: true, rev, removedUsers: others });
+    }
+
     return res.status(400).json({ error: 'Acción no válida' });
   } catch (e) {
     return res.status(500).json({ error: String((e && e.message) || e) });

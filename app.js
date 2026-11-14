@@ -1362,6 +1362,11 @@ function viewAjustes() {
     <p class="muted" style="font-size:14px">Elimina equipos, sorteo y resultados de ${esc(catName(S.cat))}, pero conserva la categoría.</p>
     <button class="btn danger block" data-a="resetCat">Vaciar ${esc(catName(S.cat))}</button>
   </div>
+  ${online ? `<div class="card" style="border-color:var(--bad)">
+    <h2>⚠️ Reiniciar todo</h2>
+    <p class="muted" style="font-size:14px">Borra TODOS los torneos, equipos, partidos, resultados y el historial de versiones, y deja un torneo vacío. Solo queda su usuario (${esc(auth.user)}); los demás usuarios se eliminan. Pide su contraseña.</p>
+    <button class="btn danger block" data-a="resetAll">Reiniciar base de datos</button>
+  </div>` : ''}
   <p class="muted" style="text-align:center;font-size:12px">Torneo Fútbol · funciona sin internet</p>`;
 }
 
@@ -2326,6 +2331,25 @@ const actions = {
       historyList = status === 200 && j ? j.versions : [];
     } catch (e) { historyList = []; toast('Sin conexión'); }
     if (modal && modal.type === 'history') renderModal();
+  },
+  resetAll: async () => {
+    const ok = await askWord('Se borrarán TODOS los torneos, categorías, equipos, partidos, resultados y el historial de versiones. Solo quedará su usuario. Esta acción no se puede deshacer.', { title: '⚠️ Reiniciar base de datos', word: 'REINICIAR', ok: 'Continuar' });
+    if (!ok) return toast('No se borró nada');
+    const pass = await askText('Para confirmar, escriba su contraseña.', { title: '🔑 Contraseña de ' + auth.user, type: 'password', ok: 'Reiniciar todo', danger: true });
+    if (!pass) return toast('No se borró nada');
+    const fresh = { torneos: { t1: newTorneo('Mi Torneo') } };
+    fresh.torneos.t1.createdAt = Date.now();
+    try {
+      const { status, j } = await authCall({ action: 'resetAll', pass, data: fresh });
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast((j && j.error) || 'No se pudo reiniciar');
+      // empezar limpio también en este teléfono
+      S.torneos = fresh.torneos; S.tor = 't1'; S.cat = 'M'; S.tab = 'ajustes';
+      sync.dirty = false; sync.rev = -1; sync.base = null;
+      saveLocal(); saveSync();
+      orgs = null; render(); await pull(true); loadOrgs();
+      toast('✅ Base de datos reiniciada' + (j.removedUsers && j.removedUsers.length ? ' · usuarios eliminados: ' + j.removedUsers.join(', ') : ''));
+    } catch (e) { toast('Sin conexión'); }
   },
   restoreVersion: async (d) => {
     const v = (historyList || []).find((x) => String(x.i) === String(d.i));
