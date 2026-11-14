@@ -486,9 +486,15 @@ function scorersHTML(limit) {
     ${list.map((r, i) => `<tr><td>${i === 0 ? '🥇' : i + 1}</td><td class="tn"><b>${esc(r.player)}</b></td><td class="tn">${miniCrest(r.team)}${esc(tname(r.team))}</td><td class="pts">${r.n}</td></tr>`).join('')}</table></div>`;
 }
 
+/** "Todos contra todos" y "Partidos a elección" comparten tabla, fase final y podio. */
+const ligaLike = (c) => c.format === 'liga' || c.format === 'manual';
 const phase1 = () => T().matches.filter((m) => m.phase !== 'ko');
-const phase1Done = () => { const p = phase1(); return p.length > 0 && p.every((m) => m.status === 'done'); };
-const needsFinal = () => { const c = T().config; return c.format === 'grupos' || (c.format === 'liga' && c.ligaFinal > 0); };
+const phase1Done = () => {
+  const t = T(), p = phase1();
+  if (t.config.format === 'manual' && !t.manualClosed) return false; // en manual, la fase termina cuando el organizador la cierra
+  return p.length > 0 && p.every((m) => m.status === 'done');
+};
+const needsFinal = () => { const c = T().config; return c.format === 'grupos' || (ligaLike(c) && c.ligaFinal > 0); };
 
 function podium() {
   const t = T(), c = t.config;
@@ -500,15 +506,15 @@ function podium() {
     if (c.podium >= 3) {
       const th = ko.find((m) => m.ko === 'third');
       if (th) p.push(winner(th));
-      else if ((c.format === 'liga' || t.groups.length === 1) && t.groups[0]) {
-        const tab = standings(t.groups[0].teams, c.format === 'liga' ? 'liga' : 'grupo', t.groups[0].name);
+      else if ((ligaLike(c) || t.groups.length === 1) && t.groups[0]) {
+        const tab = standings(t.groups[0].teams, ligaLike(c) ? 'liga' : 'grupo', t.groups[0].name);
         const third = tab.find((r) => !p.includes(r.id));
         p.push(third ? third.id : null);
       }
     }
     return p.slice(0, c.podium);
   }
-  if (c.format === 'liga' && !needsFinal() && phase1Done()) {
+  if (ligaLike(c) && !needsFinal() && phase1Done()) {
     return standings(t.groups[0].teams, 'liga', '').slice(0, c.podium).map((r) => r.id);
   }
   return null;
@@ -554,7 +560,8 @@ function doDraw() {
     if (ng * c.perGroup < 2) return toast('Deben clasificar al menos 2 equipos: aumente "Clasifican por grupo"');
     if (Math.min(...Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0))) < c.perGroup) return toast('Hay grupos con menos equipos que los que clasifican');
   }
-  if (c.format === 'liga' && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
+  if (ligaLike(c) && c.ligaFinal > n) return toast(`No hay ${c.ligaFinal} equipos para la fase final`);
+  if (c.format === 'manual') return ask(`Se iniciará el torneo de ${catName(S.cat)} con ${n} equipos. Ustedes eligen cada partido; la tabla se calcula sola.`, { title: '✋ Partidos a elección', ok: 'Iniciar torneo' }).then((ok) => { if (ok) doDrawNow(); });
   return ask(`Se sortearán ${n} equipos de ${catName(S.cat)}.\n\nEl sorteo se hace una sola vez y queda registrado con fecha y usuario.`, { title: '🎲 Sorteo oficial', ok: '🎲 Realizar sorteo' })
     .then((ok) => { if (ok) doDrawNow(); });
 }
@@ -569,6 +576,12 @@ function doDrawNow() {
   } else if (c.format === 'liga') {
     t.groups = [{ name: '', teams: ids }];
     t.matches = roundRobin(ids, 'liga', '');
+    t.stage = 'fase1';
+  } else if (c.format === 'manual') {
+    // Partidos a elección: los equipos quedan en una sola tabla y el organizador crea cada partido
+    t.groups = [{ name: '', teams: t.teams.map((x) => x.id) }];
+    t.matches = [];
+    t.manualClosed = false;
     t.stage = 'fase1';
   } else {
     const ng = groupCount(n, c.groupSize);
@@ -588,7 +601,7 @@ function genFinal(prevNotes = []) {
   const t = T(), c = t.config;
   if (!phase1Done()) return toast('Terminen todos los partidos primero');
   let seeds = [];
-  if (c.format === 'liga') {
+  if (ligaLike(c)) {
     seeds = standings(t.groups[0].teams, 'liga', '').slice(0, c.ligaFinal).map((r) => r.id);
   } else {
     const tabs = t.groups.map((g) => standings(g.teams, 'grupo', g.name));
@@ -606,7 +619,7 @@ function genFinal(prevNotes = []) {
   if (seeds.length < 2) return toast('No hay suficientes clasificados');
 
   // Revisar el último cupo de cada tabla: avisar cómo se decidió y pedir decisión si hay empate total
-  const cuts = c.format === 'liga'
+  const cuts = ligaLike(c)
     ? [{ tab: standings(t.groups[0].teams, 'liga', ''), cut: c.ligaFinal, g: '' }]
     : t.groups.map((g) => ({ tab: standings(g.teams, 'grupo', g.name), cut: c.perGroup, g: g.name }));
   const notes = [...prevNotes];
@@ -776,10 +789,10 @@ function miniStandings() {
   const t = T(), c = t.config;
   if (t.stage === 'inscripcion' || c.format === 'elim' || !t.groups.length) return '';
   const blocks = t.groups.map((g) => {
-    const rows = standings(g.teams, c.format === 'liga' ? 'liga' : 'grupo', g.name).slice(0, c.format === 'liga' ? 6 : 4);
+    const rows = standings(g.teams, ligaLike(c) ? 'liga' : 'grupo', g.name).slice(0, ligaLike(c) ? 6 : 4);
     return `${g.name ? `<div class="day" style="margin:14px 14px 6px">Grupo ${g.name}</div>` : ''}
       <table><tr><th>#</th><th class="tn">Equipo</th><th>PJ</th><th>DG</th><th>Pts</th></tr>
-      ${rows.map((r, i) => `<tr class="${i < (c.format === 'liga' ? (c.ligaFinal || c.podium) : c.perGroup) ? 'q' : ''}"><td>${i + 1}</td><td class="tn">${miniCrest(r.id)}${esc(tname(r.id))}</td><td>${r.pj}</td><td>${r.gf - r.gc}</td><td class="pts">${r.pts}</td></tr>`).join('')}</table>`;
+      ${rows.map((r, i) => `<tr class="${i < (ligaLike(c) ? (c.ligaFinal || c.podium) : c.perGroup) ? 'q' : ''}"><td>${i + 1}</td><td class="tn">${miniCrest(r.id)}${esc(tname(r.id))}</td><td>${r.pj}</td><td>${r.gf - r.gc}</td><td class="pts">${r.pts}</td></tr>`).join('')}</table>`;
   }).join('');
   return `<div class="sec-head"><h2>📊 Posiciones</h2><button class="link" data-a="tab" data-t="tabla">Ver todo →</button></div>
     <div class="panel">${blocks}</div>`;
@@ -951,7 +964,7 @@ const PAIRING_TEXT = {
 /** Regla de cruces efectiva según el formato. */
 function pairingOf(c) {
   const p = c.koPairing || 'cruzado';
-  if (c.format === 'liga') return p === 'sorteo' ? 'sorteo' : 'ranking';
+  if (ligaLike(c)) return p === 'sorteo' ? 'sorteo' : 'ranking';
   if (c.format === 'grupos' && groupCount(T().teams.length, c.groupSize) === 1 && p === 'cruzado') return 'ranking';
   return p;
 }
@@ -970,6 +983,10 @@ function formatPreview() {
     parts.push(ng === 1 ? `1 grupo de ${n} equipos (${gm} partidos)` : `${ng} grupos de ${sizes.join(', ')} equipos (${gm} partidos de grupos)`);
     Q = ng * c.perGroup;
     parts.push(`clasifican ${Q} (${c.perGroup === 1 ? 'el 1°' : 'los ' + c.perGroup + ' primeros'}${ng > 1 ? ' de cada grupo' : ''})`);
+  } else if (c.format === 'manual') {
+    parts.push(`ustedes eligen cada partido; la tabla se calcula por puntos y la fase termina cuando el organizador la cierra`);
+    Q = c.ligaFinal;
+    if (!Q) return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}. Gana el 1° de la tabla.</div>`;
   } else if (c.format === 'liga') {
     parts.push(`todos contra todos: ${(n * (n - 1)) / 2} partidos en ${n % 2 ? n : n - 1} jornadas${n % 2 ? ' (cada jornada descansa un equipo)' : ''}`);
     Q = c.ligaFinal;
@@ -994,8 +1011,10 @@ function drawSetupHTML() {
     <h3>Formato</h3>
     ${optRadio('format', 'liga', c.format, 'Todos contra todos', 'Todos se enfrentan una vez. Tabla por puntos.')}
     ${optRadio('format', 'grupos', c.format, 'Cuadrangulares (grupos)', 'Se sortean grupos; los mejores pasan a eliminación.')}
-    ${optRadio('format', 'elim', c.format, 'Eliminación directa', 'Llave de eliminación desde el inicio.')}`;
-  if (c.format === 'liga') {
+    ${optRadio('format', 'elim', c.format, 'Eliminación directa', 'Llave de eliminación desde el inicio.')}
+    ${optRadio('format', 'manual', c.format, 'Partidos a elección', 'Ustedes eligen quién juega contra quién (la app sugiere cruces parejos). Tabla por puntos.')}
+    <button class="btn ghost block sm" data-a="openCompare" style="margin:4px 0 6px">🧮 Comparar formatos según la cantidad de equipos</button>`;
+  if (ligaLike(c)) {
     h += `<h3>Fase final</h3>
       ${optRadio('ligaFinal', 0, c.ligaFinal, 'Sin fase final', 'Gana el primero de la tabla')}
       ${optRadio('ligaFinal', 2, c.ligaFinal, 'Final', '1° vs 2° de la tabla')}
@@ -1029,7 +1048,7 @@ function drawSetupHTML() {
       ${optRadio('podium', 3, c.podium, '3 lugares', 'Incluye partido por el tercer lugar si hay semifinales')}
       <label class="fl">Duración de partido por defecto (minutos)<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
       <div style="height:12px"></div>
-      <button class="btn block" data-a="draw" ${n < 2 ? 'disabled' : ''}>🎲 Realizar sorteo</button>`;
+      <button class="btn block" data-a="draw" ${n < 2 ? 'disabled' : ''}>${c.format === 'manual' ? '✋ Iniciar torneo (partidos a elección)' : '🎲 Realizar sorteo'}</button>`;
   return h;
 }
 
@@ -1069,7 +1088,7 @@ function phasesHTML() {
   let h = '';
   const p1 = phase1();
   if (p1.length) {
-    h += `<h3>${c.format === 'liga' ? 'Fase regular' : 'Fase de grupos'} · ${p1.filter((m) => m.status === 'done').length}/${p1.length}</h3>`;
+    h += `<h3>${ligaLike(c) ? 'Fase regular' : 'Fase de grupos'} · ${p1.filter((m) => m.status === 'done').length}/${p1.length}</h3>`;
     for (const r of [...new Set(p1.map((m) => m.round))]) {
       h += `<div class="day">Jornada ${r}</div>`;
       for (const m of p1.filter((x) => x.round === r)) h += matchCard(m);
@@ -1094,7 +1113,7 @@ function viewPartidos() {
     if (adm) return drawSetupHTML();
     return `<h1>Partidos ${catName(S.cat)}</h1><div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
   }
-  const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa' }[c.format];
+  const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa', manual: 'Partidos a elección' }[c.format];
   const mode = S.view === 'fase' ? 'fase' : 'cal';
   const all = t.matches;
   const done = all.filter((m) => m.status === 'done').length;
@@ -1118,6 +1137,19 @@ function viewPartidos() {
     h += phasesHTML();
   }
 
+  if (adm && c.format === 'manual' && t.stage === 'fase1') {
+    if (!t.manualClosed) {
+      h += `<div class="cta-grid" style="margin-top:14px">
+        <button class="btn" data-a="manualNew">＋ Agregar partido</button>
+        <button class="btn ghost" data-a="manualSuggest">🎲 Sugerir partido</button>
+      </div>
+      ${manualBalanceHTML()}
+      <button class="btn ghost block sm" data-a="manualClose" ${phase1().length && phase1().every((m) => m.status === 'done') ? '' : 'disabled'}>🏁 Terminar fase de partidos${needsFinal() ? ' (para generar la fase final)' : ' (definir campeón)'}</button>
+      <p class="muted" style="font-size:12.5px">Para terminar la fase, todos los partidos creados deben estar finalizados.</p>`;
+    } else if (!t.matches.some((m) => m.phase === 'ko')) {
+      h += `<div class="note">La fase de partidos está cerrada.</div><button class="btn ghost block sm" data-a="manualReopen">↩️ Reabrir fase para agregar más partidos</button>`;
+    }
+  }
   if (adm) {
     if (t.stage === 'fase1' && needsFinal()) {
       h += phase1Done()
@@ -1130,6 +1162,112 @@ function viewPartidos() {
   if (pod) h += podiumHTML(pod);
   if (adm) h += `<div style="height:20px"></div><button class="btn danger block sm" data-a="undoDraw">Deshacer sorteo (borra resultados)</button>`;
   return h;
+}
+
+/* ---------------- Formato "Partidos a elección" ---------------- */
+/** Partidos jugados/programados por equipo y si ya se enfrentaron. */
+function manualStats() {
+  const t = T();
+  const count = Object.fromEntries(t.teams.map((x) => [x.id, 0]));
+  const met = new Set();
+  for (const m of phase1()) { count[m.home]++; count[m.away]++; met.add([m.home, m.away].sort().join('|')); }
+  return { count, met };
+}
+function manualBalanceHTML() {
+  const t = T(), { count } = manualStats();
+  const rows = [...t.teams].sort((a, b) => count[a.id] - count[b.id]);
+  return `<div class="card" style="padding:12px;margin-top:10px"><b style="font-size:14px">Partidos por equipo</b>
+    <div class="row" style="margin-top:8px;gap:6px">${rows.map((x) => `<span class="badge ${count[x.id] === count[rows[0].id] ? 'b-ok' : 'b-pend'}">${esc(x.name)}: ${count[x.id]}</span>`).join('')}</div>
+    <small>En verde, los que menos han jugado. "Sugerir partido" los prioriza y evita repetir cruces.</small></div>`;
+}
+/** Sugerencia: dos equipos con menos partidos que aún no se hayan enfrentado (si es posible). */
+function suggestPair() {
+  const t = T(), { count, met } = manualStats();
+  const ids = shuffle(t.teams.map((x) => x.id)).sort((a, b) => count[a] - count[b]);
+  let best = null, bestScore = Infinity;
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    const a = ids[i], b = ids[j];
+    const score = (count[a] + count[b]) * 10 + (met.has([a, b].sort().join('|')) ? 1000 : 0) + Math.abs(count[a] - count[b]);
+    if (score < bestScore) { bestScore = score; best = [a, b]; }
+  }
+  return best;
+}
+function manualMatchHTML() {
+  const t = T(), sel = modal.pair || [];
+  // Jornada sugerida: la última si aún caben partidos (cada equipo juega 1 vez por jornada), si no, la siguiente
+  const p1 = phase1(), last = p1.length ? Math.max(...p1.map((m) => m.round)) : 1;
+  const inLast = p1.filter((m) => m.round === last).length;
+  const nextRound = !p1.length ? 1 : inLast < Math.floor(t.teams.length / 2) ? last : last + 1;
+  const opt = (v) => t.teams.map((x) => `<option value="${x.id}" ${x.id === v ? 'selected' : ''}>${esc(x.name)}</option>`).join('');
+  return `<div class="mh"><h2>＋ Agregar partido</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb">
+    <div class="grid2">
+      <label class="fl">Local<select id="mm-h" class="inp"><option value="">— Elegir —</option>${opt(sel[0])}</select></label>
+      <label class="fl">Visitante<select id="mm-a" class="inp"><option value="">— Elegir —</option>${opt(sel[1])}</select></label>
+    </div>
+    <label class="fl">Jornada / ronda<input id="mm-r" type="number" inputmode="numeric" min="1" value="${modal.round || nextRound}"></label>
+    <p class="muted" style="font-size:13px">La jornada sirve para ordenar el calendario. Puede programar fecha y hora después.</p>
+  </div>
+  <div class="mf">
+    <button class="btn block" data-a="manualCreate">Crear partido</button>
+    <button class="btn ghost block sm" data-a="manualSuggest">🎲 Sugerir otro cruce</button>
+  </div>`;
+}
+
+/* ---------------- Comparador de formatos ---------------- */
+function compareFormats(n, minutes, fields) {
+  const c = T().config, podium3 = c.podium >= 3;
+  const ko = (Q) => (Q < 2 ? 0 : Q - 1 + (podium3 && Q >= 4 ? 1 : 0));
+  const koText = (Q) => {
+    if (Q < 2) return 'sin fase final';
+    const P = nextPow2(Q), byes = P - Q, rs = []; for (let k = P; k >= 2; k /= 2) rs.push(roundName(k));
+    if (byes) rs[0] += ` (${byes} pase${byes > 1 ? 's' : ''} directo${byes > 1 ? 's' : ''})`;
+    return rs.join(' → ') + (podium3 && Q >= 4 ? ' + 3er lugar' : '');
+  };
+  const time = (games) => { const slots = Math.ceil(games / fields), mins = slots * minutes; return `≈ ${Math.floor(mins / 60)} h ${pad(mins % 60)} min`; };
+  const out = [];
+  // Todos contra todos (con final o semis)
+  const rr = (n * (n - 1)) / 2;
+  for (const fin of [0, 2, 4]) {
+    if (fin > n) continue;
+    const g = rr + ko(fin);
+    out.push({ name: 'Todos contra todos' + (fin === 2 ? ' + final' : fin === 4 ? ' + semifinales' : ''), games: g, perTeam: `${n - 1}${fin ? '–' + (n - 1 + (fin === 2 ? 1 : 2)) : ''}`,
+      detail: `${rr} partidos en ${n % 2 ? n : n - 1} jornadas${n % 2 ? ', cada jornada descansa 1 equipo' : ''}${fin ? '; luego ' + koText(fin) : '; gana el 1° de la tabla'}`, time: time(g) });
+  }
+  // Grupos
+  for (const size of [3, 4]) {
+    if (n < 3) break;
+    const ng = groupCount(n, size), sizes = Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0));
+    const gm = sizes.reduce((a, k) => a + (k * (k - 1)) / 2, 0), Q = ng * 2;
+    if (Math.min(...sizes) < 3) continue; // grupos de 2 no tienen sentido
+    const g = gm + ko(Q);
+    out.push({ name: ng === 1 ? 'Cuadrangular: 1 grupo' : `Cuadrangulares: ${ng} grupos`, games: g, perTeam: `${Math.min(...sizes) - 1}–${Math.max(...sizes) - 1 + Math.log2(nextPow2(Q))}`,
+      detail: `${ng} grupo${ng > 1 ? 's' : ''} de ${sizes.join(', ')} (${gm} partidos); pasan 2${ng > 1 ? ' por grupo' : ''} → ${koText(Q)}`, time: time(g) });
+    if (out.some((o) => o.detail === out[out.length - 1].detail && o !== out[out.length - 1])) out.pop(); // sin filas repetidas
+  }
+  // Eliminación directa
+  const ge = ko(n);
+  out.push({ name: 'Eliminación directa', games: ge, perTeam: `1–${Math.log2(nextPow2(n))}`, detail: koText(n) + '; el que pierde queda fuera', time: time(ge) });
+  return out;
+}
+function compareHTML() {
+  const c = T().config;
+  const n = modal.n || Math.max(2, T().teams.length || 6);
+  const fields = modal.fields || 1, minutes = (c.duration || 20) + 5;
+  const rows = compareFormats(n, minutes, fields);
+  return `<div class="mh"><h2>🧮 Comparar formatos</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb" style="padding-top:10px">
+    <div class="grid2">
+      <label class="fl">Cantidad de equipos<input id="cmp-n" type="number" inputmode="numeric" min="2" max="40" value="${n}"></label>
+      <label class="fl">Canchas a la vez<select id="cmp-f" class="inp">${[1, 2, 3].map((v) => `<option ${v === fields ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    </div>
+    <p class="muted" style="font-size:13px">${n % 2 ? `<b>${n} es impar:</b> en todos contra todos un equipo descansa cada jornada; en eliminación hay pases directos.` : `<b>${n} es par:</b> en todos contra todos juegan todos en cada jornada.`} Tiempo estimado con partidos de ${c.duration} min + 5 de cambio.</p>
+    ${rows.map((r) => `<div class="card" style="padding:12px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline"><b>${esc(r.name)}</b><span class="badge b-ok">${r.games} partidos</span></div>
+      <div class="muted" style="font-size:13.5px;margin:4px 0">${esc(r.detail)}</div>
+      <small>Cada equipo juega ${r.perTeam} partidos · ${r.time} con ${fields} cancha${fields > 1 ? 's' : ''}</small></div>`).join('')}
+    <div class="card" style="padding:12px"><b>Partidos a elección</b><div class="muted" style="font-size:13.5px;margin-top:4px">Ustedes deciden cuántos partidos y quién contra quién. Útil si hay poco tiempo o equipos que llegan tarde.</div></div>
+  </div>`;
 }
 
 function matchCard(m) {
@@ -1180,7 +1318,7 @@ function viewTabla() {
   const pod = podium();
   if (pod) h += podiumHTML(pod);
 
-  if (c.format === 'liga') {
+  if (ligaLike(c)) {
     h += `<h3>Posiciones</h3>` + tableHTML(standings(t.groups[0].teams, 'liga', ''), c.ligaFinal || c.podium);
     h += `<p class="muted" style="font-size:12.5px;margin-top:-4px">Desempate: ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</p>`;
   } else if (c.format === 'grupos') {
@@ -1386,6 +1524,8 @@ function renderModal() {
   else if (modal.type === 'schedule') sheet.innerHTML = scheduleHTML();
   else if (modal.type === 'torneos') sheet.innerHTML = torneosHTML();
   else if (modal.type === 'history') sheet.innerHTML = historyHTML();
+  else if (modal.type === 'manualMatch') sheet.innerHTML = manualMatchHTML();
+  else if (modal.type === 'compare') sheet.innerHTML = compareHTML();
   else if (modal.type === 'teamView') {
     if (!teamById(modal.id)) { modal = null; return renderModal(); }
     sheet.innerHTML = teamViewHTML(modal.id);
@@ -1825,6 +1965,9 @@ function matchHTML(m) {
       ? `<button class="btn ghost block" data-a="reopen">✏️ Corregir resultado</button>`
       : `<button class="btn block" data-a="finish">✅ Finalizar partido</button>`;
   }
+  if (adm && T().config.format === 'manual' && m.phase !== 'ko' && m.status === 'pend' && !T().manualClosed) {
+    h += `<button class="btn danger block sm" data-a="manualDelete" data-id="${m.id}">Eliminar este partido</button>`;
+  }
   h += `</div>`;
   return h;
 }
@@ -2006,7 +2149,7 @@ function mergeCat(L, B, R) {
     const drawL = !same(L.groups, B.groups), drawR = !same(R.groups, B.groups);
     const koIds = (x) => (x.matches || []).filter((m) => m.phase === 'ko').map((m) => m.id).sort().join();
     const koL = koIds(L) !== koIds(B), koR = koIds(R) !== koIds(B);
-    const meta = ['drawInfo', 'finalInfo', 'tieOverride', 'drawLog'];
+    const meta = ['drawInfo', 'finalInfo', 'tieOverride', 'drawLog', 'manualClosed'];
     if (drawL && drawR) {
       // Ambos sortearon a la vez: se mantiene el sorteo que llegó primero al servidor
       mergeNotices.push(`Otro organizador ya había realizado el sorteo de ${R.name || 'la categoría'}. Se mantiene ese sorteo.`);
@@ -2230,7 +2373,7 @@ const actions = {
     askWord(msg, { title: '⚠️ Anular sorteo oficial', ok: 'Anular sorteo' }).then((ok) => {
     if (!ok) return toast('No se anuló el sorteo');
     if (t.drawInfo) t.drawLog = [...(t.drawLog || []), { type: 'draw', at: t.drawInfo.at, by: t.drawInfo.by, annulledAt: Date.now(), annulledBy: auth ? auth.user : 'local' }];
-    t.matches = []; t.groups = []; t.stage = 'inscripcion'; t.drawInfo = null; t.finalInfo = null; t.tieOverride = {};
+    t.matches = []; t.groups = []; t.stage = 'inscripcion'; t.drawInfo = null; t.finalInfo = null; t.tieOverride = {}; t.manualClosed = false;
     save(); render(); toast('Sorteo anulado');
     });
   },
@@ -2332,6 +2475,48 @@ const actions = {
     } catch (e) { historyList = []; toast('Sin conexión'); }
     if (modal && modal.type === 'history') renderModal();
   },
+  openCompare: () => openModal('compare', null),
+  manualNew: () => { modal = { type: 'manualMatch', id: null, pair: null }; renderModal(); },
+  manualSuggest: () => {
+    if (T().teams.length < 2) return toast('Se necesitan al menos 2 equipos');
+    const pair = suggestPair();
+    modal = { type: 'manualMatch', id: null, pair };
+    renderModal();
+    toast(`🎲 Sugerido: ${tname(pair[0])} vs ${tname(pair[1])}`);
+  },
+  manualCreate: () => {
+    const t = T();
+    const home = $('#mm-h').value, away = $('#mm-a').value, round = Math.max(1, parseInt($('#mm-r').value, 10) || 1);
+    if (!home || !away) return toast('Elija los dos equipos');
+    if (home === away) return toast('Un equipo no puede jugar contra sí mismo');
+    const create = () => {
+      t.matches.push(mkMatch({ phase: 'liga', group: '', round, home, away }));
+      save(); closeModal(); render();
+      toast(`✅ Partido creado: ${tname(home)} vs ${tname(away)}`);
+    };
+    const already = phase1().filter((m) => [m.home, m.away].sort().join('|') === [home, away].sort().join('|')).length;
+    if (already) return ask(`${tname(home)} y ${tname(away)} ya tienen ${already} partido(s) entre ellos. ¿Crear otro?`, { title: 'Cruce repetido', ok: 'Crear de todos modos' }).then((ok) => { if (ok) create(); });
+    create();
+  },
+  manualDelete: (d) => {
+    const m = mById(d.id); if (!m || m.status !== 'pend') return toast('Solo se pueden eliminar partidos que no han empezado');
+    ask(`${tname(m.home)} vs ${tname(m.away)}`, { title: 'Eliminar partido', ok: 'Eliminar', danger: true }).then((ok) => {
+      if (!ok) return;
+      T().matches = T().matches.filter((x) => x.id !== m.id);
+      save(); closeModal(); render(); toast('Partido eliminado');
+    });
+  },
+  manualClose: () => {
+    const t = T(), p = phase1();
+    if (!p.length || p.some((m) => m.status !== 'done')) return toast('Primero finalice todos los partidos creados');
+    const { count } = manualStats(), vals = Object.values(count);
+    const uneven = Math.max(...vals) !== Math.min(...vals);
+    ask(`Se cerrará la fase con ${p.length} partidos jugados.${uneven ? '\n\n⚠️ No todos los equipos jugaron la misma cantidad de partidos (' + Math.min(...vals) + ' a ' + Math.max(...vals) + ').' : ''}${needsFinal() ? '\n\nLuego podrá generar la fase final.' : '\n\nEl 1° de la tabla será el campeón.'}`, { title: '🏁 Terminar fase de partidos', ok: 'Terminar fase' }).then((ok) => {
+      if (!ok) return;
+      t.manualClosed = true; save(); render(); toast('Fase de partidos terminada');
+    });
+  },
+  manualReopen: () => { T().manualClosed = false; save(); render(); toast('Fase reabierta: puede agregar más partidos'); },
   resetAll: async () => {
     const ok = await askWord('Se borrarán TODOS los torneos, categorías, equipos, partidos, resultados y el historial de versiones. Solo quedará su usuario. Esta acción no se puede deshacer.', { title: '⚠️ Reiniciar base de datos', word: 'REINICIAR', ok: 'Continuar' });
     if (!ok) return toast('No se borró nada');
@@ -2442,7 +2627,7 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow']);
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow', 'openCompare']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
@@ -2500,6 +2685,14 @@ document.addEventListener('change', (e) => {
     if (!isAdmin()) return;
     const n = el.value.trim().slice(0, 40);
     if (n) { TOR().name = n; save(); render(); toast('Nombre del torneo guardado'); }
+    return;
+  }
+  if (el.id === 'cmp-n' || el.id === 'cmp-f') {
+    if (modal && modal.type === 'compare') {
+      if (el.id === 'cmp-n') modal.n = Math.max(2, Math.min(40, parseInt(el.value, 10) || 2));
+      else modal.fields = Math.max(1, Math.min(3, parseInt(el.value, 10) || 1));
+      renderModal();
+    }
     return;
   }
   if (el.dataset.tcfg) {
