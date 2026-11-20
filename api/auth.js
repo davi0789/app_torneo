@@ -81,7 +81,7 @@ module.exports = async function handler(req, res) {
       if (!okData) return res.status(400).json({ error: 'Datos de reinicio no válidos' });
       const others = (await redis(['HKEYS', USERS])).filter((u) => u !== me);
       for (const u of others) await redis(['HDEL', USERS, u]);
-      await redis(['DEL', 'torneo:hist', 'torneo:insc', 'torneo:bajas']);
+      await redis(['DEL', 'torneo:hist', 'torneo:insc', 'torneo:bajas', 'torneo:invit']);
       const rev = Number((await redis(['GET', 'torneo:rev'])) || 0) + 1;
       await redis(['SET', 'torneo:data', JSON.stringify(data)]);
       await redis(['SET', 'torneo:meta', JSON.stringify({ at: Date.now(), by: me, reset: true })]);

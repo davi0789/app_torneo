@@ -204,7 +204,7 @@ function askText(message, o = {}) {
 /** Elegir entre varias opciones [{key,label,value,style}]. Devuelve value o null. */
 function askChoice(message, options, o = {}) {
   if (SYNC_DIALOGS) { const a = (prompt(message) || '').trim().toUpperCase(); const x = options.find((op) => op.key === a); return now(x ? x.value : null); }
-  return openDialog({ title: o.title, message, options });
+  return openDialog({ title: o.title, message, options, cancelText: o.cancel || 'Cancelar' });
 }
 /** Acción peligrosa: hay que escribir la palabra (BORRAR). Devuelve true/false. */
 function askWord(message, o = {}) {
@@ -2412,7 +2412,7 @@ function inscCTA(compact) {
       : '<button class="btn ghost" data-a="capOpen">🔑 Soy capitán</button>';
   return `<div class="card">
     <h2>📝 Inscripción · ${esc(catName(S.cat))}</h2>
-    <p class="muted" style="margin:4px 0 10px;font-size:14px">${txt ? txt + ' ' : ''}De ${cfg.min} a ${cfg.max} jugadores por equipo. La organización revisa y aprueba cada inscripción.</p>
+    <p class="muted" style="margin:4px 0 10px;font-size:14px">${txt ? txt + ' ' : ''}De ${cfg.min} a ${cfg.max} jugadores por equipo. Se inscribe <b>solo con la invitación</b> que la organización envía a cada capitán, y la organización aprueba cada inscripción.</p>
     <div class="row">${main}<button class="btn ghost" data-a="openRules">📜 Reglamento</button></div>
   </div>`;
 }
@@ -2426,26 +2426,42 @@ function capHTML() {
 }
 
 function capStartHTML() {
-  const open = Object.entries(CATS_()).filter(([, c]) => inscWin(inscOf(c)).regOpen);
-  const sel = open.some(([k]) => k === S.cat) ? S.cat : (open[0] || [])[0];
-  return `<div class="mb">
-    ${open.length ? `<div class="card" style="margin-top:12px">
-      <h3 style="margin-top:0">Nueva inscripción</h3>
-      <p class="muted" style="font-size:14px">El representante (capitán) crea la inscripción y después agrega a sus jugadores. Recibirá un <b>código</b>: con ese código y su clave podrá volver a entrar desde cualquier teléfono.</p>
+  const inv = modal.inv;
+  let nueva;
+  if (!inv) {
+    nueva = `<div class="card" style="margin-top:12px">
+      <h3 style="margin-top:0">Inscribir un equipo</h3>
+      <p class="muted" style="font-size:14px">La inscripción es <b>solo con invitación</b>: la organización envía a cada capitán un enlace personal. Si le dieron el código de invitación, escríbalo aquí.</p>
+      <form id="capInvForm" autocomplete="off">
+        <label class="fl">Código de invitación<input id="ci-code" maxlength="12" autocapitalize="characters" spellcheck="false" placeholder="Ej: K7P2-QX9M" value="${esc(modal.invCode || '')}" required></label>
+        <div style="height:10px"></div><button class="btn block" type="submit">Continuar</button>
+      </form>
+    </div>`;
+  } else if (inv.used) {
+    nueva = '<div class="note warn" style="margin-top:12px">Esta invitación ya se usó para inscribir un equipo. Ingrese abajo con el <b>código del equipo</b> y su <b>clave</b>.</div>';
+  } else if (!inv.open) {
+    nueva = `<div class="note warn" style="margin-top:12px">La inscripción de <b>${esc(inv.catName)}</b> no está abierta en este momento. Consulte a la organización.</div>`;
+  } else {
+    nueva = `<div class="card" style="margin-top:12px">
+      <h3 style="margin-top:0">Nueva inscripción · ${esc(inv.catName)}</h3>
+      <div class="note">✉️ Invitación para <b>${esc(inv.label)}</b>${inv.until ? `<br>Inscripción abierta hasta el <b>${fmtWhen(inv.until)}</b>` : ''}</div>
+      <p class="muted" style="font-size:14px">Cree la inscripción y después agregue a sus jugadores. Recibirá un <b>código de equipo</b>: con ese código y su clave podrá volver a entrar desde cualquier teléfono. La invitación sirve una sola vez.</p>
       <form id="capNewForm" autocomplete="off">
-        <label class="fl">Categoría<select id="cn-cat">${open.map(([k, c]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${esc(c.name)}${inscOf(c).until ? ' · hasta ' + fmtWhen(inscOf(c).until) : ''}</option>`).join('')}</select></label>
         <label class="fl">Nombre del equipo<input id="cn-name" maxlength="40" placeholder="Ej: Los Tigres" required></label>
         <label class="fl">Representante propietario <small>(nombre y apellido)</small><input id="cn-rep" maxlength="60" required></label>
         <label class="fl">Teléfono del representante<input id="cn-phone" type="tel" inputmode="tel" maxlength="20" placeholder="Ej: 7777-7777" required></label>
-        <label class="fl">Cree una clave <small>(mínimo 6 caracteres)</small><input id="cn-pass" type="password" autocomplete="new-password" minlength="6" required></label>
+        <label class="fl">Cree una clave <small>(mínimo 6 caracteres, solo usted la sabrá)</small><input id="cn-pass" type="password" autocomplete="new-password" minlength="6" required></label>
         <div style="height:10px"></div><button class="btn block" type="submit">Crear inscripción</button>
       </form>
-    </div>` : `<div class="note warn" style="margin-top:12px">En este momento no hay inscripciones abiertas en ${esc(TOR().name)}.</div>`}
+    </div>`;
+  }
+  return `<div class="mb">
+    ${nueva}
     <div class="card">
-      <h3 style="margin-top:0">Ya tengo una inscripción</h3>
+      <h3 style="margin-top:0">Ya tengo mi equipo inscrito</h3>
       <form id="capLoginForm" autocomplete="on">
         <div class="grid2">
-          <label class="fl">Código<input id="cl-id" name="username" maxlength="6" autocapitalize="characters" spellcheck="false" placeholder="Ej: K7P2QX" required></label>
+          <label class="fl">Código del equipo<input id="cl-id" name="username" maxlength="6" autocapitalize="characters" spellcheck="false" placeholder="Ej: MJGVDH" required></label>
           <label class="fl">Clave<input id="cl-pass" name="password" type="password" autocomplete="current-password" required></label>
         </div>
         <div style="height:10px"></div><button class="btn ghost block" type="submit">Ingresar</button>
@@ -2454,6 +2470,44 @@ function capStartHTML() {
     </div>
     <button class="btn ghost block sm" data-a="openRules">📜 Ver reglamento</button>
   </div>`;
+}
+/** Revisa un código de invitación y muestra el formulario de inscripción. */
+async function checkInvite(code) {
+  const c = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (c.length !== 8) return toast('El código de invitación tiene 8 letras y números');
+  try {
+    const { status, j } = await inscCall({ action: 'checkInvite', invite: c });
+    if (status !== 200) return toast(j.error || 'Código de invitación no válido');
+    if (modal && modal.type === 'cap') { modal.inv = j; modal.invCode = c; renderModal(); }
+  } catch (e) { toast('Sin conexión. Intente de nuevo.'); }
+}
+
+/* ---- Invitaciones (organizador) ---- */
+let inscInvites = [];
+const invPretty = (c) => String(c).slice(0, 4) + '-' + String(c).slice(4);
+const invLink = (c) => `${location.origin}/?i=${invPretty(c)}`;
+function invText(inv) {
+  const tor = S.torneos[inv.tor], c = tor && tor.cats[inv.cat], cfg = inscOf(c);
+  return `Hola ${inv.label} 👋\nEsta es su invitación para inscribir su equipo en *${tor ? tor.name : 'el torneo'}* · ${c ? c.name : ''}.\n\n👉 ${invLink(inv.code)}\n\nCódigo de invitación: ${invPretty(inv.code)}\n${cfg.until ? `Inscripción abierta hasta el ${fmtWhen(cfg.until)}.\n` : ''}El enlace es personal y sirve una sola vez: no lo comparta.`;
+}
+function invShare(inv, how) {
+  const text = invText(inv);
+  if (how === 'wa') { window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank'); return; }
+  const fallback = () => askText('Copie el enlace de invitación:', { title: '📋 Enlace', value: invLink(inv.code), ok: 'Listo' });
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => toast('📋 Invitación copiada. Péguela en WhatsApp o SMS.'), fallback);
+  else fallback();
+}
+function invitesHTML() {
+  const list = inscInvites.filter((i) => i.tor === S.tor && i.cat === S.cat);
+  const pend = list.filter((i) => !i.usedBy).length;
+  return `<div class="cr-lbl" style="margin-top:14px">✉️ Invitaciones a capitanes${list.length ? ` <small>· ${pend} sin usar</small>` : ''}</div>
+    <p class="muted" style="font-size:13px;margin:0 0 8px">Solo quien tenga una invitación puede inscribir un equipo. Cada invitación sirve una vez y es para esta categoría.</p>
+    <button class="btn block sm" data-a="invNew">✉️ Invitar a un capitán</button>
+    ${list.map((i) => `<div class="org"><span class="grow"><b>${esc(i.label)}</b><br><small><span class="code">${invPretty(i.code)}</span> · ${i.usedBy ? `✅ usada: ${esc(i.team || i.usedBy)}` : 'pendiente'}</small></span>
+      ${i.usedBy ? '' : `<span class="row" style="flex-wrap:nowrap;flex:none">
+        <button class="btn ghost sm" data-a="invWa" data-c="${i.code}" aria-label="Enviar por WhatsApp">💬</button>
+        <button class="btn ghost sm" data-a="invCopy" data-c="${i.code}" aria-label="Copiar">📋</button>
+        <button class="btn danger sm" data-a="invDel" data-c="${i.code}" aria-label="Anular">🗑️</button></span>`}</div>`).join('')}`;
 }
 
 /** Qué puede cambiar el capitán ahora (el servidor aplica las mismas reglas). */
@@ -2627,7 +2681,7 @@ async function loadInsc(force) {
     const { status, j } = await admInsc({ action: 'list' });
     if (status === 401) return sessionExpired();
     if (status === 200) {
-      inscList = j.regs || []; inscBans = j.bans || []; inscAt = Date.now();
+      inscList = j.regs || []; inscBans = j.bans || []; inscInvites = j.invites || []; inscAt = Date.now();
       if (S.tab === 'equipos' || (modal && modal.type === 'inscAdmin')) requestRender();
     }
   } catch (e) { /* sin conexión */ } finally { inscLoading = false; }
@@ -2658,6 +2712,7 @@ function inscAdminCard() {
       <span class="tcrest" style="width:36px;height:36px">${crestHTML(r.crest, r.name, 36)}</span>
       <div class="grow"><div class="t">${esc(r.name)}${regWarns(r).length ? ' ⚠️' : ''}</div><small>${r.players.length} jugadores · ${esc(r.rep.name)} · ${fmtWhen(r.updatedAt)}</small></div>${inscBadge(r)}</button>`).join('')
     : '<p class="muted">Aún no hay inscripciones en línea en esta categoría.</p>'}
+    ${invitesHTML()}
     ${bans.length ? `<details style="margin-top:8px"><summary><b>Jugadores dados de baja (intransferibles): ${bans.length}</b></summary>
       ${bans.map((b) => `<div class="org"><span class="grow"><b>${esc(b.name)}</b> <small>· ${esc(b.team)} (${esc(b.cat)})</small><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span>
       <button class="btn ghost sm" data-a="inscUnban" data-k="${esc(b.key)}">Habilitar</button></div>`).join('')}</details>` : ''}
@@ -2757,6 +2812,7 @@ function rulesBody(text) {
 function rulesHTML() {
   const tor = TOR(), cfg = inscOf();
   const sys = [
+    'Solo pueden inscribir equipos los capitanes que reciben una invitación personal de la organización (sirve una sola vez).',
     `Cada equipo inscribe de ${cfg.min} a ${cfg.max} jugadores.`,
     'Un jugador solo puede estar en un equipo del torneo (en cualquier categoría). Si ya aparece en otro equipo, el sistema no lo deja inscribir y el jugador debe decidir en cuál participará. Si son dos personas con el mismo nombre, se diferencian con el DUI o carné y la organización lo verifica.',
     'Para dar de baja a un jugador hay que escribir el motivo. El jugador dado de baja queda intransferible: no puede volver a inscribirse en ningún equipo.',
@@ -2981,6 +3037,30 @@ const actions = {
   rulesTemplate: async () => {
     if (TOR().rules && !(await ask('Se reemplazará el reglamento actual por el del Campeonato de Futbolito Perquín 2026.', { title: '📄 Usar plantilla', ok: 'Reemplazar', danger: true }))) return;
     TOR().rules = RULES_TEMPLATE; save(); render(); toast('Reglamento cargado. Puede editarlo.');
+  },
+  invNew: async () => {
+    const label = await askText(`¿A quién va dirigida? Escriba el nombre del capitán y/o del equipo.\n\nCategoría: ${catName(S.cat)}`, { title: '✉️ Nueva invitación', placeholder: 'Ej: Juan López – Los Tigres', ok: 'Crear invitación' });
+    if (label == null) return;
+    if (label.trim().length < 3) return toast('Escriba el nombre del capitán o del equipo');
+    try {
+      const { status, j } = await admInsc({ action: 'invite', tor: S.tor, cat: S.cat, label: label.trim() });
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast(j.error || 'No se pudo crear la invitación');
+      inscInvites.unshift(j.invite); render();
+      const how = await askChoice(`Invitación para ${j.invite.label}\n\n${invLink(j.invite.code)}\n\nEnvíela solo a esa persona.`,
+        [{ key: 'W', label: '💬 Enviar por WhatsApp', value: 'wa' }, { key: 'C', label: '📋 Copiar mensaje', value: 'copy', style: 'ghost' }], { title: '✅ Invitación creada', cancel: 'Después' });
+      if (how) invShare(j.invite, how);
+    } catch (e) { toast('Sin conexión'); }
+  },
+  invWa: (d) => { const i = inscInvites.find((x) => x.code === d.c); if (i) invShare(i, 'wa'); },
+  invCopy: (d) => { const i = inscInvites.find((x) => x.code === d.c); if (i) invShare(i, 'copy'); },
+  invDel: async (d) => {
+    const i = inscInvites.find((x) => x.code === d.c);
+    if (!(await ask(`Se anulará la invitación de ${i ? i.label : ''}. El enlace dejará de funcionar.`, { title: 'Anular invitación', ok: 'Anular', danger: true }))) return;
+    const { status, j } = await admInsc({ action: 'invDel', code: d.c });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast(j.error || 'No se pudo anular');
+    inscInvites = inscInvites.filter((x) => x.code !== d.c); render(); toast('Invitación anulada');
   },
   champCats: async () => {
     const cats = CATS_(), used = new Set(), plan = [];
@@ -3316,16 +3396,17 @@ document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
   if (e.target.id === 'capNewForm') {
     e.preventDefault();
-    const body = { action: 'create', tor: S.tor, cat: $('#cn-cat').value, name: $('#cn-name').value.trim(), rep: { name: $('#cn-rep').value.trim(), phone: $('#cn-phone').value.trim() }, pass: $('#cn-pass').value };
+    const body = { action: 'create', invite: modal.inv && modal.inv.invite, name: $('#cn-name').value.trim(), rep: { name: $('#cn-rep').value.trim(), phone: $('#cn-phone').value.trim() }, pass: $('#cn-pass').value };
     try {
       const { status, j } = await inscCall(body);
-      if (status !== 200) return toast(j.error || 'No se pudo crear la inscripción');
+      if (status !== 200) { if (status === 409 && modal.inv && /invitación/.test(j.error || '')) { modal.inv.used = true; renderModal(); } return toast(j.error || 'No se pudo crear la inscripción'); }
       setCap({ id: j.reg.id, token: j.token, name: j.reg.name }, j.reg);
       modal = { type: 'cap' }; renderModal(); render();
       ask(`Su código es ${j.reg.id}\n\nAnótelo junto con su clave: los necesitará para entrar desde otro teléfono. Ahora agregue a sus jugadores y envíe la inscripción.`, { title: '✅ Inscripción creada', ok: 'Entendido' });
     } catch (err) { toast('Sin conexión. Intente de nuevo.'); }
     return;
   }
+  if (e.target.id === 'capInvForm') { e.preventDefault(); return checkInvite($('#ci-code').value); }
   if (e.target.id === 'capLoginForm') {
     e.preventDefault();
     try {
@@ -3510,3 +3591,14 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 if (ADMIN_URL && !auth) S.tab = 'ajustes';
 render();
 startSync();
+// Enlace de invitación para capitanes: /?i=XXXX-XXXX
+(() => {
+  const code = new URLSearchParams(location.search).get('i');
+  if (!code) return;
+  try { history.replaceState(null, '', location.pathname); } catch (e) { /* nada */ }
+  S.tab = 'equipos'; render();
+  modal = { type: 'cap', invCode: code };
+  if (capAuth) setCap(null);
+  renderModal();
+  checkInvite(code);
+})();

@@ -5,6 +5,19 @@ const { configured, redis, hashPass, checkPass, signData, verifyData, verify, re
 const K_INSC = 'torneo:insc';     // hash: código → inscripción (JSON)
 const K_BANS = 'torneo:bajas';    // hash: "torneo|nombre" → jugador dado de baja (no puede inscribirse en otro equipo)
 const K_LOCK = 'torneo:insc:lock';
+const K_INV = 'torneo:invit';     // hash: código de invitación → {tor, cat, label, usedBy}
+const normInv = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+async function getInv(code) {
+  const c = normInv(code);
+  const raw = c.length === 8 ? await redis(['HGET', K_INV, c]) : null;
+  try { return raw ? { code: c, ...JSON.parse(raw) } : null; } catch (e) { return null; }
+}
+async function allInvites() {
+  const flat = (await redis(['HGETALL', K_INV])) || [];
+  const out = [];
+  for (let i = 0; i < flat.length; i += 2) { try { out.push({ code: flat[i], ...JSON.parse(flat[i + 1]) }); } catch (e) { /* dañada */ } }
+  return out.sort((a, z) => (z.createdAt || 0) - (a.createdAt || 0));
+}
 const MAX_REGS = 300;
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -64,11 +77,11 @@ async function withLock(fn) {
   throw new Error('El sistema está ocupado, intente de nuevo');
 }
 
-function newCode(existing) {
+function newCode(existing, len = 6) {
   const crypto = require('crypto');
   for (;;) {
     let c = '';
-    for (let i = 0; i < 6; i++) c += CODE_CHARS[crypto.randomInt(CODE_CHARS.length)];
+    for (let i = 0; i < len; i++) c += CODE_CHARS[crypto.randomInt(CODE_CHARS.length)];
     if (!existing.has(c)) return c;
   }
 }
@@ -240,9 +253,23 @@ module.exports = async function handler(req, res) {
     const b = readBody(req);
     const action = b.action;
 
-    /* ---- Capitán: crear inscripción ---- */
+    /* ---- Capitán: revisar su invitación (solo dice para qué categoría es) ---- */
+    if (action === 'checkInvite') {
+      const inv = await getInv(b.invite);
+      if (!inv) { await sleep(800); return fail(res, 404, 'Código de invitación no válido. Revise el enlace que le enviaron.'); }
+      const data = await loadData();
+      const cat = data && data.torneos && data.torneos[inv.tor] && data.torneos[inv.tor].cats[inv.cat];
+      const cfg = inscCfg(cat), w = windows(cfg);
+      return res.status(200).json({ invite: inv.code, tor: inv.tor, cat: inv.cat, catName: cat ? cat.name : '', label: inv.label, used: !!inv.usedBy, open: w.regOpen, until: cfg.until });
+    }
+
+    /* ---- Capitán: crear inscripción (solo con invitación de la organización) ---- */
     if (action === 'create') {
       return await withLock(async () => {
+        const inv = await getInv(b.invite);
+        if (!inv) { await sleep(800); return fail(res, 403, 'Se necesita una invitación válida de la organización para inscribir un equipo'); }
+        if (inv.usedBy) return fail(res, 409, 'Esta invitación ya fue usada. Ingrese con el código de su equipo y su clave.');
+        b.tor = inv.tor; b.cat = inv.cat;
         const data = await loadData();
         const tor = data && data.torneos && data.torneos[b.tor];
         const cat = tor && tor.cats && tor.cats[b.cat];
@@ -259,11 +286,14 @@ module.exports = async function handler(req, res) {
         const reg = {
           id: newCode(new Set(regs.map((r) => r.id))), tor: b.tor, cat: b.cat, name, rep, rep2: { name: '', phone: '' },
           crest: cleanCrest(b.crest), colors: '', players: [], bajas: [], status: 'borrador',
-          createdAt: Date.now(), updatedAt: Date.now(), pass: hashPass(b.pass), pv: 1, log: [],
+          createdAt: Date.now(), updatedAt: Date.now(), pass: hashPass(b.pass), pv: 1, log: [], invite: inv.code,
         };
         if (teamNameTaken(name, data, regs, reg)) return fail(res, 409, `Ya existe un equipo llamado "${name}" en ${cat.name}`);
-        addLog(reg, 'capitán', 'creada', `Inscripción creada por ${rep.name}`);
+        addLog(reg, 'capitán', 'creada', `Inscripción creada por ${rep.name} (invitación ${inv.label})`);
         await putReg(reg);
+        const used = { ...inv, usedBy: reg.id, usedAt: Date.now(), team: name };
+        delete used.code;
+        await redis(['HSET', K_INV, inv.code, JSON.stringify(used)]);
         return res.status(200).json({ reg: publicReg(reg), token: await signData({ k: 'cap', id: reg.id, v: reg.pv }, 120) });
       });
     }
@@ -363,9 +393,32 @@ module.exports = async function handler(req, res) {
     if (!me) return fail(res, 401, 'Debe ingresar como organizador');
 
     if (action === 'list') {
-      const [regs, bans] = await Promise.all([allRegs(), allBans()]);
+      const [regs, bans, invites] = await Promise.all([allRegs(), allBans(), allInvites()]);
       const data = await loadData();
-      return res.status(200).json({ regs: regs.map((r) => ({ ...publicReg(r), warn: regWarn(r, data, regs, bans) })).sort((a, z) => (z.updatedAt || 0) - (a.updatedAt || 0)), bans });
+      return res.status(200).json({ regs: regs.map((r) => ({ ...publicReg(r), warn: regWarn(r, data, regs, bans) })).sort((a, z) => (z.updatedAt || 0) - (a.updatedAt || 0)), bans, invites });
+    }
+
+    /* Invitación personal para un capitán: un solo uso y para una categoría */
+    if (action === 'invite') {
+      const data = await loadData();
+      const cat = data && data.torneos && data.torneos[b.tor] && data.torneos[b.tor].cats[b.cat];
+      if (!cat) return fail(res, 404, 'Categoría no encontrada');
+      const label = clean(b.label, 60);
+      if (label.length < 3) return fail(res, 400, 'Escriba a quién va dirigida la invitación (capitán o equipo)');
+      const existing = new Set((await allInvites()).map((i) => i.code));
+      if (existing.size >= 500) return fail(res, 429, 'Demasiadas invitaciones');
+      const code = newCode(existing, 8);
+      const inv = { tor: b.tor, cat: b.cat, label, createdAt: Date.now(), by: me, usedBy: null };
+      await redis(['HSET', K_INV, code, JSON.stringify(inv)]);
+      return res.status(200).json({ invite: { code, ...inv } });
+    }
+
+    if (action === 'invDel') {
+      const inv = await getInv(b.code);
+      if (!inv) return fail(res, 404, 'Invitación no encontrada');
+      if (inv.usedBy) return fail(res, 409, 'Esta invitación ya fue usada; elimine la inscripción si es necesario');
+      await redis(['HDEL', K_INV, inv.code]);
+      return res.status(200).json({ ok: true });
     }
 
     if (action === 'review') {
