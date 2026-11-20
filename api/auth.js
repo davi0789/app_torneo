@@ -70,7 +70,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Reiniciar toda la base de datos: deja un torneo vacío, borra el historial y deja solo al usuario que lo hace.
+    // Reiniciar toda la base de datos: deja un torneo vacío, borra el historial, las inscripciones en línea y deja solo al usuario que lo hace.
     // Exige la contraseña del usuario además de la sesión.
     if (action === 'resetAll') {
       const stored = await redis(['HGET', USERS, me]);
@@ -81,7 +81,7 @@ module.exports = async function handler(req, res) {
       if (!okData) return res.status(400).json({ error: 'Datos de reinicio no válidos' });
       const others = (await redis(['HKEYS', USERS])).filter((u) => u !== me);
       for (const u of others) await redis(['HDEL', USERS, u]);
-      await redis(['DEL', 'torneo:hist']);
+      await redis(['DEL', 'torneo:hist', 'torneo:insc', 'torneo:bajas']);
       const rev = Number((await redis(['GET', 'torneo:rev'])) || 0) + 1;
       await redis(['SET', 'torneo:data', JSON.stringify(data)]);
       await redis(['SET', 'torneo:meta', JSON.stringify({ at: Date.now(), by: me, reset: true })]);

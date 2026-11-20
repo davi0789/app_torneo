@@ -46,12 +46,14 @@ function newTournament(name = '', color = 0) {
   };
 }
 
+/** Categorías del Campeonato de Futbolito Perquín 2026: [clave, nombre, color, cómo reconocerla]. */
+const CHAMP_CATS = [['F', 'Futbolito Femenino', 1, /femen/], ['J', 'Futbolito Juvenil', 2, /juven/], ['L', 'Futbolito Libre', 0, /libre|mascul/]];
 /** Configuración general del torneo (aplica a todos los equipos). */
 const defaultTorConfig = () => ({ starters: 8, subs: 4, minPlayers: 8 });
 function newTorneo(name, catsFrom) {
   const cats = {};
   if (catsFrom) Object.entries(catsFrom).forEach(([k, t]) => { cats[k] = newTournament(t.name, t.color); cats[k].config = Object.assign(clone(t.config), {}); });
-  else { cats.M = newTournament('Masculino', 0); cats.F = newTournament('Femenino', 1); }
+  else CHAMP_CATS.forEach(([k, n, c]) => { cats[k] = newTournament(n, c); });
   return { name, createdAt: Date.now(), config: defaultTorConfig(), cats };
 }
 
@@ -228,8 +230,15 @@ function playerIndex(exceptTeamId) {
       for (const p of tm.players) map.set(norm(p.name), `${tm.name} (${catName(k)})`);
     }
   }
+  // Inscripciones en línea aún no aprobadas (solo las ve el organizador)
+  for (const r of inscList || []) {
+    if (r.tor !== S.tor || r.status === 'rechazada' || (exceptTeamId && r.teamId === exceptTeamId)) continue;
+    for (const p of r.players) if (!map.has(norm(p.name))) map.set(norm(p.name), `la inscripción de ${r.name} (${catName(r.cat)})`);
+  }
   return map;
 }
+/** Jugadores dados de baja en este torneo: quedan intransferibles. */
+const banOf = (n) => inscBans.find((b) => b.tor === S.tor && norm(b.name) === n);
 
 /* ---------------- Partidos ---------------- */
 function mkMatch(o) {
@@ -830,6 +839,7 @@ function viewInicio() {
     </div>
     ${all.length ? `<div class="progress"><span style="width:${pct}%"></span></div><small>${pct}% del torneo completado</small>` : ''}
   </section>`;
+  if (!adm) h += inscCTA(true);
 
   // Campeón
   if (pod && pod[0]) {
@@ -916,7 +926,7 @@ setInterval(tickLive, 1000);
 function viewEquipos() {
   const t = T(), c = t.config;
   if (!isAdmin()) {
-    let h = `<h1>Equipos ${esc(catName(S.cat))}</h1>`;
+    let h = `<h1>Equipos ${esc(catName(S.cat))}</h1>` + inscCTA();
     if (!t.teams.length) return h + `<div class="empty"><span class="big-ic">🛡️</span>Aún no hay equipos inscritos.</div>`;
     h += `<p class="muted">${t.teams.length} equipos · G = ganados, E = empatados, P = perdidos. Toca un equipo para ver su plantel y partidos.</p>`;
     return h + teamsGrid();
@@ -934,6 +944,8 @@ function viewEquipos() {
   } else {
     h += `<div class="note">Sorteo realizado: aún puede editar integrantes y pagos, pero no agregar ni eliminar equipos.</div>`;
   }
+  h += inscAdminCard();
+  if (sync.mode !== 'local') setTimeout(loadInsc, 0);
   if (!t.teams.length) {
     h += `<div class="empty">Aún no hay equipos inscritos.<br><small>Cuota de inscripción: ${money(c.fee)} · ${TC().starters} titulares + ${TC().subs} suplentes · mínimo ${TC().minPlayers}</small></div>`;
   }
@@ -1418,6 +1430,7 @@ function categoriesCard() {
         <button class="btn ghost sm" data-a="renameCat" data-c="${k}" aria-label="Renombrar">✏️</button>
         ${keys.length > 1 ? `<button class="btn danger sm" data-a="delCat" data-c="${k}" aria-label="Eliminar">🗑️</button>` : ''}
       </span></div>`; }).join('')}
+    ${CHAMP_CATS.every(([, n]) => keys.some((k) => CATS_()[k].name === n)) ? '' : '<button class="btn ghost block sm" style="margin-top:10px" data-a="champCats">⚽ Usar categorías del campeonato: Futbolito Femenino, Juvenil y Libre</button>'}
     <form id="catForm" class="row" style="margin-top:10px;flex-wrap:nowrap" autocomplete="off">
       <input id="cat-name" maxlength="24" placeholder="Nueva categoría, ej: Veteranos">
       <button class="btn sm" type="submit" style="flex:none">＋ Agregar</button>
@@ -1452,6 +1465,7 @@ function viewAjustes() {
   </div>` : ''}
   ${torneoCard()}
   ${categoriesCard()}
+  ${rulesCard()}
   <div class="card">
     <h2>Inscripción · ${esc(catName(S.cat))}</h2>
     <div class="grid2">
@@ -1460,6 +1474,7 @@ function viewAjustes() {
     </div>
     <small>Estos ajustes son solo para la categoría ${catName(S.cat)}.</small>
   </div>
+  ${online ? inscConfigCard() : ''}
   <div class="card">
     <h2>Reglas · ${esc(catName(S.cat))}</h2>
     <label class="fl">Desempate cuando hay igualdad de puntos<select data-cfg="tiebreak">
@@ -1517,7 +1532,7 @@ function renderModal() {
   clearInterval(tick); tick = null;
   if (!modal) { el.hidden = true; document.body.style.overflow = ''; return; }
   // si perdió el permiso (cerró sesión), no mostrar formularios de edición
-  if (!isAdmin() && (modal.type === 'team' || modal.type === 'schedule')) { modal = null; return renderModal(); }
+  if (!isAdmin() && ['team', 'schedule', 'inscAdmin'].includes(modal.type)) { modal = null; return renderModal(); }
   const sheet = $('#sheet');
   const scroll = sheet.scrollTop;
   if (modal.type === 'team') sheet.innerHTML = teamFormHTML(modal.id);
@@ -1526,6 +1541,9 @@ function renderModal() {
   else if (modal.type === 'history') sheet.innerHTML = historyHTML();
   else if (modal.type === 'manualMatch') sheet.innerHTML = manualMatchHTML();
   else if (modal.type === 'compare') sheet.innerHTML = compareHTML();
+  else if (modal.type === 'cap') sheet.innerHTML = capHTML();
+  else if (modal.type === 'inscAdmin') sheet.innerHTML = inscAdminHTML(modal.id);
+  else if (modal.type === 'rules') sheet.innerHTML = rulesHTML();
   else if (modal.type === 'teamView') {
     if (!teamById(modal.id)) { modal = null; return renderModal(); }
     sheet.innerHTML = teamViewHTML(modal.id);
@@ -1585,7 +1603,7 @@ function teamViewHTML(id) {
       <div class="stat"><b class="e">${r.e}</b><span>Empatados</span></div>
       <div class="stat"><b class="p">${r.p}</b><span>Perdidos</span></div>
     </div>
-    <p class="muted" style="margin:0 0 6px">Goles a favor ${r.gf} · en contra ${r.gc}</p>
+    <p class="muted" style="margin:0 0 6px">Goles a favor ${r.gf} · en contra ${r.gc}${tm.colors ? ` · 🎽 ${esc(tm.colors)}` : ''}</p>
     <h3>Partidos</h3>
     ${ms.length ? ms.map(matchCard).join('') : '<p class="muted">Aún no tiene partidos asignados.</p>'}
     ${[['Titulares', tm.players.filter((p) => !p.sub)], ['Suplentes', tm.players.filter((p) => p.sub)]].filter(([, l]) => l.length).map(([title, list]) => `
@@ -1719,41 +1737,45 @@ function teamFormHTML(id) {
 /* ---- editor de escudo ---- */
 function crestEditorHTML(name) {
   const cr = modal.crest;
-  const sel = (key, opts) => `<select data-crest="${key}" class="inp">${opts.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select>`;
-  return `<div class="fl">Escudo</div>
+  const sw = (k, label) => `<div class="cr-lbl">${label}</div><div class="swatches">${CREST_COLORS.map(([c, l]) => `<button type="button" class="sw" data-a="crestSet" data-k="${k}" data-v="${c}" style="background:${c}" title="${esc(l)}" aria-label="${label}: ${esc(l)}"></button>`).join('')}</div>`;
+  return `<div class="fl">Escudo o logo del equipo</div>
   <div class="crest-edit">
     <div id="crest-preview" class="crest-prev">${crestPreview(cr, name)}</div>
     <div class="crest-ctrl">
-      <div class="row">
-        <button type="button" class="btn ghost sm" data-a="crestRandom">🎲 Al azar</button>
-        <label class="btn ghost sm">📷 Subir<input type="file" accept="image/*" id="crestFile" hidden></label>
-        <button type="button" class="btn ghost sm" data-a="crestNone" aria-label="Quitar escudo">✕</button>
-      </div>
-      <div class="crest-sel">
-        ${sel('s', Object.entries(CREST_SHAPES).map(([k, v]) => [k, 'Forma: ' + v[0]]))}
-        ${sel('p', Object.entries(CREST_PATTERNS).map(([k, v]) => [k, 'Diseño: ' + v]))}
-        ${sel('c1', CREST_COLORS.map(([c, l]) => [c, 'Color 1: ' + l]))}
-        ${sel('c2', CREST_COLORS.map(([c, l]) => [c, 'Color 2: ' + l]))}
-        ${sel('e', Object.entries(CREST_EMBLEMS).map(([k, v]) => [k, 'Emblema: ' + v]))}
-      </div>
+      <label class="btn sm">📷 Subir nuestro logo<input type="file" accept="image/*" id="crestFile" hidden></label>
+      <div class="row"><button type="button" class="btn ghost sm" data-a="crestRandom">🎲 Al azar</button><button type="button" class="btn ghost sm" data-a="crestNone">✕ Quitar</button></div>
+      <small>¿No tienen logo? Créenlo aquí abajo: elijan una figura, la forma y los colores.</small>
     </div>
   </div>
-  <div class="crest-gallery">${CREST_PRESETS.map((p, i) => `<button type="button" data-a="crestPreset" data-i="${i}" aria-label="Escudo ${i + 1}">${crestHTML(p, name || 'FC', 46)}</button>`).join('')}</div>`;
+  <div class="crest-maker${cr && cr.img ? ' is-img' : ''}">
+    <div class="note img-note">Está usando su logo subido. Si elige una figura o un color, se cambia por un escudo creado aquí.</div>
+    <div class="cr-lbl">1. Figura</div>
+    <div class="emb-grid">${Object.entries(CREST_EMBLEMS).map(([k, l]) => `<button type="button" class="emb" data-a="crestSet" data-k="e" data-v="${k}">${crestEmblemIcon(k, 38)}<span>${esc(l)}</span></button>`).join('')}</div>
+    <div class="cr-lbl">2. Forma</div>
+    <div class="shape-row">${Object.entries(CREST_SHAPES).map(([k, [l]]) => `<button type="button" class="emb" data-a="crestSet" data-k="s" data-v="${k}">${crestHTML({ s: k, p: 'liso', c1: '#94a3b8', c2: '#94a3b8', e: 'ninguno' }, '', 36)}<span>${esc(l)}</span></button>`).join('')}</div>
+    <label class="fl">3. Diseño del fondo<select data-crest="p" class="inp">${Object.entries(CREST_PATTERNS).map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join('')}</select></label>
+    ${sw('c1', '4. Color principal')}${sw('c2', '5. Color secundario')}${sw('ce', '6. Color de la figura')}
+    <div class="cr-lbl">O tome una idea lista</div>
+    <div class="crest-gallery">${CREST_PRESETS.map((pr, i) => `<button type="button" data-a="crestPreset" data-i="${i}" aria-label="Escudo ${i + 1}">${crestHTML(pr, name || 'FC', 46)}</button>`).join('')}</div>
+  </div>`;
 }
 const crestPreview = (cr, name) => (cr ? crestHTML(cr, name || '?', 96) : '<div class="crest-none">Sin escudo</div>');
 function updateCrestUI() {
-  if (!modal || modal.type !== 'team') return;
+  if (!modal || (modal.type !== 'team' && modal.type !== 'cap')) return;
   const name = ($('#f-name') || {}).value || '';
   const prev = $('#crest-preview');
   if (prev) prev.innerHTML = crestPreview(modal.crest, name);
-  const cr = modal.crest;
-  document.querySelectorAll('[data-crest]').forEach((s) => {
-    if (cr && !cr.img && cr[s.dataset.crest]) s.value = cr[s.dataset.crest];
-    s.disabled = !!(cr && cr.img);
-  });
+  const cr = modal.crest, made = cr && !cr.img;
+  const maker = document.querySelector('.crest-maker');
+  if (maker) maker.classList.toggle('is-img', !!(cr && cr.img));
+  const def = { ce: '#ffffff' };
+  document.querySelectorAll('[data-a="crestSet"]').forEach((b) => b.classList.toggle('on', !!made && (cr[b.dataset.k] || def[b.dataset.k]) === b.dataset.v));
+  document.querySelectorAll('[data-crest]').forEach((sel) => { if (made && cr[sel.dataset.crest]) sel.value = cr[sel.dataset.crest]; });
 }
 
+/** Revisa el formulario del organizador. Devuelve los errores (rojo) y deja en checkPlayers.warns los avisos (amarillo). */
 function checkPlayers() {
+  checkPlayers.warns = 0;
   if (!modal || modal.type !== 'team') return 0;
   const idx = playerIndex(modal.id);
   const seen = new Map();
@@ -1761,16 +1783,22 @@ function checkPlayers() {
   document.querySelectorAll('#f-players .prow').forEach((row) => {
     const inp = row.querySelector('.pl-name');
     const n = norm(inp.value);
-    let msg = '';
+    let msg = '', warn = '';
     if (n) {
       filled++;
-      if (idx.has(n)) msg = `Ya está inscrito en ${idx.get(n)}`;
-      else if (seen.has(n)) msg = `Repetido con el integrante ${seen.get(n)}`;
-      else seen.set(n, row.querySelector('.pn').textContent);
+      if (seen.has(n)) msg = `Repetido con el integrante ${seen.get(n)}`;
+      else {
+        seen.set(n, row.querySelector('.pn').textContent);
+        // Puede ser otra persona con el mismo nombre: el organizador decide al guardar
+        if (banOf(n)) warn = `⚠️ Mismo nombre que un jugador dado de baja de ${banOf(n).team} (intransferible). ¿Es otra persona?`;
+        else if (idx.has(n)) warn = `⚠️ Mismo nombre que un jugador de ${idx.get(n)}. ¿Es otra persona?`;
+      }
     }
     row.classList.toggle('bad', !!msg);
-    row.querySelector('.perr').textContent = msg;
+    row.classList.toggle('warn', !msg && !!warn);
+    row.querySelector('.perr').textContent = msg || warn;
     if (msg) errors++;
+    if (warn) checkPlayers.warns++;
   });
   const g = TC();
   const cnt = $('#f-count');
@@ -1779,7 +1807,7 @@ function checkPlayers() {
   return errors;
 }
 
-function saveTeam() {
+async function saveTeam() {
   const t = T(), g = TC();
   const id = modal.id;
   const name = $('#f-name').value.trim().replace(/\s+/g, ' ');
@@ -1794,11 +1822,41 @@ function saveTeam() {
     if (pn) players.push({ name: pn, num: nb, sub: row.dataset.sub === '1' });
   });
   const nTit = players.filter((p) => !p.sub).length, nSup = players.length - nTit;
+  if (t.config.insc) {
+    const ic = inscOf(t);
+    if (players.length < ic.min) return toast(`En ${catName(S.cat)} se requieren al menos ${ic.min} jugadores (hay ${players.length})`);
+    if (players.length > ic.max) return toast(`En ${catName(S.cat)} el máximo es de ${ic.max} jugadores (hay ${players.length})`);
+  }
   if (players.length < g.minPlayers) return toast(`Para participar se requieren al menos ${g.minPlayers} integrantes (hay ${players.length})`);
   if (nTit > g.starters) return toast(`Máximo ${g.starters} titulares`);
   if (nSup > g.subs) return toast(`Máximo ${g.subs} suplentes`);
   const paid = num($('#f-paid').value);
   const crest = modal.crest || null;
+  if (checkPlayers.warns && !(await ask(`${checkPlayers.warns} integrante(s) tienen el mismo nombre que un jugador de otro equipo o dado de baja (marcados en amarillo).\n\n¿Confirma que son personas distintas?`, { title: '⚠️ Nombres repetidos', ok: 'Sí, son distintas' }))) return;
+  // Equipo que vino de la inscripción en línea: el cambio se copia también a la inscripción del capitán
+  const tm0 = id ? teamById(id) : null;
+  if (tm0 && tm0.insc && sync.mode !== 'local') {
+    const removed = tm0.players.filter((p) => !players.some((x) => norm(x.name) === norm(p.name))).map((p) => p.name);
+    let baja;
+    if (removed.length) {
+      const how = await askChoice(`Quitó a: ${removed.join(', ')}.\n\n¿Es una baja (el jugador queda intransferible y no podrá jugar en otro equipo) o solo una corrección de un nombre mal escrito?`,
+        [{ key: 'B', label: '➖ Es una baja', value: 'baja', style: 'danger' }, { key: 'C', label: '✏️ Solo corrección', value: 'fix', style: 'ghost' }], { title: 'Jugadores quitados' });
+      if (!how) return;
+      if (how === 'baja') {
+        const r = await askText('Motivo de la baja (obligatorio, lo verá el capitán):', { title: 'Motivo de la baja' });
+        if (r == null) return;
+        if (r.trim().length < 10) return toast('Explique el motivo (al menos 10 letras)');
+        baja = r.trim();
+      }
+    }
+    try {
+      const { status, j } = await admInsc({ action: 'adminSync', id: tm0.insc, name, crest, players: players.map((p) => ({ name: p.name, num: p.num })), baja });
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast(j.error || 'No se pudo actualizar la inscripción del capitán');
+      replaceReg(j.reg);
+      if (baja) loadInsc(true);
+    } catch (e) { return toast('Sin conexión: este equipo viene de la inscripción en línea y se necesita internet para editarlo'); }
+  }
   if (id) {
     Object.assign(teamById(id), { name, players, paid, crest });
   } else {
@@ -2131,7 +2189,7 @@ function mergeKeyed(L, B, R, mergeItem) {
 function mergeTorneo(L, B, R) {
   B = B || {};
   const o = clone(R);
-  for (const k of ['name', 'org', 'contact']) if (L[k] !== B[k]) o[k] = L[k];
+  for (const k of ['name', 'org', 'contact', 'rules']) if (L[k] !== B[k]) o[k] = L[k];
   if (!same(L.config, B.config)) o.config = L.config;
   o.cats = mergeKeyed(L.cats, B.cats, R.cats, mergeCat);
   return o;
@@ -2174,7 +2232,7 @@ function mergeCat(L, B, R) {
 
 function isBusy() {
   const a = document.activeElement;
-  return (modal && modal.type === 'team') || (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.type !== 'radio');
+  return (modal && (modal.type === 'team' || modal.type === 'cap')) || (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.type !== 'radio');
 }
 function requestRender() {
   if (isBusy()) sync.pendingRender = true;
@@ -2282,11 +2340,533 @@ function startSync() {
     if (document.visibilityState !== 'visible') return;
     if (sync.pendingRender && !isBusy()) render();
     if (sync.dirty) push(); else pull(false);
+    if (auth && S.tab === 'equipos') loadInsc();
   }, 5000);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pull(false); });
   window.addEventListener('online', () => (sync.dirty ? push() : pull(true)));
   document.addEventListener('focusout', () => setTimeout(() => { if (sync.pendingRender && !isBusy()) render(); }, 300));
 }
+
+/* =========================================================
+   Inscripción en línea: capitanes inscriben, organizadores aprueban.
+   El servidor (api/insc) valida todo; aquí solo se ayuda a llenar bien.
+   ========================================================= */
+const INSC_DEF = { open: false, until: 0, changesUntil: 0, min: 5, max: 10 };
+const inscOf = (c = T()) => Object.assign({}, INSC_DEF, (c && c.config && c.config.insc) || {});
+/** regOpen: se pueden crear y enviar inscripciones. chOpen: altas y bajas de jugadores. */
+function inscWin(cfg) {
+  const t = Date.now();
+  const regOpen = cfg.open && (!cfg.until || t <= cfg.until);
+  const chOpen = cfg.open && (cfg.changesUntil ? t <= cfg.changesUntil : regOpen);
+  return { regOpen, chOpen: chOpen || regOpen };
+}
+const fmtWhen = (ms) => (ms ? new Date(ms).toLocaleString('es', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
+const toLocalInput = (ms) => { if (!ms) return ''; const d = new Date(ms); return `${isoDate(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const regCat = (r) => (r && S.torneos[r.tor] && S.torneos[r.tor].cats[r.cat]) || null;
+const INSC_STATUS = { borrador: ['Borrador', 'b-pend'], enviada: ['Por revisar', 'b-warn'], observada: ['Con observaciones', 'b-bad'], aprobada: ['Aprobada', 'b-ok'], rechazada: ['Rechazada', 'b-bad'] };
+const inscBadge = (r) => { const [l, c] = INSC_STATUS[r.status] || [r.status, 'b-pend']; return `<span class="badge ${c}">${r.status === 'enviada' && r.approvedAt ? 'Cambios por revisar' : l}</span>`; };
+const LOG_TXT = { editado: '🛠️ Editado por la organización', eliminado: '🗑️ Equipo eliminado', creada: '🆕 Creada', enviada: '📨 Enviada', cambio: '✏️ Cambio', baja: '➖ Baja', aprobada: '✅ Aprobada', observada: '⚠️ Observación', rechazada: '❌ Rechazada', clave: '🔑 Clave' };
+const logItem = (l) => `<li><span class="grow"><b>${LOG_TXT[l.t] || esc(l.t)}</b>${l.text ? ' · ' + esc(l.text) : ''}<br><small>${fmtWhen(l.at)} · ${esc(l.by)}</small></span></li>`;
+
+async function inscCall(body, token) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const r = await fetch('api/insc', { method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store' });
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* sin API */ }
+  return { status: r.status, j: j || {} };
+}
+
+/* ---- Sesión del capitán (código + clave) ---- */
+const CAP_KEY = 'torneo-cap';
+let capAuth = null;
+try { capAuth = JSON.parse(localStorage.getItem(CAP_KEY)); } catch (e) { /* nada */ }
+let capReg = null;
+function setCap(a, reg = null) {
+  capAuth = a; capReg = reg;
+  try { if (a) localStorage.setItem(CAP_KEY, JSON.stringify(a)); else localStorage.removeItem(CAP_KEY); } catch (e) { /* nada */ }
+}
+const capCall = (body) => inscCall(body, capAuth && capAuth.token);
+function capGone(j) { setCap(null); if (modal && modal.type === 'cap') modal = { type: 'cap' }; renderModal(); toast((j && j.error) || 'Ingrese de nuevo con su código y clave'); }
+
+async function capLoad() {
+  try {
+    const { status, j } = await capCall({ action: 'get' });
+    if (status === 401) return capGone(j);
+    if (status !== 200) return toast(j.error || 'No se pudo cargar la inscripción');
+    setCap(Object.assign({}, capAuth, { name: j.reg.name }), j.reg);
+  } catch (e) { toast('Sin conexión. Intente de nuevo.'); }
+  if (modal && modal.type === 'cap') renderModal();
+}
+
+/** Botones públicos: inscribir equipo, mi inscripción y reglamento. */
+function inscCTA(compact) {
+  const cfg = inscOf(), w = inscWin(cfg);
+  let txt = '';
+  if (w.regOpen) txt = `Inscripción abierta${cfg.until ? ' hasta el <b>' + fmtWhen(cfg.until) + '</b>' : ''}.`;
+  else if (w.chOpen) txt = `Inscripción de equipos cerrada. Altas y bajas de jugadores hasta el <b>${fmtWhen(cfg.changesUntil)}</b>.`;
+  else if (cfg.open && cfg.until) txt = 'El plazo de inscripción en línea ya cerró.';
+  if (compact && !w.regOpen && !capAuth) return '';
+  const main = capAuth ? `<button class="btn" data-a="capOpen">🔑 Mi inscripción${capAuth.name ? ' · ' + esc(capAuth.name) : ''}</button>`
+    : w.regOpen ? '<button class="btn" data-a="capOpen">📝 Inscribir mi equipo</button>'
+      : '<button class="btn ghost" data-a="capOpen">🔑 Soy capitán</button>';
+  return `<div class="card">
+    <h2>📝 Inscripción · ${esc(catName(S.cat))}</h2>
+    <p class="muted" style="margin:4px 0 10px;font-size:14px">${txt ? txt + ' ' : ''}De ${cfg.min} a ${cfg.max} jugadores por equipo. La organización revisa y aprueba cada inscripción.</p>
+    <div class="row">${main}<button class="btn ghost" data-a="openRules">📜 Reglamento</button></div>
+  </div>`;
+}
+
+function capHTML() {
+  const head = (t) => `<div class="mh"><h2>${t}</h2><button class="x" data-a="close">✕</button></div>`;
+  if (sync.mode === 'local') return head('Inscripción') + '<div class="mb"><p class="muted">La inscripción en línea necesita conexión con la base de datos.</p></div>';
+  if (!capAuth) return head('Inscripción de equipos') + capStartHTML();
+  if (!capReg) return head('Mi inscripción') + '<div class="mb"><p class="muted">Cargando…</p></div>';
+  return capEditorHTML();
+}
+
+function capStartHTML() {
+  const open = Object.entries(CATS_()).filter(([, c]) => inscWin(inscOf(c)).regOpen);
+  const sel = open.some(([k]) => k === S.cat) ? S.cat : (open[0] || [])[0];
+  return `<div class="mb">
+    ${open.length ? `<div class="card" style="margin-top:12px">
+      <h3 style="margin-top:0">Nueva inscripción</h3>
+      <p class="muted" style="font-size:14px">El representante (capitán) crea la inscripción y después agrega a sus jugadores. Recibirá un <b>código</b>: con ese código y su clave podrá volver a entrar desde cualquier teléfono.</p>
+      <form id="capNewForm" autocomplete="off">
+        <label class="fl">Categoría<select id="cn-cat">${open.map(([k, c]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${esc(c.name)}${inscOf(c).until ? ' · hasta ' + fmtWhen(inscOf(c).until) : ''}</option>`).join('')}</select></label>
+        <label class="fl">Nombre del equipo<input id="cn-name" maxlength="40" placeholder="Ej: Los Tigres" required></label>
+        <label class="fl">Representante propietario <small>(nombre y apellido)</small><input id="cn-rep" maxlength="60" required></label>
+        <label class="fl">Teléfono del representante<input id="cn-phone" type="tel" inputmode="tel" maxlength="20" placeholder="Ej: 7777-7777" required></label>
+        <label class="fl">Cree una clave <small>(mínimo 6 caracteres)</small><input id="cn-pass" type="password" autocomplete="new-password" minlength="6" required></label>
+        <div style="height:10px"></div><button class="btn block" type="submit">Crear inscripción</button>
+      </form>
+    </div>` : `<div class="note warn" style="margin-top:12px">En este momento no hay inscripciones abiertas en ${esc(TOR().name)}.</div>`}
+    <div class="card">
+      <h3 style="margin-top:0">Ya tengo una inscripción</h3>
+      <form id="capLoginForm" autocomplete="on">
+        <div class="grid2">
+          <label class="fl">Código<input id="cl-id" name="username" maxlength="6" autocapitalize="characters" spellcheck="false" placeholder="Ej: K7P2QX" required></label>
+          <label class="fl">Clave<input id="cl-pass" name="password" type="password" autocomplete="current-password" required></label>
+        </div>
+        <div style="height:10px"></div><button class="btn ghost block" type="submit">Ingresar</button>
+      </form>
+      <p class="muted" style="font-size:13px;margin-bottom:0">¿Olvidó su clave? Pida a la organización que se la restablezca.</p>
+    </div>
+    <button class="btn ghost block sm" data-a="openRules">📜 Ver reglamento</button>
+  </div>`;
+}
+
+/** Qué puede cambiar el capitán ahora (el servidor aplica las mismas reglas). */
+function capPerm(reg) {
+  const c = regCat(reg), cfg = inscOf(c), w = inscWin(cfg), sent = !!reg.sentAt;
+  const alive = reg.status !== 'rechazada';
+  const full = alive && (reg.status === 'observada' || w.regOpen);
+  return { c, cfg, w, sent, full, edit: alive && (full || (sent && w.chOpen)), baja: alive && w.chOpen };
+}
+
+function capEditorHTML() {
+  const reg = capReg, d = modal.draft || reg, P = capPerm(reg), cfg = P.cfg;
+  if (modal.crest === undefined) modal.crest = d.crest || null;
+  const approved = new Set((reg.approvedPlayers || []).map((p) => norm(p.name)));
+  const lastNote = [...(reg.log || [])].reverse().find((l) => l.t === 'observada' || l.t === 'rechazada');
+  const dis = (on) => (on ? '' : 'disabled');
+  let st;
+  if (reg.status === 'borrador') st = `<div class="note">📝 Aún no ha enviado la inscripción. Agregue de ${cfg.min} a ${cfg.max} jugadores y toque <b>Enviar inscripción</b>${cfg.until ? ' antes del <b>' + fmtWhen(cfg.until) + '</b>' : ''}.</div>`;
+  else if (reg.status === 'enviada') st = `<div class="note">⏳ ${reg.approvedAt ? 'Sus cambios están' : 'Su inscripción está'} en revisión. La organización la aprobará o le dejará observaciones aquí.</div>`;
+  else if (reg.status === 'observada') st = `<div class="note warn">⚠️ <b>La organización dejó observaciones:</b><br>${esc(lastNote ? lastNote.text : '')}<br><small>Corrija y toque <b>Reenviar a revisión</b>.</small></div>`;
+  else if (reg.status === 'aprobada') st = `<div class="note">✅ Equipo aprobado. ${P.w.chOpen ? `Puede dar altas y bajas de jugadores${cfg.changesUntil ? ' hasta el <b>' + fmtWhen(cfg.changesUntil) + '</b>' : ''}; cada cambio vuelve a revisión.` : 'El plazo de cambios ya cerró.'}</div>`;
+  else st = `<div class="note warn">❌ <b>Inscripción rechazada.</b> ${esc(lastNote ? lastNote.text : '')}</div>`;
+  if (!P.edit && reg.status !== 'rechazada') st += '<div class="note warn">🔒 El plazo está cerrado: solo puede ver su inscripción.</div>';
+
+  const rows = d.players.map((p) => ({ ...p, ok: approved.has(norm(p.name)) }));
+  if (P.edit) while (rows.length < cfg.max) rows.push({ name: '', num: '', doc: '' });
+  const errs = modal.errors || {};
+  const playerRows = rows.map((p, i) => {
+    const lock = p.ok || !P.edit, e = errs[i] || '';
+    return `<div class="prow cprow" data-srv="${esc(e)}"><span class="pn">${i + 1}</span>
+      <input class="pl-name" data-cpl autocomplete="off" placeholder="Nombre y apellido${i < cfg.min ? ' *' : ''}" value="${esc(p.name)}" ${lock ? 'readonly' : ''}>
+      <input class="pl-num" data-cpl type="number" inputmode="numeric" min="0" max="99" placeholder="N°" value="${esc(p.num)}" ${lock ? 'readonly' : ''}>
+      <input class="pl-doc" data-cpl maxlength="16" autocapitalize="characters" placeholder="DUI o carné (opcional)" value="${esc(p.doc || '')}" ${lock ? 'readonly' : ''}>
+      ${p.ok && P.baja ? `<button type="button" class="btn danger sm" data-a="capBaja" data-n="${esc(p.name)}">Baja</button>` : `<span class="pok">${p.ok ? '✅' : ''}</span>`}
+      <div class="perr"></div></div>`;
+  }).join('');
+  const send = P.sent ? `<button class="btn block" data-a="capSave" data-send="1">${reg.status === 'observada' ? '📨 Reenviar a revisión' : 'Guardar cambios'}</button>`
+    : '<button class="btn block" data-a="capSave" data-send="1">📨 Enviar inscripción</button><button class="btn ghost block" data-a="capSave">Guardar borrador</button>';
+  setTimeout(checkCapPlayers, 0);
+  return `<div class="mh"><h2>${esc(d.name)}</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb">
+    <div class="row" style="align-items:center;margin:12px 0 10px">${inscBadge(reg)}<small>Código <b class="code">${esc(reg.id)}</b> · ${esc(P.c ? P.c.name : '')}</small></div>
+    ${st}
+    ${modal.general && modal.general.length ? `<div class="note warn">${modal.general.map(esc).join('<br>')}</div>` : ''}
+    <label class="fl">Nombre del equipo<input id="f-name" maxlength="40" value="${esc(d.name)}" ${dis(P.full)}></label>
+    ${P.edit ? crestEditorHTML(d.name) : `<div class="fl">Escudo</div><div class="crest-prev">${crestPreview(d.crest, d.name)}</div>`}
+    <label class="fl">Colores del uniforme<input id="c-colors" maxlength="60" placeholder="Ej: camisa roja, short negro" value="${esc(d.colors || '')}" ${dis(P.edit)}></label>
+    <div class="psec">Representantes</div>
+    <div class="grid2">
+      <label class="fl">Propietario<input id="c-rep-n" maxlength="60" value="${esc(d.rep.name)}" ${dis(P.edit)}></label>
+      <label class="fl">Teléfono<input id="c-rep-p" type="tel" inputmode="tel" maxlength="20" value="${esc(d.rep.phone)}" ${dis(P.edit)}></label>
+      <label class="fl">Suplente<input id="c-rep2-n" maxlength="60" value="${esc(d.rep2.name)}" ${dis(P.edit)}></label>
+      <label class="fl">Teléfono<input id="c-rep2-p" type="tel" inputmode="tel" maxlength="20" value="${esc(d.rep2.phone)}" ${dis(P.edit)}></label>
+    </div>
+    <small>El suplente actúa solo cuando el propietario no está. Los teléfonos y DUI solo los ve la organización.</small>
+    <div class="psec">Jugadores <small id="c-count"></small></div>
+    <div id="c-players">${playerRows || '<p class="muted">Sin jugadores.</p>'}</div>
+    <small>Si dos jugadores se llaman igual, escriba el DUI o carné de cada uno para diferenciarlos. ✅ = aprobado. Un jugador aprobado no se borra: se le da de <b>Baja</b> con el motivo y ya no podrá inscribirse en ningún otro equipo. Cada jugador usa el mismo número todo el campeonato.</small>
+    ${reg.bajas && reg.bajas.length ? `<div class="psec">Dados de baja (intransferibles)</div><ul class="cardlist">${reg.bajas.map((b) => `<li><span class="grow"><b>${esc(b.name)}</b><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span></li>`).join('')}</ul>` : ''}
+    ${!P.sent && P.edit ? `<label class="opt ${modal.accept ? 'on' : ''}" style="margin-top:14px"><input type="checkbox" id="c-accept" ${modal.accept ? 'checked' : ''}><div><b>Confirmo</b><span>que todos los jugadores pertenecen al municipio o viven permanentemente en él, y que el equipo acepta el reglamento del campeonato.</span></div></label>` : ''}
+    <div class="psec">Historial</div>
+    <ul class="cardlist">${(reg.log || []).slice(-10).reverse().map(logItem).join('')}</ul>
+  </div>
+  <div class="mf">
+    ${P.edit ? send : ''}
+    <div class="row"><button class="btn ghost sm" data-a="openRules">📜 Reglamento</button><button class="btn ghost sm" data-a="capLogout">Salir</button></div>
+  </div>`;
+}
+
+/** Jugadores repetidos o ya inscritos en otro equipo publicado del torneo (el servidor hace la revisión completa). */
+function checkCapPlayers() {
+  if (!modal || modal.type !== 'cap' || !capReg) return 0;
+  const cfg = inscOf(regCat(capReg));
+  const idx = new Map();
+  const tor = S.torneos[capReg.tor];
+  if (tor) for (const c of Object.values(tor.cats)) for (const tm of c.teams) { if (tm.id === capReg.teamId) continue; for (const p of tm.players) idx.set(norm(p.name), `${tm.name} (${c.name})`); }
+  const seen = new Map(), nums = new Map();
+  let errors = 0, filled = 0;
+  document.querySelectorAll('#c-players .cprow').forEach((row) => {
+    const n = norm(row.querySelector('.pl-name').value), num = row.querySelector('.pl-num').value.trim();
+    const doc = row.querySelector('.pl-doc').value.trim().toUpperCase().replace(/[\s.]/g, '');
+    const pn = row.querySelector('.pn').textContent;
+    let msg = '';
+    if (n) {
+      filled++;
+      const twin = (seen.get(n) || []).find((o) => !doc || !o.doc || o.doc === doc);
+      if (twin) msg = `Repetido con el jugador ${twin.pn}${doc ? '' : ' (si es otra persona, escriba el DUI o carné de ambos)'}`;
+      else if (idx.has(n) && !doc) msg = `Ya hay un jugador con este nombre en ${idx.get(n)}. Si es la misma persona, debe decidir en cuál equipo jugará; si es otra persona, escriba su DUI o carné`;
+      else if (num !== '' && nums.has(String(+num))) msg = `El número ${+num} ya lo usa el jugador ${nums.get(String(+num))}`;
+      else msg = row.dataset.srv || '';
+      if (!seen.has(n)) seen.set(n, []);
+      seen.get(n).push({ pn, doc });
+      if (num !== '' && !nums.has(String(+num))) nums.set(String(+num), pn);
+    }
+    row.classList.toggle('bad', !!msg);
+    row.querySelector('.perr').textContent = msg;
+    if (msg) errors++;
+  });
+  const cnt = $('#c-count');
+  if (cnt) { cnt.textContent = `(${filled} de ${cfg.max} · mínimo ${cfg.min})`; cnt.style.color = filled < cfg.min || filled > cfg.max ? 'var(--bad)' : ''; }
+  updateCrestUI();
+  return errors;
+}
+
+function capCollect() {
+  const v = (id) => (($('#' + id) || {}).value || '').trim().replace(/\s+/g, ' ');
+  const players = [];
+  document.querySelectorAll('#c-players .cprow').forEach((row) => {
+    const name = row.querySelector('.pl-name').value.trim().replace(/\s+/g, ' ');
+    if (name) players.push({ name, num: row.querySelector('.pl-num').value.trim(), doc: row.querySelector('.pl-doc').value.trim() });
+  });
+  const acc = $('#c-accept');
+  if (acc) modal.accept = acc.checked;
+  return { name: v('f-name') || capReg.name, crest: modal.crest || null, colors: v('c-colors'), rep: { name: v('c-rep-n'), phone: v('c-rep-p') }, rep2: { name: v('c-rep2-n'), phone: v('c-rep2-p') }, players };
+}
+
+async function capSave(send) {
+  if (!capReg) return;
+  const data = capCollect();
+  if (checkCapPlayers() > 0) return toast('Hay jugadores con errores (marcados en rojo)');
+  const cfg = inscOf(regCat(capReg));
+  if (data.players.length > cfg.max) return toast(`Máximo ${cfg.max} jugadores`);
+  if (send && data.players.length < cfg.min) return toast(`Se requieren al menos ${cfg.min} jugadores (hay ${data.players.length})`);
+  if (send && !capReg.sentAt && !modal.accept) return toast('Marque la casilla de confirmación antes de enviar');
+  modal.draft = Object.assign({}, capReg, data);
+  try {
+    const { status, j } = await capCall(Object.assign({ action: 'save', send: !!send, accept: !!modal.accept }, data));
+    if (status === 401) return capGone(j);
+    if (status === 422) {
+      modal.errors = Object.fromEntries((j.errors || []).map((e) => [e.i, e.msg]));
+      modal.general = j.general || [];
+      renderModal();
+      return toast(j.error || 'Revise los datos');
+    }
+    if (status !== 200) return toast(j.error || 'No se pudo guardar');
+    const first = send && !capReg.sentAt;
+    setCap(Object.assign({}, capAuth, { name: j.reg.name }), j.reg);
+    Object.assign(modal, { draft: null, errors: null, general: null, crest: undefined });
+    renderModal();
+    toast(first ? '📨 Inscripción enviada. La organización la revisará.' : j.reg.status === 'enviada' && j.reg.approvedAt ? '📨 Cambios enviados a revisión' : '✅ Guardado');
+  } catch (e) { toast('Sin conexión. Intente de nuevo.'); }
+}
+
+async function capBaja(name) {
+  modal.draft = Object.assign({}, capReg, capCollect());
+  const ok = await ask(`${name} será dado de baja del equipo.\n\nQuedará intransferible: no podrá volver a inscribirse en ningún equipo del torneo. No se puede deshacer.`, { title: '➖ Dar de baja', ok: 'Continuar', danger: true });
+  if (!ok) return;
+  const reason = await askText('¿Por qué ya no participará? Es obligatorio y lo verá la organización.', { title: 'Motivo de la baja', placeholder: 'Ej: se fue a vivir fuera del municipio', ok: 'Dar de baja', danger: true });
+  if (reason == null) return;
+  if (reason.trim().length < 10) return toast('Explique el motivo (al menos 10 letras)');
+  try {
+    const { status, j } = await capCall({ action: 'baja', name, reason: reason.trim() });
+    if (status === 401) return capGone(j);
+    if (status !== 200) return toast(j.error || 'No se pudo dar de baja');
+    capReg = j.reg;
+    if (modal.draft) modal.draft.players = modal.draft.players.filter((p) => norm(p.name) !== norm(name));
+    modal.errors = null;
+    renderModal();
+    toast(`${name} dado de baja`);
+  } catch (e) { toast('Sin conexión. Intente de nuevo.'); }
+}
+
+/* ---- Panel de organizadores ---- */
+let inscList = null, inscBans = [], inscLoading = false, inscAt = 0;
+const admInsc = (body) => inscCall(body, auth && auth.token);
+async function loadInsc(force) {
+  if (!auth || !auth.token || sync.mode === 'local' || inscLoading) return;
+  if (!force && inscList && Date.now() - inscAt < 30000) return;
+  inscLoading = true;
+  try {
+    const { status, j } = await admInsc({ action: 'list' });
+    if (status === 401) return sessionExpired();
+    if (status === 200) {
+      inscList = j.regs || []; inscBans = j.bans || []; inscAt = Date.now();
+      if (S.tab === 'equipos' || (modal && modal.type === 'inscAdmin')) requestRender();
+    }
+  } catch (e) { /* sin conexión */ } finally { inscLoading = false; }
+}
+function replaceReg(r) {
+  if (!inscList) inscList = [];
+  const i = inscList.findIndex((x) => x.id === r.id);
+  if (i >= 0) inscList[i] = r; else inscList.unshift(r);
+}
+/** Avisos del servidor: hard = conflicto real (bloquea), soft = posible homónimo por verificar. */
+const regWarns = (r) => (r && r.warn) || [];
+
+function inscAdminCard() {
+  if (sync.mode === 'local') return '';
+  const cfg = inscOf(), w = inscWin(cfg);
+  const order = { enviada: 0, observada: 1, borrador: 2, aprobada: 3, rechazada: 4 };
+  const regs = (inscList || []).filter((r) => r.tor === S.tor && r.cat === S.cat)
+    .sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || (b.updatedAt || 0) - (a.updatedAt || 0));
+  const pend = regs.filter((r) => r.status === 'enviada').length;
+  const bans = inscBans.filter((b) => b.tor === S.tor);
+  const state = !cfg.open ? 'Cerrada (actívela en Ajustes)'
+    : w.regOpen ? `Abierta${cfg.until ? ' hasta ' + fmtWhen(cfg.until) : ''}`
+      : w.chOpen ? `Equipos nuevos cerrado · altas y bajas hasta ${fmtWhen(cfg.changesUntil)}` : 'Plazo vencido';
+  return `<div class="card">
+    <div class="sec-head" style="margin:0 0 6px"><h2 style="margin:0">📝 Inscripciones en línea</h2><button class="link" data-a="inscReload">🔄 Actualizar</button></div>
+    <p class="muted" style="font-size:14px;margin:0 0 10px">${state} · ${cfg.min} a ${cfg.max} jugadores${pend ? ` · <b style="color:var(--text)">${pend} por revisar</b>` : ''}</p>
+    ${inscList === null ? '<p class="muted">Cargando…</p>' : regs.length ? regs.map((r) => `<button class="list-item" data-a="inscView" data-id="${esc(r.id)}">
+      <span class="tcrest" style="width:36px;height:36px">${crestHTML(r.crest, r.name, 36)}</span>
+      <div class="grow"><div class="t">${esc(r.name)}${regWarns(r).length ? ' ⚠️' : ''}</div><small>${r.players.length} jugadores · ${esc(r.rep.name)} · ${fmtWhen(r.updatedAt)}</small></div>${inscBadge(r)}</button>`).join('')
+    : '<p class="muted">Aún no hay inscripciones en línea en esta categoría.</p>'}
+    ${bans.length ? `<details style="margin-top:8px"><summary><b>Jugadores dados de baja (intransferibles): ${bans.length}</b></summary>
+      ${bans.map((b) => `<div class="org"><span class="grow"><b>${esc(b.name)}</b> <small>· ${esc(b.team)} (${esc(b.cat)})</small><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span>
+      <button class="btn ghost sm" data-a="inscUnban" data-k="${esc(b.key)}">Habilitar</button></div>`).join('')}</details>` : ''}
+  </div>`;
+}
+
+function inscAdminHTML(id) {
+  const r = (inscList || []).find((x) => x.id === id);
+  const head = (t) => `<div class="mh"><h2>${t}</h2><button class="x" data-a="close">✕</button></div>`;
+  if (!r) return head('Inscripción') + '<div class="mb"><p class="muted">No encontrada.</p></div>';
+  const c = regCat(r), cfg = inscOf(c);
+  const appr = new Set((r.approvedPlayers || []).map((p) => norm(p.name)));
+  const warns = regWarns(r);
+  const wOf = (n) => warns.filter((w) => norm(w.name) === n);
+  const tel = (p) => (p ? `<a href="tel:${esc(String(p).replace(/[^\d+]/g, ''))}">${esc(p)}</a>` : '—');
+  const nOk = r.players.length >= cfg.min && r.players.length <= cfg.max;
+  const canApprove = r.sentAt && (r.status === 'enviada' || r.status === 'observada');
+  return `${head(esc(r.name))}
+  <div class="mb">
+    <div class="row" style="align-items:center;margin:12px 0 10px">${inscBadge(r)}<small>Código <b class="code">${esc(r.id)}</b> · ${esc(c ? c.name : '¿categoría eliminada?')}${r.sentAt ? ' · enviada ' + fmtWhen(r.sentAt) : ''}</small></div>
+    <div class="crest-edit" style="grid-template-columns:72px 1fr">
+      <div class="crest-prev" style="width:72px;height:80px">${crestPreview(r.crest, r.name)}</div>
+      <div style="font-size:14px">🎽 <b>Uniforme:</b> ${esc(r.colors || '—')}<br>
+        👤 <b>Propietario:</b> ${esc(r.rep.name || '—')} · ${tel(r.rep.phone)}<br>
+        👥 <b>Suplente:</b> ${esc((r.rep2 && r.rep2.name) || '—')} · ${tel(r.rep2 && r.rep2.phone)}</div>
+    </div>
+    ${warns.length ? `<div class="note warn" style="margin-top:12px">${warns.map((w) => `${w.hard ? '⛔' : '⚠️'} <b>${esc(w.name)}</b>: ${esc(w.msg)}`).join('<br>')}</div>` : ''}
+    <div class="psec">Jugadores (${r.players.length}) <small style="color:${nOk ? 'inherit' : 'var(--bad)'}">· se permiten ${cfg.min} a ${cfg.max}</small></div>
+    <ul class="cardlist">${r.players.map((p) => { const w = wOf(norm(p.name)); return `<li><span class="grow">${p.num !== '' ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${p.doc ? ` <small>· ${/^\d{8}-\d$/.test(p.doc) ? 'DUI' : 'Doc.'} ${esc(p.doc)}</small>` : ''}</span>
+      ${r.approvedAt && !appr.has(norm(p.name)) ? '<span class="badge b-warn">Alta nueva</span>' : ''}${w.some((x) => x.hard) ? '<span class="badge b-bad">Repetido</span>' : w.length ? '<span class="badge b-warn">Verificar</span>' : ''}</li>`; }).join('') || '<li class="muted">Sin jugadores</li>'}</ul>
+    ${r.bajas && r.bajas.length ? `<div class="psec">Bajas</div><ul class="cardlist">${r.bajas.map((b) => `<li><span class="grow"><b>${esc(b.name)}</b><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span></li>`).join('')}</ul>` : ''}
+    <div class="psec">Historial</div>
+    <ul class="cardlist">${(r.log || []).slice().reverse().map(logItem).join('')}</ul>
+  </div>
+  <div class="mf">
+    ${canApprove ? `<button class="btn block" data-a="inscApprove" data-id="${esc(r.id)}">✅ ${r.approvedAt ? 'Aprobar cambios' : 'Aprobar e inscribir equipo'}</button>` : ''}
+    ${!r.sentAt ? '<div class="note" style="margin:0">El capitán aún no ha enviado esta inscripción.</div>' : ''}
+    <div class="row">
+      <button class="btn ghost sm" data-a="inscReview" data-st="observada" data-id="${esc(r.id)}">⚠️ Observar</button>
+      ${!r.approvedAt && r.status !== 'rechazada' ? `<button class="btn danger sm" data-a="inscReview" data-st="rechazada" data-id="${esc(r.id)}">❌ Rechazar</button>` : ''}
+    </div>
+    <div class="row">
+      <button class="btn ghost sm" data-a="inscPin" data-id="${esc(r.id)}">🔑 Restablecer clave</button>
+      ${!r.approvedAt ? `<button class="btn danger sm" data-a="inscRemove" data-id="${esc(r.id)}">🗑️ Eliminar</button>` : ''}
+    </div>
+  </div>`;
+}
+
+async function inscApprove(id) {
+  const r = (inscList || []).find((x) => x.id === id);
+  const c = regCat(r);
+  if (!r || !c) return toast('La categoría de esta inscripción ya no existe');
+  let team = r.teamId ? c.teams.find((t) => t.id === r.teamId) : null;
+  if (!team && c.stage !== 'inscripcion') return toast(`El sorteo de ${c.name} ya se realizó: no se pueden agregar equipos nuevos`);
+  const dup = c.teams.find((t) => t !== team && norm(t.name) === norm(r.name));
+  if (dup) return toast(`Ya existe el equipo "${dup.name}" en ${c.name}`);
+  const warns = regWarns(r), hard = warns.filter((w) => w.hard);
+  if (hard.length) return toast(`⛔ ${hard[0].name}: ${hard[0].msg}`);
+  if (warns.length && !(await ask(warns.map((w) => `• ${w.name}: ${w.msg}`).join('\n') + '\n\n¿Ya verificó que son personas distintas?', { title: '⚠️ Posibles nombres repetidos', ok: 'Sí, verificado' }))) return;
+  const ok = await ask(team ? `Se actualizará ${r.name} en ${c.name} con ${r.players.length} jugadores.` : `${r.name} quedará inscrito en ${c.name} con ${r.players.length} jugadores y aparecerá en la lista pública de equipos.`, { title: '✅ Aprobar', ok: 'Aprobar' });
+  if (!ok) return;
+  const teamId = team ? team.id : uid();
+  try {
+    const { status, j } = await admInsc({ action: 'review', id, status: 'aprobada', teamId });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast(j.error || 'No se pudo aprobar');
+    const reg = j.reg;
+    team = c.teams.find((t) => t.id === teamId);
+    const starters = S.torneos[reg.tor].config.starters;
+    const prevSub = new Map(team ? team.players.map((p) => [norm(p.name), p.sub]) : []);
+    const players = reg.players.map((p, i) => ({ name: p.name, num: p.num, sub: prevSub.has(norm(p.name)) ? prevSub.get(norm(p.name)) : i >= starters }));
+    if (team) Object.assign(team, { name: reg.name, players, crest: reg.crest, colors: reg.colors, insc: reg.id });
+    else c.teams.push({ id: teamId, name: reg.name, players, paid: 0, crest: reg.crest, colors: reg.colors, insc: reg.id, createdAt: Date.now() });
+    replaceReg(reg);
+    save(); render();
+    toast(team ? `✅ Cambios de ${reg.name} aprobados` : `✅ ${reg.name} inscrito en ${c.name}`);
+  } catch (e) { toast('Sin conexión'); }
+}
+
+/* ---- Reglamento ---- */
+function rulesBody(text) {
+  const out = [];
+  let list = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const raw of String(text || '').split('\n')) {
+    const l = raw.trim();
+    let m;
+    if (!l) close();
+    else if ((m = l.match(/^#+\s*(.+)/))) { close(); out.push(`<h3>${esc(m[1])}</h3>`); }
+    else if ((m = l.match(/^[-*•]\s*(.+)/))) { if (list !== 'ul') { close(); out.push('<ul>'); list = 'ul'; } out.push(`<li>${esc(m[1])}</li>`); }
+    else if ((m = l.match(/^\d+[.)]\s*(.+)/))) { if (list !== 'ol') { close(); out.push('<ol>'); list = 'ol'; } out.push(`<li>${esc(m[1])}</li>`); }
+    else { close(); out.push(`<p>${esc(l)}</p>`); }
+  }
+  close();
+  return out.join('');
+}
+function rulesHTML() {
+  const tor = TOR(), cfg = inscOf();
+  const sys = [
+    `Cada equipo inscribe de ${cfg.min} a ${cfg.max} jugadores.`,
+    'Un jugador solo puede estar en un equipo del torneo (en cualquier categoría). Si ya aparece en otro equipo, el sistema no lo deja inscribir y el jugador debe decidir en cuál participará. Si son dos personas con el mismo nombre, se diferencian con el DUI o carné y la organización lo verifica.',
+    'Para dar de baja a un jugador hay que escribir el motivo. El jugador dado de baja queda intransferible: no puede volver a inscribirse en ningún equipo.',
+    'Son obligatorios: representante propietario y suplente (nombre y teléfono), logo o escudo y colores del uniforme.',
+    'El número de camisa no se repite dentro del equipo y, una vez aprobado, el jugador conserva el mismo número todo el campeonato.',
+    'El capitán confirma que sus jugadores pertenecen o viven permanentemente en el municipio.',
+    !cfg.open ? 'La inscripción en línea de esta categoría aún no está abierta.'
+      : (cfg.until ? `Inscripción de equipos hasta el ${fmtWhen(cfg.until)}.` : 'Inscripción de equipos abierta.') + (cfg.changesUntil ? ` Altas y bajas de jugadores hasta el ${fmtWhen(cfg.changesUntil)}.` : ''),
+    'Toda inscripción y todo cambio de jugadores queda pendiente hasta que la organización lo aprueba, lo observa o lo rechaza.',
+  ];
+  return `<div class="mh"><h2>📜 Reglamento</h2><button class="x" data-a="close">✕</button></div>
+  <div class="mb rules">
+    <div class="note" style="margin-top:12px"><b>✅ Lo que el sistema valida automáticamente · ${esc(catName(S.cat))}</b><ul>${sys.map((s) => `<li>${esc(s)}</li>`).join('')}</ul></div>
+    ${tor.rules ? rulesBody(tor.rules) : '<p class="muted">La organización aún no ha publicado el reglamento completo.</p>'}
+  </div>`;
+}
+
+function inscConfigCard() {
+  const cfg = inscOf();
+  return `<div class="card">
+    <h2>📝 Inscripción en línea · ${esc(catName(S.cat))}</h2>
+    <p class="muted" style="font-size:14px">Los capitanes inscriben a su equipo desde su teléfono y ustedes aprueban, observan o rechazan en <b>Equipos</b>. Cada categoría tiene su propio plazo y tamaño de equipo.</p>
+    <label class="opt ${cfg.open ? 'on' : ''}"><input type="checkbox" data-insc="open" ${cfg.open ? 'checked' : ''}><div><b>Inscripción en línea habilitada</b><span>Los capitanes pueden crear, enviar y modificar inscripciones dentro de los plazos.</span></div></label>
+    <label class="fl">Cierre de inscripción de equipos <small>(fecha y hora)</small><input type="datetime-local" data-insc="until" value="${toLocalInput(cfg.until)}"></label>
+    <label class="fl">Cierre de altas y bajas de jugadores <small>(ej: fin de la primera vuelta · vacío = mismo cierre)</small><input type="datetime-local" data-insc="changesUntil" value="${toLocalInput(cfg.changesUntil)}"></label>
+    <div class="grid2">
+      <label class="fl">Mínimo de jugadores<input type="number" inputmode="numeric" min="1" max="30" data-insc="min" value="${cfg.min}"></label>
+      <label class="fl">Máximo de jugadores<input type="number" inputmode="numeric" min="1" max="30" data-insc="max" value="${cfg.max}"></label>
+    </div>
+    <small>Hora de este teléfono. El cierre lo aplica el servidor aunque el capitán tenga la pantalla abierta.</small>
+  </div>`;
+}
+function rulesCard() {
+  return `<div class="card">
+    <h2>📜 Reglamento del torneo</h2>
+    <p class="muted" style="font-size:14px">Lo ven capitanes, jugadores y público con el botón “Reglamento”. Formato: <b># Título</b>, <b>- punto</b>, <b>1. punto numerado</b>. Se guarda al salir del cuadro.</p>
+    <textarea id="t-rules" rows="10" maxlength="20000" placeholder="Escriba o pegue el reglamento…">${esc(TOR().rules || '')}</textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost sm" data-a="rulesTemplate">📄 Usar reglamento Perquín 2026</button>
+      <button class="btn ghost sm" data-a="openRules">👁️ Ver</button>
+    </div>
+  </div>`;
+}
+
+const RULES_TEMPLATE = `# Generalidades
+- Como estructura partidaria de Nuevas Ideas en el Distrito de Perquín, se realizará la planificación, organización, coordinación y ejecución del campeonato de futbolito, que se regirá por lo siguiente.
+- El campeonato se desarrollará por medio de esta plataforma digital, abierta a todos los participantes y a todo el que quiera dar seguimiento permanente al evento.
+- Se convocará a una reunión previa con todos los interesados en formar equipos. Entre los asistentes se formará un comité organizador, integrado por las diferentes categorías, con voz y voto en todo lo relacionado con la estructura, forma y bases de competencia.
+- Se presentará un borrador que, en la primera reunión, deberá considerar todas las opciones de fondo posibles para lograr una mejor organización.
+- De los representantes se nombrará una junta directiva con voz y voto para la toma de decisiones, dentro de lo acordado al inicio.
+- Cada miembro de la junta directiva velará por los intereses del torneo de forma íntegra, sin salirse de los lineamientos, bases y reglamento aprobados.
+- La junta directiva general se reunirá una vez a la semana para realizar las programaciones y verificar resultados.
+
+# Equipos e inscripción
+- Cada equipo inscribirá un representante propietario y un suplente. El suplente actuará únicamente cuando el propietario no esté.
+- Los participantes deberán pertenecer al municipio de Perquín. También podrán participar quienes vivan permanentemente en el municipio.
+- La inscripción se realizará por medio de esta plataforma, a partir de la fecha que anuncie la organización, con toda la información que se requiera.
+- El mínimo de jugadores será de 5 y el máximo a inscribir será de 10.
+- Se permitirá inscribir y desinscribir jugadores durante toda la primera vuelta. Los jugadores desinscritos quedan intransferibles y no podrán jugar en otros equipos.
+- Toda inscripción se hará por medios digitales, por el encargado de realizar cambios en el sistema, y deberá tener la aprobación de los organizadores.
+- Al desinscribir a un jugador se deberá justificar el motivo por el cual ya no participará.
+- Cada equipo presentará un logo y los colores de uniforme a utilizar; de preferencia camisas numeradas, y el mismo jugador usará siempre el mismo número en todo el campeonato.
+- Si el equipo no se presenta debidamente identificado con su uniforme, será causal de pérdida de puntos.
+- El sistema detectará si un jugador intenta inscribirse en dos equipos; se le consultará al jugador en cuál equipo desea participar.
+- El representante será el responsable de recibir y entregar los chalecos.
+
+# Formato de competencia
+- Las fases de clasificación se determinarán de acuerdo con la cantidad de equipos inscritos.
+- Se jugará a una o dos vueltas de clasificación en dos grupos distintos, según cuántos equipos estén inscritos.
+- Clasificarán los dos equipos de mayor puntuación de cada grupo.
+- En caso de empate, para efectos de clasificación se definirá por diferencia de goles.
+
+# Partidos
+- Para su identificación, los jugadores titulares y suplentes deberán presentarse al terreno de juego para el reconocimiento del árbitro. El careo se hará 10 minutos antes de iniciar el juego.
+- Después de la hora señalada se esperará a los equipos un máximo de 15 minutos.
+- Un partido podrá iniciar con un mínimo de TRES jugadores; de lo contrario, el equipo pierde por default.
+- No habrá límite de cambios durante el partido.
+- Se jugarán dos tiempos de 30 minutos, con un descanso máximo de 5 minutos después del primer tiempo.
+
+# Pérdida de partidos
+- Todo equipo perderá el juego a favor de su contrincante, al que se adjudicarán los tres puntos, cuando no se presente a la hora indicada, por conductas inapropiadas o por agresión al árbitro.
+- Cuando un equipo pierda el juego por estas causas, el resultado será de dos a cero a favor de su adversario, anotando los goles al capitán.
+- El equipo que no se presente a 3 juegos consecutivos del campeonato quedará automáticamente fuera.
+- No se aceptan reclamos sobre el trámite del partido. Toda apelación se hará en reunión con las partes involucradas, con elementos justificables.
+- Los árbitros rendirán ante el comité, únicamente en las reuniones, un informe de todos los incidentes del partido.
+
+# Sanción de 3 minutos fuera del terreno de juego
+1. Entrar o salir sin autorización del árbitro.
+2. Botar el balón deliberadamente.
+3. Entrar cambiándose.
+4. Tirar el balón encima de las mallas que están sobre la cancha.
+
+# Tarjetas amarillas
+1. Agresiones verbales y palabras obscenas.
+2. Falta física leve por conducta antideportiva.
+
+# Expulsiones y suspensiones
+- Dos tarjetas amarillas más roja: expulsión y 2 partidos de suspensión.
+- Una tarjeta amarilla más roja: 3 partidos de suspensión.
+- Tres tarjetas amarillas durante 3 partidos consecutivos: 1 partido de suspensión.
+- Roja directa: 5 partidos de suspensión.
+- Roja directa con agresiones graves: expulsión de todo el campeonato.
+
+# Reglas de juego
+1. Toda mano y falta grave dentro del área será sancionada como penal, sin ningún jugador o jugadora en la portería.
+2. No se permite invadir el área pequeña por más de 5 segundos; si ocurre, el equipo contrario tendrá un tiro libre desde el centro de la cancha con un jugador estático cubriendo la portería.
+3. Todo balón de saque de meta no debe sobrepasar la media cancha; si lo hace, será posesión del equipo contrario.
+4. Los saques de banda serán en contacto con el piso, sujetando el balón con la mano y golpeándolo de forma rasante.
+5. No está permitido que el jugador se sujete de la malla; hacerlo será falta sancionada por el árbitro.`;
+
 
 /* ---------------- Eventos ---------------- */
 const actions = {
@@ -2296,7 +2876,7 @@ const actions = {
     if (d.t === 'ajustes' && auth && sync.mode !== 'local') loadOrgs();
     if (d.t === 'ajustes' && !isAdmin()) checkSetup();
   },
-  close: () => closeModal(),
+  close: () => { if (modal && modal.type === 'rules' && modal.back) { modal = modal.back; return renderModal(); } closeModal(); },
   view: (d) => { S.view = d.v; save(); render(); },
   viewTeam: (d) => openModal('teamView', d.id),
   openSchedule: () => openModal('schedule', null),
@@ -2312,7 +2892,7 @@ const actions = {
   },
   logout: () => {
     const go = () => {
-      setAuth(null); orgs = null;
+      setAuth(null); orgs = null; inscList = null; inscBans = [];
       sync.dirty = false; sync.rev = -1;
       S.tab = ADMIN_URL ? 'ajustes' : 'inicio'; render(); pull(true);
       toast('Sesión cerrada');
@@ -2336,14 +2916,110 @@ const actions = {
     if (status !== 200) return toast((j && j.error) || 'No se pudo quitar');
     orgs = j; render(); toast('Usuario quitado');
   },
+  // Siempre traer el estado actual (la organización pudo aprobar u observar mientras tanto)
+  capOpen: () => { modal = { type: 'cap' }; if (capAuth) capReg = null; renderModal(); if (capAuth) capLoad(); },
+  capSave: (d) => capSave(!!d.send),
+  capBaja: (d) => capBaja(d.n),
+  capLogout: () => ask('Saldrá de la inscripción en este teléfono. Para volver a entrar necesitará su código y su clave.', { title: 'Salir', ok: 'Salir' }).then((ok) => {
+    if (!ok) return;
+    setCap(null); modal = { type: 'cap' }; renderModal(); render(); toast('Salió de la inscripción');
+  }),
+  openRules: () => {
+    // Desde la inscripción: guardar lo escrito para volver sin perderlo
+    if (modal && modal.type === 'cap') {
+      const back = capReg ? { type: 'cap', draft: Object.assign({}, capReg, capCollect()), crest: modal.crest, accept: modal.accept, errors: modal.errors, general: modal.general } : { type: 'cap' };
+      modal = { type: 'rules', back };
+      return renderModal();
+    }
+    openModal('rules', null);
+  },
+  inscReload: () => loadInsc(true).then(() => toast('Inscripciones actualizadas')),
+  inscView: (d) => openModal('inscAdmin', d.id),
+  inscApprove: (d) => inscApprove(d.id),
+  inscReview: async (d) => {
+    const obs = d.st === 'observada';
+    const note = await askText(obs ? 'Escriba qué debe corregir el capitán. Lo verá en su inscripción.' : 'Escriba el motivo del rechazo. Lo verá el capitán.', { title: obs ? '⚠️ Observaciones' : '❌ Rechazar inscripción', ok: obs ? 'Enviar observación' : 'Rechazar', danger: !obs });
+    if (note == null) return;
+    if (note.trim().length < 5) return toast('Escriba un poco más de detalle');
+    try {
+      const { status, j } = await admInsc({ action: 'review', id: d.id, status: d.st, note: note.trim() });
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast(j.error || 'No se pudo guardar');
+      replaceReg(j.reg); loadInsc(true); renderModal(); render(); toast(obs ? 'Observación enviada al capitán' : 'Inscripción rechazada');
+    } catch (e) { toast('Sin conexión'); }
+  },
+  inscPin: async (d) => {
+    const pass = await askText('Nueva clave para el capitán (mínimo 6 caracteres). Entréguesela personalmente o por un medio seguro.', { title: '🔑 Restablecer clave', ok: 'Guardar' });
+    if (pass == null) return;
+    if (pass.length < 6) return toast('La clave debe tener al menos 6 caracteres');
+    try {
+      const { status, j } = await admInsc({ action: 'resetPin', id: d.id, pass });
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast(j.error || 'No se pudo cambiar');
+      replaceReg(j.reg); renderModal(); toast(`✅ Clave cambiada. Código: ${d.id}`);
+    } catch (e) { toast('Sin conexión'); }
+  },
+  inscRemove: async (d) => {
+    const ok = await ask('Se eliminará esta inscripción (no aprobada). El capitán ya no podrá entrar con su código.', { title: '🗑️ Eliminar inscripción', ok: 'Eliminar', danger: true });
+    if (!ok) return;
+    const { status, j } = await admInsc({ action: 'remove', id: d.id });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast(j.error || 'No se pudo eliminar');
+    inscList = (inscList || []).filter((x) => x.id !== d.id);
+    closeModal(); render(); toast('Inscripción eliminada');
+  },
+  inscUnban: async (d) => {
+    const b = inscBans.find((x) => x.key === d.k);
+    const ok = await ask(`${b ? b.name : 'El jugador'} podrá volver a inscribirse en cualquier equipo. Úselo solo para corregir una baja hecha por error.`, { title: 'Habilitar jugador', ok: 'Habilitar' });
+    if (!ok) return;
+    const { status, j } = await admInsc({ action: 'unban', key: d.k });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast(j.error || 'No se pudo habilitar');
+    inscBans = inscBans.filter((x) => x.key !== d.k);
+    render(); toast('Jugador habilitado');
+  },
+  rulesTemplate: async () => {
+    if (TOR().rules && !(await ask('Se reemplazará el reglamento actual por el del Campeonato de Futbolito Perquín 2026.', { title: '📄 Usar plantilla', ok: 'Reemplazar', danger: true }))) return;
+    TOR().rules = RULES_TEMPLATE; save(); render(); toast('Reglamento cargado. Puede editarlo.');
+  },
+  champCats: async () => {
+    const cats = CATS_(), used = new Set(), plan = [];
+    for (const [, name, color, re] of CHAMP_CATS) {
+      const k = Object.keys(cats).find((x) => !used.has(x) && (cats[x].name === name || re.test(norm(cats[x].name))));
+      if (k) { used.add(k); if (cats[k].name !== name) plan.push({ k, name, txt: `“${cats[k].name}” → ${name} (conserva sus ${cats[k].teams.length} equipos)` }); }
+      else plan.push({ name, color, txt: `Nueva: ${name}` });
+    }
+    const rest = Object.keys(cats).filter((k) => !used.has(k)).map((k) => cats[k].name);
+    if (!plan.length) return toast('Las categorías ya están listas');
+    const ok = await ask(plan.map((x) => '• ' + x.txt).join('\n') + (rest.length ? `\n\nNo se tocan: ${rest.join(', ')} (puede eliminarlas o renombrarlas después).` : ''), { title: '⚽ Categorías del campeonato', ok: 'Aplicar' });
+    if (!ok) return;
+    for (const x of plan) {
+      if (x.k) cats[x.k].name = x.name;
+      else { const id = 'c' + uid(); cats[id] = newTournament(x.name, x.color); }
+    }
+    // Orden: Femenino, Juvenil, Libre y después las demás
+    const ordered = {};
+    for (const [, name] of CHAMP_CATS) { const k = Object.keys(cats).find((x) => cats[x].name === name); if (k) ordered[k] = cats[k]; }
+    for (const k of Object.keys(cats)) if (!ordered[k]) ordered[k] = cats[k];
+    TOR().cats = ordered;
+    save(); render(); toast('✅ Categorías listas');
+  },
   newTeam: () => openModal('team', null),
   editTeam: (d) => openModal('team', d.id),
   saveTeam: () => saveTeam(),
   delTeam: (d) => {
     const tm = teamById(d.id);
     if (!tm) return;
-    ask(`Se eliminará el equipo "${tm.name}" con sus integrantes.`, { title: 'Eliminar equipo', ok: 'Eliminar', danger: true }).then((ok) => {
+    ask(`Se eliminará el equipo "${tm.name}" con sus integrantes.${tm.insc ? '\n\nVino de la inscripción en línea: la inscripción del capitán quedará cerrada.' : ''}`, { title: 'Eliminar equipo', ok: 'Eliminar', danger: true }).then(async (ok) => {
       if (!ok) return;
+      if (tm.insc && sync.mode !== 'local') {
+        try {
+          const { status, j } = await admInsc({ action: 'adminSync', id: tm.insc, remove: true });
+          if (status === 401) return sessionExpired();
+          if (status !== 200 && status !== 404) return toast(j.error || 'No se pudo cerrar la inscripción del capitán');
+          if (j.reg) replaceReg(j.reg);
+        } catch (e) { return toast('Sin conexión'); }
+      }
       T().teams = T().teams.filter((x) => x.id !== d.id);
       save(); closeModal(); render(); toast('Equipo eliminado');
     });
@@ -2463,6 +3139,12 @@ const actions = {
     });
   },
   crestRandom: () => { if (modal) { modal.crest = randomCrest(); updateCrestUI(); } },
+  crestSet: (d) => {
+    if (!modal) return;
+    const base = modal.crest && !modal.crest.img ? modal.crest : Object.assign(randomCrest(), { e: 'balon' });
+    modal.crest = Object.assign({}, base, { [d.k]: d.v });
+    updateCrestUI();
+  },
   crestNone: () => { if (modal) { modal.crest = null; updateCrestUI(); } },
   crestPreset: (d) => { if (modal) { modal.crest = clone(CREST_PRESETS[+d.i]); updateCrestUI(); } },
   openTorneos: () => openModal('torneos', null),
@@ -2529,7 +3211,7 @@ const actions = {
       if (status === 401) return sessionExpired();
       if (status !== 200) return toast((j && j.error) || 'No se pudo reiniciar');
       // empezar limpio también en este teléfono
-      S.torneos = fresh.torneos; S.tor = 't1'; S.cat = 'M'; S.tab = 'ajustes';
+      S.torneos = fresh.torneos; S.tor = 't1'; S.cat = Object.keys(fresh.torneos.t1.cats)[0]; S.tab = 'ajustes';
       sync.dirty = false; sync.rev = -1; sync.base = null;
       saveLocal(); saveSync();
       orgs = null; render(); await pull(true); loadOrgs();
@@ -2627,10 +3309,33 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow', 'openCompare']);
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow', 'openCompare',
+  'capOpen', 'capSave', 'capBaja', 'capLogout', 'openRules', 'crestRandom', 'crestNone', 'crestPreset', 'crestSet']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
+  if (e.target.id === 'capNewForm') {
+    e.preventDefault();
+    const body = { action: 'create', tor: S.tor, cat: $('#cn-cat').value, name: $('#cn-name').value.trim(), rep: { name: $('#cn-rep').value.trim(), phone: $('#cn-phone').value.trim() }, pass: $('#cn-pass').value };
+    try {
+      const { status, j } = await inscCall(body);
+      if (status !== 200) return toast(j.error || 'No se pudo crear la inscripción');
+      setCap({ id: j.reg.id, token: j.token, name: j.reg.name }, j.reg);
+      modal = { type: 'cap' }; renderModal(); render();
+      ask(`Su código es ${j.reg.id}\n\nAnótelo junto con su clave: los necesitará para entrar desde otro teléfono. Ahora agregue a sus jugadores y envíe la inscripción.`, { title: '✅ Inscripción creada', ok: 'Entendido' });
+    } catch (err) { toast('Sin conexión. Intente de nuevo.'); }
+    return;
+  }
+  if (e.target.id === 'capLoginForm') {
+    e.preventDefault();
+    try {
+      const { status, j } = await inscCall({ action: 'login', id: $('#cl-id').value.trim().toUpperCase(), pass: $('#cl-pass').value });
+      if (status !== 200) return toast(j.error || 'No se pudo ingresar');
+      setCap({ id: j.reg.id, token: j.token, name: j.reg.name }, j.reg);
+      modal = { type: 'cap' }; renderModal(); render(); toast(`👋 ${j.reg.name}`);
+    } catch (err) { toast('Sin conexión. Intente de nuevo.'); }
+    return;
+  }
   if (e.target.id === 'catForm') {
     e.preventDefault();
     if (!isAdmin()) return;
@@ -2670,6 +3375,7 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('input', (e) => {
   if (e.target.matches('[data-pl]')) checkPlayers();
+  if (e.target.matches('[data-cpl]')) { const row = e.target.closest('.cprow'); if (row) row.dataset.srv = ''; checkCapPlayers(); }
   if (e.target.id === 'f-name' && modal && modal.crest && modal.crest.e === 'inicial') updateCrestUI();
 });
 
@@ -2687,6 +3393,26 @@ document.addEventListener('change', (e) => {
     if (n) { TOR().name = n; save(); render(); toast('Nombre del torneo guardado'); }
     return;
   }
+  if (el.dataset.insc) {
+    if (!isAdmin()) return;
+    const k = el.dataset.insc, cur = inscOf();
+    if (k === 'open') cur.open = el.checked;
+    else if (k === 'until' || k === 'changesUntil') { const ms = el.value ? new Date(el.value).getTime() : 0; cur[k] = isNaN(ms) ? 0 : ms; }
+    else cur[k] = Math.max(1, Math.min(30, Math.round(num(el.value, cur[k]))));
+    if (cur.min > cur.max) { if (k === 'min') cur.min = cur.max; else cur.max = cur.min; toast('El mínimo no puede ser mayor que el máximo'); }
+    else if (cur.until && cur.changesUntil && cur.changesUntil < cur.until) toast('⚠️ El cierre de altas y bajas quedó antes que el de inscripción');
+    else toast('Inscripción en línea guardada');
+    T().config.insc = cur;
+    save(); render();
+    return;
+  }
+  if (el.id === 't-rules') {
+    if (!isAdmin()) return;
+    TOR().rules = el.value.replace(/\r/g, '').slice(0, 20000);
+    save(); toast('Reglamento guardado');
+    return;
+  }
+  if (el.id === 'c-accept') { modal.accept = el.checked; el.closest('.opt').classList.toggle('on', el.checked); return; }
   if (el.id === 'cmp-n' || el.id === 'cmp-f') {
     if (modal && modal.type === 'compare') {
       if (el.id === 'cmp-n') modal.n = Math.max(2, Math.min(40, parseInt(el.value, 10) || 2));
@@ -2705,7 +3431,7 @@ document.addEventListener('change', (e) => {
   }
   if (el.dataset.crest) {
     const k = el.dataset.crest;
-    modal.crest = Object.assign(modal.crest && !modal.crest.img ? modal.crest : randomCrest(), { [k]: el.value });
+    modal.crest = Object.assign({}, modal.crest && !modal.crest.img ? modal.crest : Object.assign(randomCrest(), { e: 'balon' }), { [k]: el.value });
     updateCrestUI();
     return;
   }

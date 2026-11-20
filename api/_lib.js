@@ -63,10 +63,27 @@ async function verify(req) {
   return Number(await redis(['HEXISTS', USERS, d.u])) === 1 ? d.u : null;
 }
 
+/** Firma un objeto cualquiera (tokens de capitanes). */
+async function signData(obj, days = DAYS) {
+  const body = Buffer.from(JSON.stringify({ ...obj, exp: Date.now() + days * 864e5 })).toString('base64url');
+  const sig = crypto.createHmac('sha256', await secret()).update(body).digest('base64url');
+  return body + '.' + sig;
+}
+/** Devuelve el objeto firmado si el token es válido y no venció (no consulta usuarios). */
+async function verifyData(req) {
+  const h = req.headers.authorization || '';
+  const tok = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const [body, sig] = tok.split('.');
+  if (!body || !sig) return null;
+  const expected = crypto.createHmac('sha256', await secret()).update(body).digest('base64url');
+  if (expected.length !== sig.length || !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) return null;
+  try { const d = JSON.parse(Buffer.from(body, 'base64url').toString()); return d.exp > Date.now() ? d : null; } catch (e) { return null; }
+}
+
 function readBody(req) {
   let b = req.body;
   if (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) { b = null; } }
   return b || {};
 }
 
-module.exports = { configured, redis, hashPass, checkPass, signToken, verify, readBody, USERS };
+module.exports = { configured, redis, hashPass, checkPass, signToken, verify, signData, verifyData, readBody, USERS };
