@@ -54,7 +54,7 @@ function newTorneo(name, catsFrom) {
   const cats = {};
   if (catsFrom) Object.entries(catsFrom).forEach(([k, t]) => { cats[k] = newTournament(t.name, t.color); cats[k].config = Object.assign(clone(t.config), {}); });
   else CHAMP_CATS.forEach(([k, n, c]) => { cats[k] = newTournament(n, c); });
-  return { name, createdAt: Date.now(), config: defaultTorConfig(), cats };
+  return { name, createdAt: Date.now(), config: defaultTorConfig(), cats, rules: '' };
 }
 
 /** Valida los datos, migra el formato antiguo ({cats}) y completa valores faltantes. */
@@ -2826,7 +2826,7 @@ function rulesHTML() {
   return `<div class="mh"><h2>📜 Reglamento</h2><button class="x" data-a="close">✕</button></div>
   <div class="mb rules">
     <div class="note" style="margin-top:12px"><b>✅ Lo que el sistema valida automáticamente · ${esc(catName(S.cat))}</b><ul>${sys.map((s) => `<li>${esc(s)}</li>`).join('')}</ul></div>
-    ${tor.rules ? rulesBody(tor.rules) : '<p class="muted">La organización aún no ha publicado el reglamento completo.</p>'}
+    ${rulesText(tor) ? rulesBody(rulesText(tor)) : '<p class="muted">La organización aún no ha publicado el reglamento completo.</p>'}
   </div>`;
 }
 
@@ -2845,11 +2845,13 @@ function inscConfigCard() {
     <small>Hora de este teléfono. El cierre lo aplica el servidor aunque el capitán tenga la pantalla abierta.</small>
   </div>`;
 }
+/** Reglamento del torneo. Si nunca se ha escrito uno, se usa el del Campeonato de Futbolito Perquín 2026. */
+const rulesText = (tor) => (tor.rules == null ? RULES_TEMPLATE : tor.rules);
 function rulesCard() {
   return `<div class="card">
     <h2>📜 Reglamento del torneo</h2>
     <p class="muted" style="font-size:14px">Lo ven capitanes, jugadores y público con el botón “Reglamento”. Formato: <b># Título</b>, <b>- punto</b>, <b>1. punto numerado</b>. Se guarda al salir del cuadro.</p>
-    <textarea id="t-rules" rows="10" maxlength="20000" placeholder="Escriba o pegue el reglamento…">${esc(TOR().rules || '')}</textarea>
+    <textarea id="t-rules" rows="10" maxlength="20000" placeholder="Escriba o pegue el reglamento…">${esc(rulesText(TOR()))}</textarea>
     <div class="row" style="margin-top:10px">
       <button class="btn ghost sm" data-a="rulesTemplate">📄 Usar reglamento Perquín 2026</button>
       <button class="btn ghost sm" data-a="openRules">👁️ Ver</button>
@@ -3035,7 +3037,7 @@ const actions = {
     render(); toast('Jugador habilitado');
   },
   rulesTemplate: async () => {
-    if (TOR().rules && !(await ask('Se reemplazará el reglamento actual por el del Campeonato de Futbolito Perquín 2026.', { title: '📄 Usar plantilla', ok: 'Reemplazar', danger: true }))) return;
+    if (rulesText(TOR()) && rulesText(TOR()) !== RULES_TEMPLATE && !(await ask('Se reemplazará el reglamento actual por el del Campeonato de Futbolito Perquín 2026.', { title: '📄 Usar plantilla', ok: 'Reemplazar', danger: true }))) return;
     TOR().rules = RULES_TEMPLATE; save(); render(); toast('Reglamento cargado. Puede editarlo.');
   },
   invNew: async () => {
