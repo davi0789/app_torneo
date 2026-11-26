@@ -86,4 +86,55 @@ function readBody(req) {
   return b || {};
 }
 
-module.exports = { configured, redis, hashPass, checkPass, signToken, verify, signData, verifyData, readBody, USERS };
+/* ---------------- Roles ----------------
+   torneo:roles guarda solo los roles distintos de organizador ('arbitro').
+   Un usuario que no aparece ahí es organizador (así los usuarios que ya existían no cambian). */
+const ROLES = 'torneo:roles';
+const ROLE_NAMES = ['admin', 'arbitro'];
+async function roleOf(user) { return (user && (await redis(['HGET', ROLES, user]))) || 'admin'; }
+/** Usuario y rol de la sesión, o null. */
+async function verifyRole(req) {
+  const user = await verify(req);
+  return user ? { user, role: await roleOf(user) } : null;
+}
+/** Solo organizadores. Responde 401/403 y devuelve null si no corresponde. */
+async function requireAdmin(req, res) {
+  const s = await verifyRole(req);
+  if (!s) { res.status(401).json({ error: 'Debe ingresar como organizador' }); return null; }
+  if (s.role !== 'admin') { res.status(403).json({ error: 'Su usuario es de árbitro: no tiene permiso para esta acción' }); return null; }
+  return s.user;
+}
+
+/* ---------------- Datos del torneo con control de versiones ---------------- */
+const K_REV = 'torneo:rev', K_DATA = 'torneo:data', K_HIST = 'torneo:hist', K_META = 'torneo:meta';
+const HIST_MAX = 40;
+// Guardar solo si nadie más guardó antes (control de versiones atómico) y respaldar la versión anterior.
+const CAS = `
+local r = redis.call('GET', KEYS[1]) or '0'
+if r ~= ARGV[1] then return {0, r} end
+local old = redis.call('GET', KEYS[2])
+if old then
+  local meta = redis.call('GET', KEYS[4]) or '{}'
+  redis.call('LPUSH', KEYS[3], '{"rev":' .. r .. ',"meta":' .. meta .. ',"data":' .. old .. '}')
+  redis.call('LTRIM', KEYS[3], 0, ${HIST_MAX - 1})
+end
+local n = tonumber(r) + 1
+redis.call('SET', KEYS[1], tostring(n))
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('SET', KEYS[4], ARGV[3])
+return {1, tostring(n)}`;
+async function readAll() {
+  const [rev, data] = await redis(['MGET', K_REV, K_DATA]);
+  return { rev: Number(rev || 0), data: data ? JSON.parse(data) : null };
+}
+/** Guarda si la versión sigue siendo baseRev. Devuelve {ok, rev}. */
+async function casWrite(baseRev, json, meta) {
+  const [ok, rev] = await redis(['EVAL', CAS, '4', K_REV, K_DATA, K_HIST, K_META, String(Number(baseRev) || 0), json, JSON.stringify(meta)]);
+  return { ok: Number(ok) === 1, rev: Number(rev) };
+}
+
+module.exports = {
+  configured, redis, hashPass, checkPass, signToken, verify, signData, verifyData, readBody, USERS,
+  ROLES, ROLE_NAMES, roleOf, verifyRole, requireAdmin,
+  K_REV, K_DATA, K_HIST, K_META, HIST_MAX, readAll, casWrite,
+};

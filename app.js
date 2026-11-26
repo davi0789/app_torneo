@@ -10,6 +10,46 @@ const totalTeams = (d) => Object.values(d.torneos || {}).reduce((a, tor) => a + 
 const $ = (s) => document.querySelector(s);
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+/** Huella corta y estable de un texto (igual en todos los teléfonos). */
+// Identificador fijo de cada jugador (rules.js: calculado igual en todos los teléfonos y en el servidor)
+const hash36 = Rules.hash36;
+const pidFor = Rules.pidFor;
+const ensurePlayerIds = Rules.ensurePlayerIds;
+/**
+ * Enlaza la lista nueva de un equipo con la anterior: el mismo nombre conserva su identificador.
+ * Devuelve los jugadores cuya fila tenía a otro jugador (nombre cambiado): queda a decisión si es corrección.
+ */
+function matchPlayerIds(players, old) {
+  const claimed = new Set();
+  for (const p of players) {
+    const o = old.find((x) => !claimed.has(x.id) && norm(x.name) === norm(p.name));
+    if (o) { p.id = o.id; claimed.add(o.id); }
+  }
+  const renamed = [];
+  for (const p of players) {
+    if (p.id || !p.rowPid || claimed.has(p.rowPid)) continue;
+    const o = old.find((x) => x.id === p.rowPid);
+    if (o) { p.oldName = o.name; claimed.add(o.id); renamed.push(p); }
+  }
+  return renamed;
+}
+/**
+ * Asigna identificador a los jugadores nuevos. Nunca reutiliza el de un jugador anterior del equipo
+ * (aunque se llame igual que alguien dado de baja): así un jugador nuevo empieza sin goles ni tarjetas.
+ */
+function assignPlayerIds(teamId, players, old = [], t = T()) {
+  const used = new Set([...old, ...players].map((p) => p.id).filter(Boolean));
+  // También los de jugadores que ya no están pero tienen goles o tarjetas registrados
+  for (const m of (t && t.matches) || []) for (const ev of [...(m.goals || []), ...(m.cards || [])]) if (ev.team === teamId && ev.pid) used.add(ev.pid);
+  for (const p of players) {
+    if (p.id) continue;
+    const base = pidFor(teamId, p.name);
+    let id = base, k = 2;
+    while (used.has(id)) id = `${base}-${k++}`;
+    p.id = id; used.add(id);
+  }
+}
+const pidByName = Rules.pidByName;
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (n) => '$' + (Number(n) || 0).toLocaleString('es', { maximumFractionDigits: 2 });
 /** Número aleatorio 0..n-1 usando el generador criptográfico del navegador (sin sesgo). */
@@ -31,8 +71,7 @@ function newTournament(name = '', color = 0) {
     config: {
       fee: 0, duration: 20,
       tiebreak: 'h2h',     // h2h = enfrentamiento directo primero | dg = diferencia de goles primero
-      suspRed: 1,          // partidos de suspensión por tarjeta roja
-      yellowLimit: 0,      // amarillas acumuladas que suspenden 1 partido (0 = no aplica)
+      // sanc: reglas de suspensión (ver SANC_DEF); si falta, se usa el acuerdo del comité
       format: 'liga',      // liga | grupos | elim
       ligaFinal: 0,        // 0 = gana la tabla, 2 = final, 4 = semifinales
       groupSize: 4, perGroup: 2,
@@ -49,7 +88,8 @@ function newTournament(name = '', color = 0) {
 /** Categorías del Campeonato de Futbolito Perquín 2026: [clave, nombre, color, cómo reconocerla]. */
 const CHAMP_CATS = [['F', 'Futbolito Femenino', 1, /femen/], ['J', 'Futbolito Juvenil', 2, /juven/], ['L', 'Futbolito Libre', 0, /libre|mascul/]];
 /** Configuración general del torneo (aplica a todos los equipos). */
-const defaultTorConfig = () => ({ starters: 8, subs: 4, minPlayers: 8 });
+/** starters = titulares en cancha (solo para ordenar la lista). El mínimo y máximo de jugadores es de cada categoría (inscOf). */
+const defaultTorConfig = () => ({ starters: 5 });
 function newTorneo(name, catsFrom) {
   const cats = {};
   if (catsFrom) Object.entries(catsFrom).forEach(([k, t]) => { cats[k] = newTournament(t.name, t.color); cats[k].config = Object.assign(clone(t.config), {}); });
@@ -73,11 +113,15 @@ function normalizeData(d) {
     if (!tor.name) tor.name = 'Mi Torneo';
     if (tor.createdAt == null) tor.createdAt = 0;
     tor.config = Object.assign(defaultTorConfig(), tor.config || {});
+    // Configuración antigua sin tocar (8 titulares + 4 suplentes, mínimo 8): ya no aplica con equipos de 5 a 8
+    if (tor.config.starters === 8 && tor.config.subs === 4 && tor.config.minPlayers === 8) tor.config.starters = 5;
     Object.keys(tor.cats).forEach((k, i) => {
       const t = tor.cats[k];
       if (!t || !Array.isArray(t.teams) || !Array.isArray(t.matches)) { delete tor.cats[k]; return; }
       if (!t.name) t.name = defaults[k] ? defaults[k][0] : 'Categoría ' + (i + 1);
       if (t.color == null) t.color = defaults[k] ? defaults[k][1] : i % PALETTES;
+      // Jugadores con identificador fijo; goles y tarjetas antiguos (solo con nombre) se enlazan a ese identificador
+      Rules.normalizeCat(t);
     });
     if (!Object.keys(tor.cats).length) tor.cats.M = newTournament('General', 0);
   }
@@ -116,10 +160,19 @@ try {
 let auth = null;
 try { auth = JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) { /* nada */ }
 let orgs = null; // lista de organizadores (se carga en Ajustes)
-const isAdmin = () => sync.mode === 'local' || !!(auth && auth.token);
+/** Organizador: todo. Sin base de datos (este teléfono solo) también es organizador. */
+const isAdmin = () => sync.mode === 'local' || !!(auth && auth.token && auth.role !== 'arbitro');
+/** Árbitro: solo maneja los partidos que le asignan (marcador, tarjetas, presentación, tiempos, W.O.). */
+const isRef = () => sync.mode !== 'local' && !!(auth && auth.token && auth.role === 'arbitro');
+const isMyMatch = (m) => !!(m && isRef() && m.ref === auth.user);
+/** ¿Puede anotar en este partido? Organizador siempre; árbitro solo en su partido y mientras no esté finalizado. */
+const canEditMatch = (m) => !!m && (isAdmin() || (isMyMatch(m) && m.status !== 'done'));
+const signedIn = () => isAdmin() || isRef();
 // El acceso de organizadores solo se muestra entrando por /admin (o ?admin)
+// Entrada fija de capitanes (sin botón público): /capitan → ingreso con código de equipo y clave
+const CAP_URL = /\/capitan\/?$/.test(location.pathname);
 const ADMIN_URL = /\/admin\/?$/.test(location.pathname) || /(^|[?&#])admin(\b|$)/.test(location.search + location.hash);
-const showAccess = () => isAdmin() || ADMIN_URL;
+const showAccess = () => signedIn() || ADMIN_URL;
 function setAuth(a) {
   auth = a;
   try { if (a) localStorage.setItem(AUTH_KEY, JSON.stringify(a)); else localStorage.removeItem(AUTH_KEY); } catch (e) { /* nada */ }
@@ -130,7 +183,7 @@ function saveLocal() {
 }
 function save() {
   saveLocal();
-  if (sync.mode !== 'local' && isAdmin()) {
+  if (sync.mode !== 'local' && signedIn()) {
     sync.dirty = JSON.stringify(payload()) !== JSON.stringify(sync.base);
     saveSync();
     if (sync.dirty) schedulePush();
@@ -154,6 +207,12 @@ const miniCrest = (id) => { const tm = teamById(id); return tm && tm.crest ? `<s
 const teamById = (id) => T().teams.find((x) => x.id === id);
 const tname = (id) => (teamById(id) || {}).name || 'Por definir';
 const mById = (id, t = T()) => t.matches.find((m) => m.id === id);
+/** Jugador de un equipo por su identificador. */
+const playerById = (teamId, pid) => { const tm = teamById(teamId); return (tm && pid && tm.players.find((p) => p.id === pid)) || null; };
+/** Clave del jugador de un gol o tarjeta (identificador; los muy antiguos sin él, por nombre). */
+const evKey = (ev) => ev.pid || 'n:' + norm(ev.player);
+/** Nombre para mostrar: el actual del jugador (si se corrigió, se ve corregido) o el que quedó guardado si ya no está en el equipo. */
+const evName = (ev) => { const p = playerById(ev.team, ev.pid); return p ? p.name : ev.player; };
 
 /* ---------------- Ventanas propias (reemplazan confirm/prompt del navegador) ---------------- */
 // En pruebas automáticas se usan respuestas inmediatas (sin interfaz).
@@ -252,21 +311,21 @@ function mkMatch(o) {
   }, o);
 }
 
-function winner(m) {
-  if (!m || m.status !== 'done') return null;
-  if (m.hs > m.as) return m.home;
-  if (m.as > m.hs) return m.away;
-  if (m.ph != null && m.pa != null) {
-    if (m.ph > m.pa) return m.home;
-    if (m.pa > m.ph) return m.away;
-  }
-  return null;
-}
-function loser(m) {
-  const w = winner(m);
-  if (!w) return null;
-  return w === m.home ? m.away : m.home;
-}
+// Ganadores (rules.js, compartido con el servidor)
+const winner = Rules.winner;
+const loser = Rules.loser;
+
+/* ---- Series de ida y vuelta por puntos (liguilla): solo cuentan los puntos, no los goles ---- */
+// Reglas compartidas con el servidor (rules.js): series por puntos y penales
+const legPts = Rules.legPts;
+const seriesPts = (vuelta, t = T()) => Rules.seriesPts(t, vuelta);
+const needsPens = (m, t = T()) => Rules.needsPens(t, m);
+const tieWinner = (m, t = T()) => Rules.tieWinner(t, m);
+const tieLoser = (m, t = T()) => Rules.tieLoser(t, m);
+/** Penales que se muestran: los del partido único empatado o los de la serie (en el partido de vuelta). */
+const pensShown = (m) => m.ph != null && m.pa != null && (m.tieOf || m.hs === m.as);
+/** Partido que define (para podio y fase): el único o el de vuelta. */
+const isDecider = (m) => m.tieLeg !== 1;
 
 function roundRobin(ids, phase, group) {
   const a = [...ids];
@@ -285,6 +344,19 @@ function roundRobin(ids, phase, group) {
   }
   return out;
 }
+/**
+ * Dos vueltas: la segunda repite los cruces de la primera con local y visitante invertidos.
+ * Empieza cuando termina la primera vuelta de TODOS los grupos (jornadas siguientes a la última de la 1ª vuelta).
+ */
+function withSecondLeg(matches) {
+  const R = Math.max(0, ...matches.map((m) => m.round));
+  matches.forEach((m) => { m.leg = 1; });
+  return matches.concat(matches.map((m) => mkMatch({ phase: m.phase, group: m.group, round: m.round + R, leg: 2, home: m.away, away: m.home })));
+}
+const legsOf = (c) => (c.format === 'liga' || c.format === 'grupos') && Number(c.legs) === 2 ? 2 : 1;
+const koLegsOf = (c) => (Number(c.koLegs) === 2 ? 2 : 1);
+/** Cantidad de grupos: la elegida (p. ej. 2, acuerdo del comité) o automática según "equipos por grupo". */
+const ngOf = (c, n) => (Number(c.nGroups) > 0 ? Math.max(1, Math.min(Number(c.nGroups), Math.floor(n / 2))) : groupCount(n, c.groupSize));
 
 function bracketOrder(P) {
   let arr = [1, 2];
@@ -317,6 +389,15 @@ function buildKO(seeds, groupOf, slots) {
       }
     }
   }
+  // Ida y vuelta (liguilla por puntos): cada cruce son 2 partidos; avanza quien sume más puntos y,
+  // si empatan en puntos, se define por penales al final de la vuelta. La llave sigue al partido de vuelta.
+  const legs = koLegsOf(t.config);
+  const tie = (o) => {
+    if (legs === 1) { const m = mkMatch(o); return { list: [m], id: m.id }; }
+    const ida = mkMatch(Object.assign({}, o, { tieLeg: 1 }));
+    const vuelta = mkMatch(Object.assign({}, o, { tieLeg: 2, tieOf: ida.id, srcH: o.srcA, srcA: o.srcH }));
+    return { list: [ida, vuelta], id: vuelta.id };
+  };
   let round = 1;
   while (prev.length > 1) {
     const name = roundName(prev.length);
@@ -328,19 +409,19 @@ function buildKO(seeds, groupOf, slots) {
       const a = prev[i], b = prev[i + 1];
       if (a && b) {
         k++;
-        const m = mkMatch({
+        const x = tie({
           phase: 'ko', round, ko: prev.length === 2 ? 'final' : (prev.length === 4 ? 'semi' : 'ko'),
           label: pairs > 1 ? `${name} ${k}` : name, srcH: a, srcA: b,
         });
-        created.push(m);
-        next.push({ w: m.id });
+        created.push(...x.list);
+        next.push({ w: x.id });
       } else {
         next.push(a || b); // pasa directo (bye)
       }
     }
     t.matches.push(...created);
     if (prev.length === 4 && t.config.podium >= 3 && next[0] && next[0].w && next[1] && next[1].w) {
-      t.matches.push(mkMatch({ phase: 'ko', round: round + 1, ko: 'third', label: 'Tercer lugar', srcH: { l: next[0].w }, srcA: { l: next[1].w } }));
+      t.matches.push(...tie({ phase: 'ko', round: round + 1, ko: 'third', label: 'Tercer lugar', srcH: { l: next[0].w }, srcA: { l: next[1].w } }).list);
     }
     prev = next;
     round++;
@@ -348,32 +429,16 @@ function buildKO(seeds, groupOf, slots) {
   syncKO();
 }
 
-function srcTeam(src, t = T()) {
-  if (!src) return null;
-  if (src.t) return src.t;
-  const m = mById(src.w || src.l, t);
-  return src.w ? winner(m) : loser(m);
-}
+const srcTeam = (src, t = T()) => Rules.srcTeam(t, src);
 function srcLabel(src) {
   if (!src) return 'Por definir';
   if (src.t) return tname(src.t);
   const m = mById(src.w || src.l);
   return (src.w ? 'Ganador ' : 'Perdedor ') + (m ? m.label : '');
 }
-function resetMatch(m) {
-  Object.assign(m, { hs: 0, as: 0, ph: null, pa: null, status: 'pend', elapsed: 0, runAt: null, alerted: false, alertedAdd: false, added: 0, cards: [], goals: [] });
-}
-/** Actualiza los equipos de la llave según los resultados. */
-function syncKO(t = T()) {
-  for (const m of t.matches) {
-    if (m.phase !== 'ko') continue;
-    const h = srcTeam(m.srcH, t), a = srcTeam(m.srcA, t);
-    if (m.home !== h || m.away !== a) {
-      if (m.status !== 'pend') resetMatch(m);
-      m.home = h; m.away = a;
-    }
-  }
-}
+const resetMatch = Rules.resetMatch;
+/** Actualiza los equipos de la llave según los resultados (rules.js; el servidor hace lo mismo). */
+const syncKO = (t = T()) => Rules.syncKO(t);
 
 /* ---------------- Tabla de posiciones ---------------- */
 function standings(ids, phase, group) {
@@ -382,12 +447,13 @@ function standings(ids, phase, group) {
     if (m.phase !== phase || m.group !== group) continue;
     for (const c of m.cards) {
       const r = rows.get(c.team);
-      if (r) { if (c.type === 'Y') r.ta++; else r.tr++; }
+      if (r) { if (c.type === 'Y') r.ta++; else if (c.type === 'R') r.tr++; } // la blanca no cuenta
     }
     if (m.status !== 'done') continue;
     const h = rows.get(m.home), a = rows.get(m.away);
     if (!h || !a) continue;
     h.pj++; a.pj++;
+    if (m.wo === 'both') { h.pp++; a.pp++; continue; } // no se presentó ninguno: ambos pierden
     h.gf += m.hs; h.gc += m.as; a.gf += m.as; a.gc += m.hs;
     if (m.hs > m.as) { h.pg++; a.pp++; h.pts += 3; }
     else if (m.hs < m.as) { a.pg++; h.pp++; a.pts += 3; }
@@ -436,44 +502,37 @@ function decidedBy(x, y) {
 }
 
 /* ============ Suspensiones (roja y amarillas acumuladas) ============ */
-/** Partidos de un equipo en orden de juego. */
-function teamMatches(teamId, t = T()) {
-  const list = t.matches.map((m, i) => ({ m, i })).filter(({ m }) => m.home === teamId || m.away === teamId);
-  // si todos tienen fecha, se usa el orden del calendario; si no, el orden de las jornadas
-  if (list.length && list.every(({ m }) => m.date)) list.sort((a, b) => (a.m.date + (a.m.time || '')).localeCompare(b.m.date + (b.m.time || '')) || a.i - b.i);
-  return list.map((x) => x.m);
-}
-/** Devuelve [{player, reason}] de jugadores suspendidos para este partido y equipo. */
-function suspendedIn(match, teamId) {
-  const c = T().config;
-  const suspRed = c.suspRed ?? 1, yl = c.yellowLimit || 0;
-  const list = teamMatches(teamId);
-  const pos = list.findIndex((m) => m.id === match.id);
-  if (pos <= 0) return [];
-  const out = new Map();
-  const yellows = new Map();
-  for (let p = 0; p < pos; p++) {
-    const m = list[p];
-    const mine = m.cards.filter((cd) => cd.team === teamId);
-    const reds = new Set(mine.filter((cd) => cd.type === 'R').map((cd) => cd.player));
-    for (const pl of reds) if (suspRed > 0 && pos - p <= suspRed) out.set(pl, `Roja vs ${tname(m.home === teamId ? m.away : m.home)}`);
-    if (yl > 0) {
-      for (const cd of mine) {
-        if (cd.type !== 'Y' || reds.has(cd.player)) continue; // la doble amarilla ya cuenta como roja
-        const n = (yellows.get(cd.player) || 0) + 1;
-        yellows.set(cd.player, n);
-        if (n % yl === 0 && pos - p === 1) out.set(cd.player, `${yl} amarillas acumuladas`);
-      }
-    }
-  }
-  return [...out.entries()].map(([player, reason]) => ({ player, reason }));
-}
+// Reglas compartidas con el servidor (rules.js): el árbitro ve y el servidor valida exactamente lo mismo
+const teamMatches = (teamId, t = T()) => Rules.teamMatches(t, teamId);
+const SANC_DEF = Rules.SANC_DEF;
+const sancRules = (c = T().config) => Rules.sancRules(c);
+const sancN = Rules.sancN;
+const sancText = Rules.sancText;
+const cardSanction = Rules.cardSanction;
+const sanctionList = (teamId, t = T()) => Rules.sanctionList(t, teamId);
+const playedBetween = Rules.playedBetween;
+const sancReason = Rules.sancReason;
+/** Jugadores que no pueden jugar este partido: [{pid, player, reason, left}] (ver rules.js). */
+const suspendedIn = (match, teamId, t = T()) => Rules.suspendedIn(t, match, teamId);
 /** Próximo partido pendiente del equipo en el que un jugador está suspendido (para la ficha). */
-function nextSuspension(teamId, player) {
+function nextSuspension(teamId, pid) {
   const next = teamMatches(teamId).find((m) => m.status !== 'done');
   if (!next) return null;
-  const s = suspendedIn(next, teamId).find((x) => x.player === player);
-  return s ? { match: next, reason: s.reason } : null;
+  const s = suspendedIn(next, teamId).find((x) => x.pid === pid);
+  return s ? { match: next, reason: s.reason, left: s.left } : null;
+}
+/** Sanciones que todavía no se terminan de cumplir (para la tabla pública). */
+function activeSanctions(t = T()) {
+  const out = [];
+  for (const tm of t.teams) {
+    const list = teamMatches(tm.id, t);
+    for (const s of sanctionList(tm.id, t)) {
+      if (!s.n) continue;
+      const left = s.n - playedBetween(list, s.from, list.length);
+      if (left > 0) out.push({ ...s, left });
+    }
+  }
+  return out.sort((a, b) => b.left - a.left || a.player.localeCompare(b.player));
 }
 
 /* ============ Goleadores ============ */
@@ -481,8 +540,9 @@ function scorers(t = T()) {
   const map = new Map();
   for (const m of t.matches) for (const g of m.goals || []) {
     if (!g.player || g.own) continue;
-    const k = g.team + '|' + g.player;
-    const r = map.get(k) || { team: g.team, player: g.player, n: 0 };
+    // Por identificador: el jugador dado de baja conserva sus goles y quien entre con su número empieza en 0
+    const k = g.team + '|' + evKey(g);
+    const r = map.get(k) || { team: g.team, pid: evKey(g), player: evName(g), gone: !playerById(g.team, g.pid), n: 0 };
     r.n++; map.set(k, r);
   }
   return [...map.values()].sort((a, b) => b.n - a.n || a.player.localeCompare(b.player));
@@ -492,7 +552,7 @@ function scorersHTML(limit) {
   if (!rows.length) return '<p class="muted">Aún no hay goles con jugador registrado.</p>';
   const list = limit ? rows.slice(0, limit) : rows;
   return `<div class="tbl-wrap"><table><tr><th>#</th><th class="tn">Jugador</th><th class="tn">Equipo</th><th>⚽</th></tr>
-    ${list.map((r, i) => `<tr><td>${i === 0 ? '🥇' : i + 1}</td><td class="tn"><b>${esc(r.player)}</b></td><td class="tn">${miniCrest(r.team)}${esc(tname(r.team))}</td><td class="pts">${r.n}</td></tr>`).join('')}</table></div>`;
+    ${list.map((r, i) => `<tr><td>${i === 0 ? '🥇' : i + 1}</td><td class="tn"><b>${esc(r.player)}</b>${r.gone ? ' <small class="muted">(ya no está en el equipo)</small>' : ''}</td><td class="tn">${miniCrest(r.team)}${esc(tname(r.team))}</td><td class="pts">${r.n}</td></tr>`).join('')}</table></div>`;
 }
 
 /** "Todos contra todos" y "Partidos a elección" comparten tabla, fase final y podio. */
@@ -509,12 +569,12 @@ function podium() {
   const t = T(), c = t.config;
   const ko = t.matches.filter((m) => m.phase === 'ko');
   if (ko.length) {
-    const fin = ko.find((m) => m.ko === 'final');
-    if (!fin || fin.status !== 'done') return null;
-    const p = [winner(fin), loser(fin)];
+    const fin = ko.find((m) => m.ko === 'final' && isDecider(m));
+    if (!fin || fin.status !== 'done' || !tieWinner(fin)) return null;
+    const p = [tieWinner(fin), tieLoser(fin)];
     if (c.podium >= 3) {
-      const th = ko.find((m) => m.ko === 'third');
-      if (th) p.push(winner(th));
+      const th = ko.find((m) => m.ko === 'third' && isDecider(m));
+      if (th) p.push(tieWinner(th));
       else if ((ligaLike(c) || t.groups.length === 1) && t.groups[0]) {
         const tab = standings(t.groups[0].teams, ligaLike(c) ? 'liga' : 'grupo', t.groups[0].name);
         const third = tab.find((r) => !p.includes(r.id));
@@ -561,11 +621,14 @@ function doDraw() {
   const t = T(), c = t.config;
   const n = t.teams.length;
   if (n < 2) return toast('Se necesitan al menos 2 equipos');
-  const short = t.teams.filter((x) => x.players.length < TC().minPlayers);
-  if (short.length) return toast(`Faltan integrantes en: ${short.map((x) => x.name).join(', ')}`);
+  const sz = teamSize(t);
+  const short = t.teams.filter((x) => x.players.length < sz.min);
+  if (short.length) return toast(`Faltan integrantes (mínimo ${sz.min}) en: ${short.map((x) => x.name).join(', ')}`);
+  const over = t.teams.filter((x) => x.players.length > sz.max);
+  if (over.length) return toast(`Pasan del máximo de ${sz.max} jugadores: ${over.map((x) => x.name).join(', ')}`);
   if (c.format === 'grupos' && n < 3) return toast('Para grupos se necesitan al menos 3 equipos');
   if (c.format === 'grupos') {
-    const ng = groupCount(n, c.groupSize);
+    const ng = ngOf(c, n);
     if (ng * c.perGroup < 2) return toast('Deben clasificar al menos 2 equipos: aumente "Clasifican por grupo"');
     if (Math.min(...Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0))) < c.perGroup) return toast('Hay grupos con menos equipos que los que clasifican');
   }
@@ -585,6 +648,7 @@ function doDrawNow() {
   } else if (c.format === 'liga') {
     t.groups = [{ name: '', teams: ids }];
     t.matches = roundRobin(ids, 'liga', '');
+    if (legsOf(c) === 2) t.matches = withSecondLeg(t.matches);
     t.stage = 'fase1';
   } else if (c.format === 'manual') {
     // Partidos a elección: los equipos quedan en una sola tabla y el organizador crea cada partido
@@ -593,12 +657,13 @@ function doDrawNow() {
     t.manualClosed = false;
     t.stage = 'fase1';
   } else {
-    const ng = groupCount(n, c.groupSize);
+    const ng = ngOf(c, n);
     const letters = 'ABCDEFGHIJ';
     t.groups = Array.from({ length: ng }, (_, i) => ({ name: letters[i], teams: [] }));
     ids.forEach((id, i) => t.groups[i % ng].teams.push(id));
     // intercalar partidos de los grupos por fecha
-    const all = t.groups.flatMap((g) => roundRobin(g.teams, 'grupo', g.name));
+    let all = t.groups.flatMap((g) => roundRobin(g.teams, 'grupo', g.name));
+    if (legsOf(c) === 2) all = withSecondLeg(all);
     t.matches = all.sort((a, b) => a.round - b.round);
     t.stage = 'fase1';
   }
@@ -665,7 +730,7 @@ function genFinalNow(seeds) {
   t.stage = 'final';
   t.finalInfo = { at: Date.now(), by: auth ? auth.user : 'local', qualified: seeds, pairing };
   save(); render();
-  const first = t.matches.filter((m) => m.phase === 'ko' && m.round === 1 && m.home && m.away);
+  const first = t.matches.filter((m) => m.phase === 'ko' && m.round === 1 && m.home && m.away && m.tieLeg !== 2);
   toast(`🏁 Fase final generada · ${first.map((m) => tname(m.home) + ' vs ' + tname(m.away)).join(' · ')}`);
 }
 
@@ -721,7 +786,9 @@ function dayLabel(d) {
   return s;
 }
 const shortDate = (d) => new Date(d + 'T12:00').toLocaleDateString('es', { weekday: 'short', day: 'numeric', month: 'short' });
-const phaseLabel = (m) => (m.phase === 'ko' ? m.label : `${m.group ? 'Grupo ' + m.group + ' · ' : ''}Jornada ${m.round}`);
+const legName = (m) => (m.tieLeg === 1 ? 'ida' : m.tieLeg === 2 ? 'vuelta' : '');
+const vueltaName = (m) => (m.leg ? `${m.leg}ª vuelta` : '');
+const phaseLabel = (m) => (m.phase === 'ko' ? m.label + (m.tieLeg ? ' · ' + legName(m) : '') : `${m.group ? 'Grupo ' + m.group + ' · ' : ''}${m.leg ? vueltaName(m) + ' · ' : ''}Jornada ${m.round}`);
 
 function teamRecord(id) {
   const r = { pj: 0, g: 0, e: 0, p: 0, gf: 0, gc: 0 };
@@ -730,7 +797,7 @@ function teamRecord(id) {
     const home = m.home === id;
     r.pj++; r.gf += home ? m.hs : m.as; r.gc += home ? m.as : m.hs;
     const w = winner(m);
-    if (!w) r.e++; else if (w === id) r.g++; else r.p++;
+    if (m.wo === 'both') r.p++; else if (!w) r.e++; else if (w === id) r.g++; else r.p++;
   }
   return r;
 }
@@ -751,7 +818,9 @@ function phaseText() {
   if (pod && pod[0]) return 'Finalizado';
   const ko = t.matches.filter((m) => m.phase === 'ko' && m.status !== 'done');
   if (t.stage === 'final' && ko.length) return ko[0].label.replace(/ \d+$/, '');
-  return t.config.format === 'grupos' ? 'Fase de grupos' : 'Fase regular';
+  const p1 = t.matches.filter((m) => m.phase !== 'ko' && m.status !== 'done');
+  const lg = p1.length && p1[0].leg ? ' · ' + vueltaName(p1.reduce((a, m) => (m.leg < a.leg ? m : a))) : '';
+  return (t.config.format === 'grupos' ? 'Fase de grupos' : 'Fase regular') + lg;
 }
 
 function whenText(m) {
@@ -789,7 +858,7 @@ function resultRow(m) {
   const w = winner(m);
   return `<div class="res" data-a="openMatch" data-id="${m.id}" role="button">
     <div class="t r ${w === m.home ? 'w' : ''}"><span>${esc(tname(m.home))}</span>${miniCrest(m.home)}</div>
-    <div class="s">${m.hs} - ${m.as}${m.ph != null && m.hs === m.as ? `<small> (${m.ph}-${m.pa})</small>` : ''}</div>
+    <div class="s">${m.hs} - ${m.as}${pensShown(m) ? `<small> (pen ${m.ph}-${m.pa})</small>` : ''}</div>
     <div class="t ${w === m.away ? 'w' : ''}">${miniCrest(m.away)}<span>${esc(tname(m.away))}</span></div>
   </div>`;
 }
@@ -829,7 +898,7 @@ function viewInicio() {
   let h = `<section class="hero">
     <div class="hero-chips"><span class="hero-chip solid">${esc(catName(S.cat))}</span><span class="hero-chip">${esc(phaseText())}</span></div>
     <h1>${esc(tor.name)}</h1>
-    <p>${tor.org ? `Organiza: <b>${esc(tor.org)}</b> · ` : ''}${t.teams.length} equipos · ${TC().starters} titulares + ${TC().subs} suplentes</p>
+    <p>${tor.org ? `Organiza: <b>${esc(tor.org)}</b> · ` : ''}${t.teams.length} equipos · de ${teamSize().min} a ${teamSize().max} jugadores por equipo</p>
     ${tor.contact ? `<p style="margin-top:2px">📞 Contacto: ${esc(tor.contact)}</p>` : ''}
     <div class="hero-stats">
       <div><b>${t.teams.length}</b><span>Equipos</span></div>
@@ -839,7 +908,7 @@ function viewInicio() {
     </div>
     ${all.length ? `<div class="progress"><span style="width:${pct}%"></span></div><small>${pct}% del torneo completado</small>` : ''}
   </section>`;
-  if (!adm) h += inscCTA(true);
+  if (!adm) h += inscCTA();
 
   // Campeón
   if (pod && pod[0]) {
@@ -898,20 +967,46 @@ function viewInicio() {
 }
 
 /* Reloj de partidos en vivo y cuentas regresivas (se actualizan cada segundo) */
+/**
+ * Fase del partido en vivo, para que todos la vean: 1er tiempo, Descanso, 2º tiempo, Penales o Final del partido.
+ * (Sin dos tiempos configurados: "En juego".)
+ */
+function livePhase(m) {
+  if (!m || m.status !== 'live') return '';
+  if (inBreak(m)) return 'Descanso';
+  if ((m.shoot || []).length) return 'Penales';
+  const last = periodOf(m) >= halvesOf(m), st = clockState(m);
+  if (last && st.phase === 'over' && !m.runAt) return needsPens(m) ? 'Penales' : 'Final del partido';
+  return halvesOf(m) > 1 ? (periodOf(m) === 1 ? '1er tiempo' : '2º tiempo') : 'En juego';
+}
+/** Texto corto en vivo: "1T 12'", "2T 41'", "Descanso", "Penales 4-3". */
+function liveText(m) {
+  const ph = livePhase(m);
+  if (ph === 'Descanso' || ph === 'Final del partido') return ph;
+  if (ph === 'Penales') return (m.ph != null || (m.shoot || []).length) ? `Penales ${m.ph || 0}-${m.pa || 0}` : 'Penales';
+  return (ph === '1er tiempo' ? '1T ' : ph === '2º tiempo' ? '2T ' : '') + minuteText(m);
+}
 function tickLive() {
   document.querySelectorAll('[data-clock]').forEach((el) => {
     const m = mById(el.dataset.clock);
     if (!m) return;
+    if (inBreak(m)) { el.textContent = '☕ Descanso'; el.classList.remove('over'); return; }
+    if (livePhase(m) === 'Penales') { el.textContent = '🥅 ' + liveText(m); el.classList.remove('over'); return; }
     const st = clockState(m);
-    el.textContent = st.phase === 'reg' ? '⏱ ' + fmtClock(st.ms)
+    const pre = halvesOf(m) > 1 ? (periodOf(m) === 1 ? '1T ' : '2T ') : '';
+    el.textContent = pre + (st.phase === 'reg' ? '⏱ ' + fmtClock(st.ms)
       : st.phase === 'add' ? `⏱ ${m.duration}:00 + ${fmtClock(st.extra)} (agregado +${m.added}')`
-        : `⏱ ${minuteText(m)} · tiempo cumplido`;
+        : `⏱ ${minuteText(m)} · tiempo cumplido`);
     el.classList.toggle('over', st.phase === 'over');
   });
   document.querySelectorAll('[data-cmin]').forEach((el) => {
     const m = mById(el.dataset.cmin);
     if (!m) return;
-    el.textContent = minuteText(m);
+    el.textContent = liveText(m);
+  });
+  document.querySelectorAll('[data-cphase]').forEach((el) => {
+    const m = mById(el.dataset.cphase);
+    if (m) el.textContent = livePhase(m);
   });
   document.querySelectorAll('[data-countdown]').forEach((el) => {
     const diff = new Date(el.dataset.countdown).getTime() - Date.now();
@@ -923,6 +1018,35 @@ function tickLive() {
 }
 setInterval(tickLive, 1000);
 
+/* ---- ¿En qué equipo está? Búsqueda de jugadores, solo para organizadores (nombre, número, equipo y categoría) ---- */
+function findPlayers(q) {
+  const n = norm(q);
+  if (n.length < 3) return [];
+  const words = n.split(' ');
+  const out = [];
+  for (const [ck, c] of Object.entries(CATS_())) {
+    for (const tm of c.teams) for (const p of tm.players) {
+      const pn = norm(p.name);
+      if (words.every((w) => pn.includes(w))) out.push({ ck, c, tm, p });
+    }
+  }
+  return out.sort((a, b) => a.p.name.localeCompare(b.p.name)).slice(0, 25);
+}
+function playerResultsHTML(q) {
+  if (norm(q).length < 3) return '<small class="muted">Escriba al menos 3 letras del nombre o apellido.</small>';
+  const list = findPlayers(q);
+  if (!list.length) return '<p class="muted" style="margin:6px 0 0">No está inscrito en ningún equipo de este torneo.</p>';
+  return `<ul class="cardlist">${list.map(({ ck, c, tm, p }) => `<li><span class="grow"><b>${esc(p.name)}</b>${p.num ? ` <small>#${esc(p.num)}</small>` : ''}<br><small>${esc(tm.name)} · ${esc(c.name)}</small></span>
+    <button class="btn ghost sm" data-a="viewTeamCat" data-c="${esc(ck)}" data-id="${esc(tm.id)}">Ver equipo</button></li>`).join('')}</ul>`;
+}
+function playerSearchHTML() {
+  return `<div class="card" style="margin-top:14px">
+    <h2>🔎 ¿En qué equipo está?</h2>
+    <p class="muted" style="font-size:14px;margin-top:0">Solo organizadores. Busque a un jugador por su nombre para saber en qué equipo y categoría está inscrito (un jugador solo puede estar en un equipo del torneo).</p>
+    <input id="psearch" class="inp" placeholder="Nombre o apellido" autocomplete="off" value="${esc(S.psearch || '')}">
+    <div id="presults" style="margin-top:8px">${S.psearch ? playerResultsHTML(S.psearch) : ''}</div>
+  </div>`;
+}
 function viewEquipos() {
   const t = T(), c = t.config;
   if (!isAdmin()) {
@@ -945,9 +1069,10 @@ function viewEquipos() {
     h += `<div class="note">Sorteo realizado: aún puede editar integrantes y pagos, pero no agregar ni eliminar equipos.</div>`;
   }
   h += inscAdminCard();
+  h += playerSearchHTML();
   if (sync.mode !== 'local') setTimeout(loadInsc, 0);
   if (!t.teams.length) {
-    h += `<div class="empty">Aún no hay equipos inscritos.<br><small>Cuota de inscripción: ${money(c.fee)} · ${TC().starters} titulares + ${TC().subs} suplentes · mínimo ${TC().minPlayers}</small></div>`;
+    h += `<div class="empty">Aún no hay equipos inscritos.<br><small>Cuota de inscripción: ${money(c.fee)} · de ${teamSize().min} a ${teamSize().max} jugadores por equipo</small></div>`;
   }
   for (const tm of t.teams) {
     const owes = num(c.fee) - num(tm.paid);
@@ -977,7 +1102,7 @@ const PAIRING_TEXT = {
 function pairingOf(c) {
   const p = c.koPairing || 'cruzado';
   if (ligaLike(c)) return p === 'sorteo' ? 'sorteo' : 'ranking';
-  if (c.format === 'grupos' && groupCount(T().teams.length, c.groupSize) === 1 && p === 'cruzado') return 'ranking';
+  if (c.format === 'grupos' && ngOf(c, T().teams.length) === 1 && p === 'cruzado') return 'ranking';
   return p;
 }
 
@@ -989,10 +1114,10 @@ function formatPreview() {
   let Q = 0;
   if (c.format === 'grupos') {
     if (n < 3) return '';
-    const ng = groupCount(n, c.groupSize);
+    const ng = ngOf(c, n);
     const sizes = Array.from({ length: ng }, (_, i) => Math.floor(n / ng) + (i < n % ng ? 1 : 0));
-    const gm = sizes.reduce((a, k) => a + (k * (k - 1)) / 2, 0);
-    parts.push(ng === 1 ? `1 grupo de ${n} equipos (${gm} partidos)` : `${ng} grupos de ${sizes.join(', ')} equipos (${gm} partidos de grupos)`);
+    const gm = sizes.reduce((a, k) => a + (k * (k - 1)) / 2, 0) * legsOf(c);
+    parts.push(ng === 1 ? `1 grupo de ${n} equipos (${gm} partidos)` : `${ng} grupos de ${sizes.join(', ')} equipos (${gm} partidos de grupos${legsOf(c) === 2 ? ", a dos vueltas" : ""})`);
     Q = ng * c.perGroup;
     parts.push(`clasifican ${Q} (${c.perGroup === 1 ? 'el 1°' : 'los ' + c.perGroup + ' primeros'}${ng > 1 ? ' de cada grupo' : ''})`);
   } else if (c.format === 'manual') {
@@ -1000,7 +1125,7 @@ function formatPreview() {
     Q = c.ligaFinal;
     if (!Q) return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}. Gana el 1° de la tabla.</div>`;
   } else if (c.format === 'liga') {
-    parts.push(`todos contra todos: ${(n * (n - 1)) / 2} partidos en ${n % 2 ? n : n - 1} jornadas${n % 2 ? ' (cada jornada descansa un equipo)' : ''}`);
+    parts.push(`todos contra todos${legsOf(c) === 2 ? " a dos vueltas" : ""}: ${(n * (n - 1)) / 2 * legsOf(c)} partidos en ${(n % 2 ? n : n - 1) * legsOf(c)} jornadas${n % 2 ? ' (cada jornada descansa un equipo)' : ''}`);
     Q = c.ligaFinal;
     if (!Q) return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}. Gana el 1° de la tabla.</div>`;
   } else {
@@ -1011,11 +1136,14 @@ function formatPreview() {
   let fin = rounds.join(' → ');
   if (byes) fin = fin.replace(rounds[0], `${rounds[0]} (${byes} pase${byes > 1 ? 's' : ''} directo${byes > 1 ? 's' : ''})`);
   if (c.podium >= 3 && Q >= 4) fin += ' + partido por el 3er lugar';
-  parts.push('fase final: ' + fin);
+  parts.push('fase final: ' + fin + (koLegsOf(c) === 2 ? ' (cada cruce a ida y vuelta, solo por puntos; empate en puntos = penales)' : ''));
   if (c.format !== 'elim' && Q >= 4) parts.push('cruces ' + PAIRING_TEXT[pairingOf(c)]);
   return `<div class="note"><b>Así quedará:</b> ${parts.join('; ')}.</div>`;
 }
 
+/** Formato acordado por el comité para el Campeonato Perquín 2026. */
+const COMITE_FORMAT = { format: 'grupos', nGroups: 2, legs: 2, perGroup: 2, koPairing: 'cruzado', koLegs: 2 };
+const isComiteFormat = (c) => Object.entries(COMITE_FORMAT).every(([k, v]) => String(c[k]) === String(v));
 function drawSetupHTML() {
   const t = T(), c = t.config, n = t.teams.length;
   let h = `<h1>Sorteo ${catName(S.cat)}</h1>
@@ -1025,7 +1153,14 @@ function drawSetupHTML() {
     ${optRadio('format', 'grupos', c.format, 'Cuadrangulares (grupos)', 'Se sortean grupos; los mejores pasan a eliminación.')}
     ${optRadio('format', 'elim', c.format, 'Eliminación directa', 'Llave de eliminación desde el inicio.')}
     ${optRadio('format', 'manual', c.format, 'Partidos a elección', 'Ustedes eligen quién juega contra quién (la app sugiere cruces parejos). Tabla por puntos.')}
-    <button class="btn ghost block sm" data-a="openCompare" style="margin:4px 0 6px">🧮 Comparar formatos según la cantidad de equipos</button>`;
+    <button class="btn ghost block sm" data-a="openCompare" style="margin:4px 0 6px">🧮 Comparar formatos según la cantidad de equipos</button>
+    ${isComiteFormat(c) ? '<div class="note">✅ Formato acordado por el comité: 2 grupos a dos vueltas, clasifican 2 por grupo, semifinales cruzadas y final a ida y vuelta por puntos.</div>'
+      : '<button class="btn block sm" data-a="formatComite" style="margin:0 0 6px">📋 Usar formato del comité (2 grupos, dos vueltas, finales ida y vuelta por puntos)</button>'}`;
+  if (c.format === 'liga' || c.format === 'grupos') {
+    h += `<h3>Vueltas</h3>
+      ${optRadio('legs', 1, legsOf(c), 'Una vuelta', 'Cada equipo enfrenta una vez a los de su grupo')}
+      ${optRadio('legs', 2, legsOf(c), 'Dos vueltas (ida y vuelta)', 'Primera y segunda vuelta: se repiten los cruces con local y visitante invertidos')}`;
+  }
   if (ligaLike(c)) {
     h += `<h3>Fase final</h3>
       ${optRadio('ligaFinal', 0, c.ligaFinal, 'Sin fase final', 'Gana el primero de la tabla')}
@@ -1038,20 +1173,28 @@ function drawSetupHTML() {
     }
   }
   if (c.format === 'grupos') {
-    h += `<div class="grid2">
-        <label class="fl">Equipos por grupo<select data-cfg="groupSize">
+    h += `<label class="fl">Cantidad de grupos<select data-cfg="nGroups">
+          ${[0, 2, 3, 4].map((v) => `<option value="${v}" ${Number(c.nGroups || 0) === v ? 'selected' : ''}>${v ? v + ' grupos' : 'Automático (según equipos por grupo)'}</option>`).join('')}
+        </select></label>
+      <div class="grid2">
+        <label class="fl">Equipos por grupo${Number(c.nGroups) > 0 ? ' <small>(no aplica: cantidad fija)</small>' : ''}<select data-cfg="groupSize" ${Number(c.nGroups) > 0 ? 'disabled' : ''}>
           ${[3, 4, 5, 6].map((v) => `<option value="${v}" ${c.groupSize == v ? 'selected' : ''}>${v}${v === 4 ? ' (cuadrangular)' : ''}</option>`).join('')}
         </select></label>
         <label class="fl">Clasifican por grupo<select data-cfg="perGroup">
           ${[1, 2, 3, 4].map((v) => `<option value="${v}" ${c.perGroup == v ? 'selected' : ''}>${v}</option>`).join('')}
         </select></label></div>`;
-    if (n >= 3 && groupCount(n, c.groupSize) * c.perGroup >= 4) {
-      const one = groupCount(n, c.groupSize) === 1;
+    if (n >= 3 && ngOf(c, n) * c.perGroup >= 4) {
+      const one = ngOf(c, n) === 1;
       h += `<h3>Cruces de la fase final</h3>
       ${one ? '' : optRadio('koPairing', 'cruzado', pairingOf(c), 'Cruces fijos', '1° del Grupo A vs 2° del Grupo B, 1° del B vs 2° del A…')}
       ${optRadio('koPairing', 'sorteo', pairingOf(c), 'Por sorteo', one ? 'Se sortea contra quién juegan los mejores ubicados' : 'Se sortea qué 1° juega contra qué 2° (nunca del mismo grupo)')}
       ${optRadio('koPairing', 'ranking', pairingOf(c), 'Por rendimiento', 'Tabla general de clasificados: el mejor contra el peor')}`;
     }
+  }
+  if (c.format === 'elim' || c.format === 'grupos' || (ligaLike(c) && c.ligaFinal > 0)) {
+    h += `<h3>Partidos de la fase final</h3>
+      ${optRadio('koLegs', 1, koLegsOf(c), 'Partido único', 'Gana el partido; si empatan, penales')}
+      ${optRadio('koLegs', 2, koLegsOf(c), 'Ida y vuelta por puntos (liguilla)', 'Semifinales y final a dos partidos. Solo cuentan los puntos (no los goles); si empatan en puntos, penales al final de la vuelta')}`;
   }
   h += formatPreview();
   h += `<h3>Premiación</h3>
@@ -1102,7 +1245,8 @@ function phasesHTML() {
   if (p1.length) {
     h += `<h3>${ligaLike(c) ? 'Fase regular' : 'Fase de grupos'} · ${p1.filter((m) => m.status === 'done').length}/${p1.length}</h3>`;
     for (const r of [...new Set(p1.map((m) => m.round))]) {
-      h += `<div class="day">Jornada ${r}</div>`;
+      const lg = (p1.find((x) => x.round === r) || {}).leg;
+      h += `<div class="day">${lg ? vueltaName({ leg: lg }) + ' · ' : ''}Jornada ${r}</div>`;
       for (const m of p1.filter((x) => x.round === r)) h += matchCard(m);
     }
   }
@@ -1121,9 +1265,11 @@ function phasesHTML() {
 
 function viewPartidos() {
   const t = T(), c = t.config, adm = isAdmin();
+  // Árbitro: sus partidos asignados arriba, en todas las categorías
+  const mine = isRef() ? `<h3>🧑‍⚖️ Mis partidos</h3>${myMatchesHTML()}` : '';
   if (t.stage === 'inscripcion') {
     if (adm) return drawSetupHTML();
-    return `<h1>Partidos ${catName(S.cat)}</h1><div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
+    return `<h1>Partidos ${catName(S.cat)}</h1>${mine}<div class="empty">El sorteo aún no se ha realizado.<br><small>${t.teams.length} equipo(s) inscritos</small></div>`;
   }
   const fmt = { liga: 'Todos contra todos', grupos: 'Cuadrangulares', elim: 'Eliminación directa', manual: 'Partidos a elección' }[c.format];
   const mode = S.view === 'fase' ? 'fase' : 'cal';
@@ -1131,7 +1277,7 @@ function viewPartidos() {
   const done = all.filter((m) => m.status === 'done').length;
   let h = `<h1>Partidos ${catName(S.cat)}</h1>
     <p class="muted">${fmt} · ${done}/${all.length} jugados${adm ? ' · toque un partido para jugarlo' : ''}</p>
-    ${drawInfoHTML(t)}`;
+    ${drawInfoHTML(t)}${mine}`;
   h += `
     <div class="seg2">
       <button data-a="view" data-v="cal" class="${mode === 'cal' ? 'on' : ''}">📅 Calendario</button>
@@ -1265,7 +1411,7 @@ function compareFormats(n, minutes, fields) {
 function compareHTML() {
   const c = T().config;
   const n = modal.n || Math.max(2, T().teams.length || 6);
-  const fields = modal.fields || 1, minutes = (c.duration || 20) + 5;
+  const fields = modal.fields || 1, minutes = matchLength(c) + 5;
   const rows = compareFormats(n, minutes, fields);
   return `<div class="mh"><h2>🧮 Comparar formatos</h2><button class="x" data-a="close">✕</button></div>
   <div class="mb" style="padding-top:10px">
@@ -1273,7 +1419,7 @@ function compareHTML() {
       <label class="fl">Cantidad de equipos<input id="cmp-n" type="number" inputmode="numeric" min="2" max="40" value="${n}"></label>
       <label class="fl">Canchas a la vez<select id="cmp-f" class="inp">${[1, 2, 3].map((v) => `<option ${v === fields ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     </div>
-    <p class="muted" style="font-size:13px">${n % 2 ? `<b>${n} es impar:</b> en todos contra todos un equipo descansa cada jornada; en eliminación hay pases directos.` : `<b>${n} es par:</b> en todos contra todos juegan todos en cada jornada.`} Tiempo estimado con partidos de ${c.duration} min + 5 de cambio.</p>
+    <p class="muted" style="font-size:13px">${n % 2 ? `<b>${n} es impar:</b> en todos contra todos un equipo descansa cada jornada; en eliminación hay pases directos.` : `<b>${n} es par:</b> en todos contra todos juegan todos en cada jornada.`} Tiempo estimado con partidos de ${matchLength(c)} min + 5 de cambio.</p>
     ${rows.map((r) => `<div class="card" style="padding:12px;margin-bottom:8px">
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline"><b>${esc(r.name)}</b><span class="badge b-ok">${r.games} partidos</span></div>
       <div class="muted" style="font-size:13.5px;margin:4px 0">${esc(r.detail)}</div>
@@ -1288,10 +1434,10 @@ function matchCard(m) {
   const side = (id, src, cls) => id
     ? `<div class="${cls} ${done && w === id ? 'win' : ''}">${cls === 'a' ? miniCrest(id) : ''}<span>${esc(tname(id))}</span>${cls === 'h' ? miniCrest(id) : ''}</div>`
     : `<div class="${cls} tbd">${esc(srcLabel(src))}</div>`;
-  const status = done ? (w ? '<span class="badge b-ok">Final</span>' : '<span class="badge b-ok">Empate</span>')
+  const status = done ? (m.wo ? '<span class="badge b-bad">W.O.</span>' : w ? '<span class="badge b-ok">Final</span>' : '<span class="badge b-ok">Empate</span>')
     : m.status === 'live' ? `<span class="badge b-live"><i class="pulse"></i>EN VIVO <span data-cmin="${m.id}"></span></span>`
       : '<span class="badge b-pend">Pendiente</span>';
-  const pens = done && m.ph != null && m.hs === m.as ? `<small>pen ${m.ph}-${m.pa}</small>` : '';
+  const pens = done && pensShown(m) ? `<small>pen ${m.ph}-${m.pa}</small>` : '';
   const yc = m.cards.filter((x) => x.type === 'Y').length, rc = m.cards.filter((x) => x.type === 'R').length;
   const cards = (yc || rc) ? `${yc ? `🟨${yc}` : ''} ${rc ? `🟥${rc}` : ''}` : '';
   const when = [
@@ -1303,8 +1449,17 @@ function matchCard(m) {
     ${side(m.home, m.srcH, 'h')}
     <div class="sc">${m.status === 'pend' ? 'vs' : `${m.hs} - ${m.as}`}${pens}</div>
     ${side(m.away, m.srcA, 'a')}
-    <div class="meta"><span>${when ? `<b>${when}</b> · ` : ''}${esc(phaseLabel(m))}</span><span>${cards} ${status}</span></div>
+    <div class="meta"><span>${when ? `<b>${when}</b> · ` : ''}${esc(phaseLabel(m))}${m.ref && signedIn() && sync.mode !== 'local' ? ' · 🧑‍⚖️ ' + esc(m.ref) : ''}</span><span>${cards} ${status}</span></div>
+    ${seriesNote(m) ? `<div class="meta"><span>${esc(seriesNote(m))}</span></div>` : ''}
   </button>`;
+}
+/** Resumen de la serie de ida y vuelta (en el partido de vuelta): puntos de cada uno y quién avanza. */
+function seriesNote(m) {
+  if (!m.tieOf || m.status === 'pend') return '';
+  const s = seriesPts(m);
+  if (!s) return '';
+  const w = tieWinner(m);
+  return `Serie: ${tname(s.a)} ${s.pa} pts · ${tname(s.b)} ${s.pb} pts${w ? ` → avanza ${tname(w)}${s.pa === s.pb ? ' por penales' : ''}` : s.ida.status !== 'done' ? ' (falta terminar la ida)' : ''}`;
 }
 
 function podiumHTML(p) {
@@ -1344,25 +1499,24 @@ function viewTabla() {
 
   h += `<h3>⚽ Goleadores</h3>` + scorersHTML();
 
-  // Suspendidos para su próximo partido
-  const susp = [];
-  for (const tm of t.teams) for (const p of tm.players) { const s = nextSuspension(tm.id, p.name); if (s) susp.push({ tm, p, s }); }
+  // Sanciones que aún se están cumpliendo
+  const susp = activeSanctions(t);
   if (susp.length) {
-    h += `<h3>⛔ Suspendidos próximo partido</h3><div class="tbl-wrap"><table><tr><th class="tn">Jugador</th><th class="tn">Equipo</th><th class="tn">Motivo</th></tr>
-      ${susp.map(({ tm, p, s }) => `<tr><td class="tn"><b>${esc(p.name)}</b></td><td class="tn">${miniCrest(tm.id)}${esc(tm.name)}</td><td class="tn">${esc(s.reason)}</td></tr>`).join('')}</table></div>`;
+    h += `<h3>⛔ Sanciones vigentes</h3><div class="tbl-wrap"><table><tr><th class="tn">Jugador</th><th class="tn">Equipo</th><th class="tn">Motivo</th><th>Faltan</th></tr>
+      ${susp.map((s) => `<tr><td class="tn"><b>${esc(s.player)}</b></td><td class="tn">${miniCrest(s.team)}${esc(tname(s.team))}</td><td class="tn">${esc(s.why)} vs ${esc(s.vs)}${s.adj ? ` <small>· ajustada por el comité: ${esc(s.adj.reason)}</small>` : ''}${s.extra ? ` <small>· ${esc(s.extra.reason)}</small>` : ''}</td><td>${s.left === Infinity ? 'Todo el torneo' : s.left}</td></tr>`).join('')}</table></div>`;
   }
 
   // Tarjetas por jugador
   const map = new Map();
   for (const m of t.matches) for (const cd of m.cards) {
-    const k = cd.team + '|' + cd.player;
-    const r = map.get(k) || { team: cd.team, player: cd.player, Y: 0, R: 0 };
+    const k = cd.team + '|' + evKey(cd);
+    const r = map.get(k) || { team: cd.team, player: evName(cd), Y: 0, R: 0, W: 0 };
     r[cd.type]++; map.set(k, r);
   }
   const rows = [...map.values()].sort((a, b) => b.R - a.R || b.Y - a.Y);
   h += `<h3>Tarjetas</h3>`;
-  h += rows.length ? `<div class="tbl-wrap"><table><tr><th class="tn">Jugador</th><th class="tn">Equipo</th><th>🟨</th><th>🟥</th></tr>
-    ${rows.map((r) => `<tr><td class="tn">${esc(r.player)}</td><td class="tn">${esc(tname(r.team))}</td><td>${r.Y}</td><td>${r.R}</td></tr>`).join('')}</table></div>`
+  h += rows.length ? `<div class="tbl-wrap"><table><tr><th class="tn">Jugador</th><th class="tn">Equipo</th><th>🟨</th><th>🟥</th><th>⬜</th></tr>
+    ${rows.map((r) => `<tr><td class="tn">${esc(r.player)}</td><td class="tn">${esc(tname(r.team))}</td><td>${r.Y}</td><td>${r.R}</td><td>${r.W}</td></tr>`).join('')}</table></div>`
     : `<p class="muted">Sin tarjetas registradas.</p>`;
   return h;
 }
@@ -1404,13 +1558,8 @@ function torneoCard() {
     <label class="fl">Nombre del torneo<input id="t-name" maxlength="40" value="${esc(tor.name)}" placeholder="Ej: Copa Navidad 2026"></label>
     <label class="fl">Organizado por <small>(ONG, iglesia, comunidad, empresa…)</small><input id="t-org" maxlength="60" value="${esc(tor.org || '')}" placeholder="Ej: Iglesia San José"></label>
     <label class="fl">Contacto para el público <small>(opcional: teléfono, WhatsApp o correo)</small><input id="t-contact" maxlength="60" value="${esc(tor.contact || '')}" placeholder="Ej: 7777-7777"></label>
-    <div class="fl">Tamaño de los equipos <small>(para todas las categorías)</small></div>
-    <div class="grid3b">
-      <label class="fl">Titulares<input type="number" inputmode="numeric" min="1" max="30" data-tcfg="starters" value="${g.starters}"></label>
-      <label class="fl">Suplentes<input type="number" inputmode="numeric" min="0" max="30" data-tcfg="subs" value="${g.subs}"></label>
-      <label class="fl">Mínimo<input type="number" inputmode="numeric" min="1" max="60" data-tcfg="minPlayers" value="${g.minPlayers}"></label>
-    </div>
-    <p class="muted" style="font-size:14px;margin:8px 0 0">Total por equipo: <b>${g.starters + g.subs}</b> integrantes (${g.starters} titulares + ${g.subs} suplentes). Un equipo necesita al menos <b>${g.minPlayers}</b> para inscribirse.</p>
+    <label class="fl">Titulares en cancha <small>(para todas las categorías)</small><input type="number" inputmode="numeric" min="1" max="30" data-tcfg="starters" value="${g.starters}"></label>
+    <p class="muted" style="font-size:14px;margin:8px 0 0">El mínimo y el máximo de jugadores por equipo se configuran en cada categoría, en <b>Inscripción en línea</b> (${esc(catName(S.cat))}: de ${teamSize().min} a ${teamSize().max}). Los demás inscritos aparecen como suplentes.</p>
     <div class="row" style="margin-top:12px">
       <button class="btn ghost sm" data-a="openTorneos">🔁 ${others > 1 ? 'Cambiar de torneo (' + others + ')' : 'Torneos'}</button>
       <button class="btn ghost sm" data-a="newTorneo">＋ Nuevo torneo</button>
@@ -1439,7 +1588,77 @@ function categoriesCard() {
 }
 const catNameTaken = (n, except) => Object.entries(CATS_()).some(([k, t]) => k !== except && norm(t.name) === norm(n));
 
+/** Reglas del día de partido (por categoría): tiempos, descanso, espera, mínimo para iniciar, blanca y W.O. */
+function matchRulesCard(c) {
+  const R = matchRules(c);
+  const sel = (k, vals, fmt) => `<select data-mrule="${k}">${vals.map((v) => `<option value="${v}" ${Number(R[k]) === v ? 'selected' : ''}>${fmt(v)}</option>`).join('')}</select>`;
+  return `<div class="card">
+    <h2>⏱️ Partido · ${esc(catName(S.cat))}</h2>
+    <div class="grid2">
+      <label class="fl">Tiempos${sel('halves', [1, 2], (v) => (v === 1 ? '1 tiempo corrido' : '2 tiempos con descanso'))}</label>
+      <label class="fl">Descanso${sel('breakMin', [3, 5, 10, 15], (v) => `${v} minutos`)}</label>
+      <label class="fl">Espera después de la hora${sel('waitMin', [0, 5, 10, 15, 20, 30], (v) => (v ? `${v} minutos` : 'Sin espera'))}</label>
+      <label class="fl">Mínimo para iniciar${sel('minStart', [1, 2, 3, 4, 5], (v) => `${v} jugadores`)}</label>
+      <label class="fl">Tarjeta blanca${sel('whiteMin', [1, 2, 3, 5], (v) => `${v} minutos fuera`)}</label>
+      <label class="fl">W.O. (no se presentó)${sel('woGoals', [1, 2, 3], (v) => `gana ${v}-0`)}</label>
+    </div>
+    <small>El partido valida la presentación de jugadores, no deja iniciar con menos del mínimo y solo permite declarar W.O. pasada la espera. Un partido ya iniciado conserva sus tiempos.</small>
+    ${matchAgreed(c) ? '' : `<div class="note warn" style="margin-top:8px">⚠️ Acuerdo del comité: ${MATCH_AGREE.halves} tiempos de ${MATCH_AGREE.duration} minutos, descanso de ${MATCH_AGREE.breakMin}, espera de ${MATCH_AGREE.waitMin}, mínimo ${MATCH_AGREE.minStart} jugadores, blanca ${MATCH_AGREE.whiteMin} minutos, W.O. ${MATCH_AGREE.woGoals}-0.
+      <div style="margin-top:8px"><button class="btn sm" data-a="matchAgree">Aplicar el acuerdo del comité</button></div></div>`}
+  </div>`;
+}
+/** Duración total de un partido en minutos (para programar el calendario). */
+const matchLength = (c) => { const R = matchRules(c); return R.halves * c.duration + (R.halves > 1 ? R.breakMin : 0); };
+/** Reglas de sanción (por categoría). Valores por defecto = acuerdo del comité. */
+function sancConfigHTML(c) {
+  const R = sancRules(c);
+  const opts = (k, vals) => `<select data-sanc="${k}">${vals.map((v) => `<option value="${v}" ${String(R[k]) === String(v) ? 'selected' : ''}>${v === 'all' ? 'Todo el torneo' : v === 0 ? (k === 'yl' ? 'No suspenden' : 'Sin suspensión') : k === 'yl' ? `${v} = 1 partido` : sancText(v)}</option>`).join('')}</select>`;
+  const n = [0, 1, 2, 3, 4, 5, 6, 8, 10, 'all'];
+  const changed = Object.keys(SANC_DEF).some((k) => String(R[k]) !== String(SANC_DEF[k]));
+  return `<div class="fl" style="margin-top:6px">Sanciones <small>(partidos de suspensión)</small></div>
+    <div class="grid2">
+      <label class="fl">2 amarillas en un partido${opts('y2', n)}</label>
+      <label class="fl">Amarilla + roja${opts('yr', n)}</label>
+      <label class="fl">Roja directa${opts('r', n)}</label>
+      <label class="fl">Roja con agresión${opts('agg', n)}</label>
+      <label class="fl">Amarillas acumuladas <small>(en distintos partidos)</small>${opts('yl', [0, 2, 3, 4, 5])}</label>
+    </div>
+    ${changed ? `<div class="note warn" style="margin-top:8px">⚠️ Distinto del acuerdo del comité (2 amarillas: 1 · amarilla + roja: 2 · roja: 3 · agresión: todo el torneo · sin acumulación).
+      <div style="margin-top:8px"><button class="btn sm ghost" data-a="sancDefault">Volver al acuerdo del comité</button></div></div>` : ''}`;
+}
+/** Partidos asignados al árbitro (en todas las categorías del torneo). */
+function myMatches() {
+  if (!isRef()) return [];
+  const out = [];
+  for (const [ck, c] of Object.entries(CATS_())) for (const m of c.matches) if (m.ref === auth.user) out.push({ ck, c, m });
+  return out.sort((a, b) => whenKey(a.m).localeCompare(whenKey(b.m)));
+}
+function myMatchesHTML() {
+  const list = myMatches();
+  if (!list.length) return '<div class="empty">Aún no tiene partidos asignados. El organizador los asigna desde cada partido.</div>';
+  return list.map(({ ck, c, m }) => `<button class="mini" data-a="openMyMatch" data-c="${esc(ck)}" data-id="${m.id}" style="width:100%;margin-bottom:6px">
+    <div class="when">${m.date ? esc(shortDate(m.date)) : 'Fecha por definir'}${m.time ? ' · ' + m.time : ''}${m.field ? ' · Cancha ' + esc(m.field) : ''} · <b>${esc(c.name)}</b></div>
+    <div class="tm"><span>${esc(Rules.tname(c, m.home))}</span></div><div class="tm"><span>${esc(Rules.tname(c, m.away))}</span></div>
+    <div class="ph">${m.status === 'done' ? `✅ Finalizado ${m.hs}-${m.as}` : m.status === 'live' ? '🔴 En juego' : '⏳ Pendiente'}</div>
+  </button>`).join('');
+}
+/** Ajustes de un árbitro: su sesión y sus partidos (no puede cambiar nada del torneo). */
+function refSettingsHTML() {
+  return `<h1>Árbitro</h1>
+  <div class="card">
+    <h2>Sesión</h2>
+    <p style="margin:6px 0 10px">🧑‍⚖️ Usuario: <b>${esc(auth.user)}</b> · árbitro</p>
+    <p class="muted" style="font-size:14px">Puede anotar marcador, goles, tarjetas, presentación de jugadores, tiempos y W.O. solo en los partidos que le asignen. Un partido finalizado lo corrige un organizador.</p>
+    <div class="row">
+      <button class="btn ghost sm" data-a="changePass">Cambiar contraseña</button>
+      <button class="btn danger sm" data-a="logout">Cerrar sesión</button>
+    </div>
+  </div>
+  <h3>🧑‍⚖️ Mis partidos</h3>
+  ${myMatchesHTML()}`;
+}
 function viewAjustes() {
+  if (isRef()) return refSettingsHTML();
   if (!isAdmin()) return loginHTML();
   const c = T().config;
   const online = sync.mode !== 'local';
@@ -1454,12 +1673,13 @@ function viewAjustes() {
   </div>
   <div class="card">
     <h2>Usuarios con acceso</h2>
-    <p class="muted" style="font-size:14px">Personas que pueden ingresar para inscribir, sortear y anotar resultados. El público solo ve.</p>
-    <div id="orgList">${orgs ? orgs.users.map((u) => `<div class="org"><span>👤 ${esc(u)}${u === orgs.me ? ' <small>(usted)</small>' : ''}</span>
-      ${u === orgs.me ? '' : `<button class="btn danger sm" data-a="delOrg" data-u="${esc(u)}">Quitar</button>`}</div>`).join('') : '<p class="muted">Cargando…</p>'}</div>
+    <p class="muted" style="font-size:14px"><b>Organizador:</b> inscribe, sortea, programa y anota todo. <b>Árbitro:</b> solo anota marcador, tarjetas, presentación, tiempos y W.O. en los partidos que se le asignen. El público solo ve.</p>
+    <div id="orgList">${orgs ? orgs.users.map((u) => { const r = roleName(u); return `<div class="org"><span>${r === 'arbitro' ? '🧑‍⚖️' : '👤'} ${esc(u)} <span class="badge ${r === 'arbitro' ? 'b-warn' : 'b-ok'}">${r === 'arbitro' ? 'Árbitro' : 'Organizador'}</span>${u === orgs.me ? ' <small>(usted)</small>' : ''}</span>
+      ${u === orgs.me ? '' : `<span class="row" style="flex-wrap:nowrap"><button class="btn ghost sm" data-a="orgRole" data-u="${esc(u)}" data-r="${r === 'arbitro' ? 'admin' : 'arbitro'}">${r === 'arbitro' ? 'Hacer organizador' : 'Hacer árbitro'}</button><button class="btn danger sm" data-a="delOrg" data-u="${esc(u)}">Quitar</button></span>`}</div>`; }).join('') : '<p class="muted">Cargando…</p>'}</div>
     <form id="orgForm" class="grid2" style="margin-top:8px" autocomplete="off">
       <input id="o-user" placeholder="Nuevo usuario" autocapitalize="none" spellcheck="false" autocomplete="off">
       <input id="o-pass" type="password" placeholder="Contraseña" autocomplete="new-password">
+      <select id="o-role" style="grid-column:1/3"><option value="admin">Organizador (todo)</option><option value="arbitro">Árbitro (solo sus partidos)</option></select>
       <button class="btn sm" type="submit" style="grid-column:1/3">＋ Agregar usuario</button>
     </form>
   </div>` : ''}
@@ -1470,26 +1690,20 @@ function viewAjustes() {
     <h2>Inscripción · ${esc(catName(S.cat))}</h2>
     <div class="grid2">
       <label class="fl">Cuota de inscripción<input type="number" inputmode="decimal" min="0" data-cfg="fee" value="${c.fee}"></label>
-      <label class="fl">Minutos por partido<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
+      <label class="fl">${matchRules(c).halves > 1 ? 'Minutos por tiempo' : 'Minutos por partido'}<input type="number" inputmode="numeric" min="1" data-cfg="duration" value="${c.duration}"></label>
     </div>
     <small>Estos ajustes son solo para la categoría ${catName(S.cat)}.</small>
   </div>
-  ${online ? inscConfigCard() : ''}
+  ${matchRulesCard(c)}
+  ${inscConfigCard(online)}
   <div class="card">
     <h2>Reglas · ${esc(catName(S.cat))}</h2>
     <label class="fl">Desempate cuando hay igualdad de puntos<select data-cfg="tiebreak">
       <option value="h2h" ${(c.tiebreak || 'h2h') === 'h2h' ? 'selected' : ''}>1° Enfrentamiento directo, 2° diferencia de goles</option>
       <option value="dg" ${c.tiebreak === 'dg' ? 'selected' : ''}>1° Diferencia de goles, 2° goles a favor</option>
     </select></label>
-    <div class="grid2">
-      <label class="fl">Suspensión por roja<select data-cfg="suspRed">
-        ${[0, 1, 2, 3].map((v) => `<option value="${v}" ${(c.suspRed ?? 1) === v ? 'selected' : ''}>${v === 0 ? 'Sin suspensión' : v + ' partido' + (v > 1 ? 's' : '')}</option>`).join('')}
-      </select></label>
-      <label class="fl">Amarillas acumuladas<select data-cfg="yellowLimit">
-        ${[0, 2, 3, 4, 5].map((v) => `<option value="${v}" ${(c.yellowLimit || 0) === v ? 'selected' : ''}>${v === 0 ? 'No suspenden' : v + ' = 1 partido'}</option>`).join('')}
-      </select></label>
-    </div>
-    <small>Doble amarilla en un partido = roja automática. Luego: puntos → ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</small>
+    ${sancConfigHTML(c)}
+    <small>Doble amarilla en un partido = roja automática. La tarjeta blanca no suspende. Las suspensiones se cumplen con los partidos que el equipo juega. Desempate: puntos → ${(c.tiebreak || 'h2h') === 'h2h' ? 'enfrentamiento directo → diferencia de goles' : 'diferencia de goles'} → goles a favor → menos tarjetas.</small>
   </div>
   ${online ? `<div class="card">
     <h2>🕘 Historial y restauración</h2>
@@ -1608,15 +1822,15 @@ function teamViewHTML(id) {
     ${ms.length ? ms.map(matchCard).join('') : '<p class="muted">Aún no tiene partidos asignados.</p>'}
     ${[['Titulares', tm.players.filter((p) => !p.sub)], ['Suplentes', tm.players.filter((p) => p.sub)]].filter(([, l]) => l.length).map(([title, list]) => `
     <h3>${title} (${list.length})</h3>
-    <ul class="cardlist">${list.map((p) => { const g = scorers().find((x) => x.team === id && x.player === p.name); const su = nextSuspension(id, p.name);
-      return `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${su ? ` <span class="badge b-bad">⛔ Suspendido</span>` : ''}</span>${g ? `<small>⚽ ${g.n}</small>` : ''}</li>`; }).join('')}</ul>`).join('')}
+    <ul class="cardlist">${list.map((p) => { const g = scorers().find((x) => x.team === id && x.pid === p.id); const su = nextSuspension(id, p.id);
+      return `<li><span class="grow">${p.num ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${p.cap ? ' <b title="Capitán">(C)</b>' : ''}${su ? ` <span class="badge b-bad">⛔ Suspendido</span>` : ''}</span>${g ? `<small>⚽ ${g.n}</small>` : ''}</li>`; }).join('')}</ul>`).join('')}
   </div>`;
 }
 
 /* ---- Programar calendario ---- */
 function scheduleHTML() {
   const c = T().config;
-  const s = Object.assign({ mode: 'dia', date: isoDate(new Date()), time: '08:00', fields: 1, gap: c.duration + 5, scope: 'sin' }, c.sched || {});
+  const s = Object.assign({ mode: 'dia', date: isoDate(new Date()), time: '08:00', fields: 1, gap: matchLength(c) + 5, scope: 'sin' }, c.sched || {});
   const opt = (v, title, desc) => `<label class="opt ${s.mode === v ? 'on' : ''}"><input type="radio" name="s-mode" value="${v}" ${s.mode === v ? 'checked' : ''}>
     <div><b>${title}</b><span>${desc}</span></div></label>`;
   return `<div class="mh"><h2>Programar calendario</h2><button class="x" data-a="close">✕</button></div>
@@ -1637,7 +1851,7 @@ function scheduleHTML() {
       <option value="sin" ${s.scope === 'sin' ? 'selected' : ''}>Solo partidos pendientes sin fecha</option>
       <option value="pend" ${s.scope === 'pend' ? 'selected' : ''}>Todos los partidos pendientes (reprogramar)</option>
     </select></label>
-    <small>“Minutos entre partidos” = duración del partido + descanso (por defecto ${c.duration} + 5).</small>
+    <small>“Minutos entre partidos” = duración del partido + cambio de cancha (por defecto ${matchLength(c)} + 5${matchRules(c).halves > 1 ? ', con los 2 tiempos y el descanso' : ''}).</small>
   </div>
   <div class="mf">
     <button class="btn block" data-a="applySchedule">🗓️ Programar</button>
@@ -1665,7 +1879,7 @@ function applySchedule() {
   const s = {
     mode, date: $('#s-date').value, time: $('#s-time').value || '08:00',
     fields: Math.max(1, parseInt($('#s-fields').value, 10) || 1),
-    gap: Math.max(5, parseInt($('#s-gap').value, 10) || t.config.duration + 5),
+    gap: Math.max(5, parseInt($('#s-gap').value, 10) || matchLength(t.config) + 5),
     scope: $('#s-scope').value,
   };
   if (!s.date) return toast('Elija la fecha de inicio');
@@ -1673,7 +1887,8 @@ function applySchedule() {
   if (!target.length) return toast('No hay partidos pendientes para programar');
 
   // Agrupar en jornadas, en orden: fase 1 por jornada, luego cada ronda de la fase final
-  const jKey = (m) => (m.phase === 'ko' ? 1000 + m.round : m.round);
+  // la ida y la vuelta de una serie quedan en jornadas distintas
+  const jKey = (m) => (m.phase === 'ko' ? 1000 + m.round * 2 + (m.tieLeg === 2 ? 1 : 0) : m.round);
   const keys = [...new Set(target.map(jKey))].sort((a, b) => a - b);
   let slot = 0;
   keys.forEach((k, j) => {
@@ -1698,18 +1913,19 @@ function applySchedule() {
 }
 
 function teamFormHTML(id) {
-  const t = T(), c = t.config, g = TC();
+  const t = T(), c = t.config, g = teamSize(t);
   const tm = id ? teamById(id) : null;
   const players = tm ? tm.players : [];
   const tit = players.filter((p) => !p.sub), sup = players.filter((p) => p.sub);
-  const nTit = Math.max(g.starters, tit.length), nSup = Math.max(g.subs, sup.length);
+  const nTit = Math.max(g.starters, tit.length), nSup = Math.max(g.max - nTit, sup.length, 0);
   if (modal.crest === undefined) modal.crest = tm ? (tm.crest || null) : randomCrest();
   let n = 0;
   const row = (p, sub, req) => {
     n++;
-    return `<div class="prow" data-sub="${sub ? 1 : 0}"><span class="pn">${n}</span>
+    return `<div class="prow prow-cap" data-sub="${sub ? 1 : 0}" data-pid="${esc(p.id || '')}"><span class="pn">${n}</span>
       <input class="pl-name" data-pl autocomplete="off" placeholder="Nombre y apellido${req ? ' *' : ''}" value="${esc(p.name || '')}">
       <input class="pl-num" type="number" inputmode="numeric" placeholder="N°" value="${esc(p.num ?? '')}">
+      <label class="pcap" title="Capitán del equipo"><input type="radio" name="f-cap" class="pl-cap" ${p.cap ? 'checked' : ''}> C</label>
       <div class="perr"></div></div>`;
   };
   let h = `<div class="mh"><h2>${tm ? 'Editar equipo' : 'Inscribir equipo'}</h2><button class="x" data-a="close">✕</button></div>
@@ -1719,9 +1935,9 @@ function teamFormHTML(id) {
     <div class="fl">Integrantes <small id="f-count"></small></div>
     <div id="f-players">
       <div class="psec">Titulares <small>(${g.starters})</small></div>`;
-  for (let i = 0; i < nTit; i++) h += row(tit[i] || {}, false, i < g.minPlayers);
+  for (let i = 0; i < nTit; i++) h += row(tit[i] || {}, false, i < g.min);
   if (nSup > 0) h += `<div class="psec">Suplentes <small>(${g.subs})</small></div>`;
-  for (let i = 0; i < nSup; i++) h += row(sup[i] || {}, true, nTit + i < g.minPlayers);
+  for (let i = 0; i < nSup; i++) h += row(sup[i] || {}, true, nTit + i < g.min);
   h += `</div>
     <label class="fl">Monto de inscripción pagado ${num(c.fee) > 0 ? `<small>(cuota ${money(c.fee)})</small>` : ''}
       <input id="f-paid" type="number" inputmode="decimal" min="0" placeholder="0" value="${esc(tm ? tm.paid : '')}"></label>
@@ -1792,6 +2008,7 @@ function checkPlayers() {
         // Puede ser otra persona con el mismo nombre: el organizador decide al guardar
         if (banOf(n)) warn = `⚠️ Mismo nombre que un jugador dado de baja de ${banOf(n).team} (intransferible). ¿Es otra persona?`;
         else if (idx.has(n)) warn = `⚠️ Mismo nombre que un jugador de ${idx.get(n)}. ¿Es otra persona?`;
+        else { const sim = [...idx.keys()].find((k) => Rules.similarNames(n, k)); if (sim) warn = `⚠️ Nombre parecido a un jugador de ${idx.get(sim)}. ¿Es otra persona?`; }
       }
     }
     row.classList.toggle('bad', !!msg);
@@ -1800,15 +2017,15 @@ function checkPlayers() {
     if (msg) errors++;
     if (warn) checkPlayers.warns++;
   });
-  const g = TC();
+  const g = teamSize();
   const cnt = $('#f-count');
-  if (cnt) cnt.textContent = `(${filled} de ${g.starters + g.subs} · mínimo ${g.minPlayers} para participar)`;
+  if (cnt) { cnt.textContent = `(${filled} de ${g.max} · mínimo ${g.min} para participar)`; cnt.style.color = filled > g.max ? 'var(--bad)' : ''; }
   updateCrestUI();
   return errors;
 }
 
 async function saveTeam() {
-  const t = T(), g = TC();
+  const t = T(), g = teamSize(t);
   const id = modal.id;
   const name = $('#f-name').value.trim().replace(/\s+/g, ' ');
   if (!name) return toast('Escriba el nombre del equipo');
@@ -1819,29 +2036,36 @@ async function saveTeam() {
   document.querySelectorAll('#f-players .prow').forEach((row) => {
     const pn = row.querySelector('.pl-name').value.trim().replace(/\s+/g, ' ');
     const nb = row.querySelector('.pl-num').value.trim();
-    if (pn) players.push({ name: pn, num: nb, sub: row.dataset.sub === '1' });
+    const cap = row.querySelector('.pl-cap');
+    if (pn) players.push({ name: pn, num: nb, sub: row.dataset.sub === '1', rowPid: row.dataset.pid || '', ...(cap && cap.checked ? { cap: true } : {}) });
   });
-  const nTit = players.filter((p) => !p.sub).length, nSup = players.length - nTit;
-  if (t.config.insc) {
-    const ic = inscOf(t);
-    if (players.length < ic.min) return toast(`En ${catName(S.cat)} se requieren al menos ${ic.min} jugadores (hay ${players.length})`);
-    if (players.length > ic.max) return toast(`En ${catName(S.cat)} el máximo es de ${ic.max} jugadores (hay ${players.length})`);
-  }
-  if (players.length < g.minPlayers) return toast(`Para participar se requieren al menos ${g.minPlayers} integrantes (hay ${players.length})`);
-  if (nTit > g.starters) return toast(`Máximo ${g.starters} titulares`);
-  if (nSup > g.subs) return toast(`Máximo ${g.subs} suplentes`);
+  if (players.length < g.min) return toast(`En ${catName(S.cat)} se requieren al menos ${g.min} jugadores (hay ${players.length})`);
+  if (players.length > g.max) return toast(`En ${catName(S.cat)} el máximo es de ${g.max} jugadores (hay ${players.length})`);
   const paid = num($('#f-paid').value);
   const crest = modal.crest || null;
   if (checkPlayers.warns && !(await ask(`${checkPlayers.warns} integrante(s) tienen el mismo nombre que un jugador de otro equipo o dado de baja (marcados en amarillo).\n\n¿Confirma que son personas distintas?`, { title: '⚠️ Nombres repetidos', ok: 'Sí, son distintas' }))) return;
-  // Equipo que vino de la inscripción en línea: el cambio se copia también a la inscripción del capitán
   const tm0 = id ? teamById(id) : null;
-  if (tm0 && tm0.insc && sync.mode !== 'local') {
+  const teamId = id || uid();
+  // Identificadores: mismo nombre = mismo jugador. Si en una fila se cambió el nombre, hay que saber si es
+  // una corrección (conserva goles, tarjetas y suspensiones) o es otro jugador (empieza de cero).
+  const renamed = matchPlayerIds(players, tm0 ? tm0.players : []);
+  let keepRenamed = false;
+  const online = tm0 && tm0.insc && sync.mode !== 'local';
+  if (renamed.length && !online) {
+    const how = await askChoice(`Cambió el nombre en: ${renamed.map((p) => `${p.oldName} → ${p.name}`).join(', ')}.\n\n¿Es la misma persona con el nombre corregido o es otro jugador?`,
+      [{ key: 'C', label: '✏️ Misma persona (conserva goles y tarjetas)', value: 'fix', style: 'ghost' }, { key: 'N', label: '🆕 Otro jugador (empieza de cero)', value: 'new' }], { title: 'Nombres cambiados' });
+    if (!how) return;
+    keepRenamed = how === 'fix';
+  }
+  // Equipo que vino de la inscripción en línea: el cambio se copia también a la inscripción del capitán
+  if (online) {
     const removed = tm0.players.filter((p) => !players.some((x) => norm(x.name) === norm(p.name))).map((p) => p.name);
     let baja;
     if (removed.length) {
       const how = await askChoice(`Quitó a: ${removed.join(', ')}.\n\n¿Es una baja (el jugador queda intransferible y no podrá jugar en otro equipo) o solo una corrección de un nombre mal escrito?`,
         [{ key: 'B', label: '➖ Es una baja', value: 'baja', style: 'danger' }, { key: 'C', label: '✏️ Solo corrección', value: 'fix', style: 'ghost' }], { title: 'Jugadores quitados' });
       if (!how) return;
+      keepRenamed = how === 'fix'; // corrección de nombre: la misma persona conserva sus goles y tarjetas
       if (how === 'baja') {
         const r = await askText('Motivo de la baja (obligatorio, lo verá el capitán):', { title: 'Motivo de la baja' });
         if (r == null) return;
@@ -1850,18 +2074,30 @@ async function saveTeam() {
       }
     }
     try {
-      const { status, j } = await admInsc({ action: 'adminSync', id: tm0.insc, name, crest, players: players.map((p) => ({ name: p.name, num: p.num })), baja });
+      const { status, j } = await admInsc({ action: 'adminSync', id: tm0.insc, name, crest, players: players.map((p) => ({ name: p.name, num: p.num, ...(p.cap ? { cap: true } : {}) })), baja });
       if (status === 401) return sessionExpired();
       if (status !== 200) return toast(j.error || 'No se pudo actualizar la inscripción del capitán');
       replaceReg(j.reg);
       if (baja) loadInsc(true);
     } catch (e) { return toast('Sin conexión: este equipo viene de la inscripción en línea y se necesita internet para editarlo'); }
   }
+  if (!id && t.stage !== 'inscripcion') return toast('El sorteo ya se realizó');
+  // Acuerdo: altas solo durante la primera vuelta. El organizador puede hacerlo después, pero confirmando.
+  const added = players.filter((p) => !p.id && !(keepRenamed && renamed.includes(p)));
+  if (tm0 && added.length && !Rules.inscWindows(Object.assign({}, inscOf(t), { open: true, from: 0 }), t, serverNow()).chOpen
+    && !(await ask(`Terminó la primera vuelta: según el reglamento ya no se inscriben jugadores.\n\nAltas: ${added.map((p) => p.name).join(', ')}\n\n¿Las autorizó el comité?`, { title: '⚠️ Fuera de plazo', ok: 'Sí, autorizado' }))) return;
+  if (keepRenamed) {
+    renamed.forEach((p) => { p.id = p.rowPid; });
+    // El nombre guardado en sus goles y tarjetas también se corrige (se ve así aunque luego salga del equipo)
+    const fixed = new Map(renamed.map((p) => [p.id, p.name]));
+    for (const m of t.matches) for (const ev of [...(m.goals || []), ...(m.cards || [])]) if (ev.team === teamId && fixed.has(ev.pid)) ev.player = fixed.get(ev.pid);
+  }
+  assignPlayerIds(teamId, players, tm0 ? tm0.players : []);
+  players.forEach((p) => { delete p.rowPid; delete p.oldName; });
   if (id) {
     Object.assign(teamById(id), { name, players, paid, crest });
   } else {
-    if (t.stage !== 'inscripcion') return toast('El sorteo ya se realizó');
-    t.teams.push({ id: uid(), name, players, paid, crest, createdAt: Date.now() });
+    t.teams.push({ id: teamId, name, players, paid, crest, createdAt: Date.now() });
   }
   save(); closeModal(); render();
   toast(id ? 'Equipo actualizado' : `✅ ${name} inscrito`);
@@ -1869,6 +2105,44 @@ async function saveTeam() {
 
 /* ---- partido ---- */
 const elapsedMs = (m) => m.elapsed + (m.runAt ? Date.now() - m.runAt : 0);
+
+/* ---- Hora del servidor: la espera de 15 minutos no depende del reloj de cada teléfono ---- */
+function noteServerTime(r) {
+  const d = r && r.headers && Date.parse(r.headers.get('Date') || '');
+  if (d && !isNaN(d)) sync.skew = d - Date.now();
+}
+const serverNow = () => Date.now() + (sync.skew || 0);
+
+/* ---- Reglas del día de partido (por categoría). Acuerdo del comité: 2 tiempos de 30, descanso de 5,
+   espera de 15 minutos, mínimo 3 jugadores para iniciar, blanca = 2 minutos fuera, W.O. 2-0. ---- */
+const MATCH_AGREE = { halves: 2, duration: 30, breakMin: 5, waitMin: 15, minStart: 3, whiteMin: 2, woGoals: 2 };
+/** Reglas del partido de la categoría (rules.js, compartidas con el servidor). */
+const matchRules = (c = T().config) => Rules.matchRules(c);
+const matchAgreed = (c = T().config) => { const r = matchRules(c); return Object.keys(MATCH_AGREE).every((k) => Number(r[k]) === MATCH_AGREE[k]); };
+const halvesOf = (m) => m.halves || 1;
+const periodOf = (m) => m.period || 1;
+const inBreak = (m) => !!m.breakAt;
+/** Tiempo jugado en total (1er tiempo + lo que va del 2º): sirve para la tarjeta blanca. */
+const playMs = (m) => (periodOf(m) === 2 && m.h1 ? m.h1.elapsed : 0) + elapsedMs(m);
+/** Minuto del partido para goles y tarjetas (en el 2º tiempo sigue contando: 31', 32'…). */
+const matchMinute = (m) => (periodOf(m) === 2 ? m.duration : 0) + Math.floor(elapsedMs(m) / 60000) + 1;
+/** Hora programada, en la hora de El Salvador (rules.js: igual en el teléfono y en el servidor). */
+const schedAt = Rules.schedAt;
+/** Jugadores presentes de un equipo (null = aún no se pasó lista). */
+const presentOf = Rules.presentOf;
+/** Jugadores que están fuera por tarjeta blanca en este momento. */
+const whiteOut = (m, tid) => (m.status !== 'live' ? [] : (m.cards || [])
+  .filter((c) => c.type === 'W' && (!tid || c.team === tid) && c.wAt != null)
+  .map((c) => Object.assign({}, c, { left: c.wAt + c.wMs - playMs(m) })).filter((c) => c.left > 0));
+/** ¿Puede este jugador anotar? Devuelve el motivo si no puede. */
+function cantPlay(m, tid, pid) {
+  const p = playerById(tid, pid);
+  if (suspendedIn(m, tid).some((x) => x.pid === pid)) return `${p ? p.name : 'El jugador'} está suspendido y no puede jugar este partido`;
+  const pr = presentOf(m, tid);
+  if (pr && !pr.includes(pid)) return `${p ? p.name : 'El jugador'} no está marcado como presente (márquelo en la presentación si llegó)`;
+  if (whiteOut(m, tid).some((c) => c.pid === pid)) return `${p ? p.name : 'El jugador'} está fuera por tarjeta blanca`;
+  return '';
+}
 const fmtClock = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
 
 /** Estado del reloj: normal, en tiempo agregado o tiempo cumplido. */
@@ -1878,34 +2152,55 @@ function clockState(m) {
   if (add && ms < reg + add) return { phase: 'add', ms, extra: ms - reg };
   return { phase: 'over', ms, extra: ms - reg };
 }
-/** Minuto para mostrar: 13', 20+2', 20'+ */
+/** Minuto para mostrar: 13', 20+2', 20'+ (en el 2º tiempo continúa: 31', 60+2'). En el descanso: "Descanso". */
 function minuteText(m) {
-  const st = clockState(m), d = m.duration;
-  if (st.phase === 'reg') return Math.floor(st.ms / 60000) + 1 + "'";
+  if (inBreak(m)) return 'Descanso';
+  const st = clockState(m), base = (periodOf(m) - 1) * m.duration, d = base + m.duration;
+  if (st.phase === 'reg') return base + Math.floor(st.ms / 60000) + 1 + "'";
   if (st.phase === 'add') return `${d}+${Math.floor(st.extra / 60000) + 1}'`;
   return m.added ? `${d}+${m.added}'` : d + "'+";
 }
+const periodName = (m) => (halvesOf(m) < 2 ? '' : periodOf(m) === 1 ? '1er tiempo' : '2º tiempo');
+const breakLeft = (m) => (m.breakMin || 5) * 60000 - (Date.now() - m.breakAt);
 
 function updateClock() {
   if (!modal || modal.type !== 'match') return;
   const m = mById(modal.id);
+  // Cuenta regresiva de las tarjetas blancas (2 minutos de juego fuera)
+  document.querySelectorAll('[data-wcd]').forEach((x) => {
+    const c = m && (m.cards || []).find((cd) => cd.id === x.dataset.wcd);
+    const left = c ? c.wAt + c.wMs - playMs(m) : 0;
+    x.textContent = left > 0 ? fmtClock(left + 999) : 'puede volver';
+    if (left <= 0 && x.dataset.done !== '1') { x.dataset.done = '1'; if (m.runAt) { toast(`⬜ ${evName(c)} puede volver a la cancha`); renderModal(); } }
+  });
+  // Terminó la espera reglamentaria: se habilita el botón de W.O.
+  const wb = document.querySelector('[data-a="wo"][disabled]');
+  if (wb && serverNow() >= Number(wb.dataset.woAt)) return renderModal();
   const el = $('#clock');
   if (!m || !el) return;
+  const lab = $('#clock-lab');
+  if (inBreak(m)) {
+    const left = breakLeft(m);
+    el.textContent = left > 0 ? fmtClock(left + 999) : '00:00';
+    el.classList.toggle('over', left <= 0);
+    if (lab) lab.textContent = left > 0 ? 'Descanso' : `Terminó el descanso (${m.breakMin || 5} min)`;
+    return;
+  }
   const st = clockState(m);
   el.textContent = fmtClock(st.ms);
   el.classList.toggle('add', st.phase === 'add');
   el.classList.toggle('over', st.phase === 'over');
-  const lab = $('#clock-lab');
+  const pn = periodName(m) ? periodName(m) + ' · ' : '';
   if (lab) {
-    lab.textContent = st.phase === 'add' ? `Tiempo agregado · ${minuteText(m)}`
+    lab.textContent = pn + (st.phase === 'add' ? `Tiempo agregado · ${minuteText(m)}`
       : st.phase === 'over' ? (m.added ? `Terminó el tiempo agregado (+${m.added}')` : 'Tiempo cumplido')
-        : m.runAt ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar';
+        : m.runAt ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar');
   }
-  if (!m.runAt || !isAdmin()) return;
+  if (!m.runAt || !canEditMatch(m)) return; // avisos de tiempo: organizador o árbitro del partido
   if (st.ms >= m.duration * 60000 && !m.alerted) {
     m.alerted = true; save();
     if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 600]);
-    toast(`⏰ Se cumplieron los ${m.duration} minutos${m.added ? ` · +${m.added}' de agregado` : ' · ¿agregar tiempo?'}`);
+    toast(`⏰ Se cumplieron los ${m.duration} minutos${pn ? ' del ' + periodName(m) : ''}${m.added ? ` · +${m.added}' de agregado` : ' · ¿agregar tiempo?'}`);
   }
   if (m.added && st.phase === 'over' && !m.alertedAdd) {
     m.alertedAdd = true; save();
@@ -1914,11 +2209,81 @@ function updateClock() {
   }
 }
 
+/** Sanciones que salen de este partido (por tarjetas y del comité), con ajuste del comité para organizadores. */
+function matchSanctionsHTML(m, adm) {
+  const list = [m.home, m.away].flatMap((tid) => sanctionList(tid).filter((s) => s.matchId === m.id));
+  if (!list.length && !adm) return '';
+  let h = `<h3>⚖️ Sanciones de este partido</h3>`;
+  h += list.length ? `<ul class="cardlist">${list.map((s) => `<li><span class="grow"><b>${esc(s.player)}</b> <small>${esc(tname(s.team))}</small><br>
+      <small>${esc(s.why)}${s.kind === 'comite' ? ': ' + esc(s.extra.reason) : ''} → <b>${esc(sancText(s.n))}</b>${s.adj ? ` (regla: ${esc(sancText(s.base))} · ajustada por ${esc(s.adj.by)}: ${esc(s.adj.reason)})` : ''}</small></span>
+      ${adm && s.kind === 'card' ? `<button class="btn ghost sm" data-a="sancAdj" data-team="${esc(s.team)}" data-pid="${esc(s.pid)}">Ajustar</button>` : ''}
+      ${adm && s.kind === 'comite' ? `<button data-a="sancDel" data-id="${esc(s.extra.id)}" aria-label="Quitar sanción">✕</button>` : ''}</li>`).join('')}</ul>`
+    : `<p class="muted" style="font-size:14px">Sin sanciones.</p>`;
+  if (adm) h += `<button class="btn ghost sm" data-a="sancAdd">➕ Sanción del comité</button>`;
+  return h;
+}
+/**
+ * Presentación de jugadores al inicio: el árbitro marca quiénes llegaron (los suspendidos no se pueden marcar).
+ * Para iniciar hace falta el mínimo por equipo (3). Pasados 15 minutos de la hora programada se puede declarar W.O.
+ */
+/**
+ * ¿Se puede inscribir un jugador en la cancha? Acuerdo: durante la primera vuelta y si el equipo tiene cupo.
+ * (La misma regla la aplica el servidor; vale aunque la inscripción en línea esté apagada.)
+ */
+function fieldAddOpen(tm) {
+  if (!tm) return false;
+  const cfg = inscOf();
+  return tm.players.length < cfg.max && Rules.inscWindows(Object.assign({}, cfg, { open: true, from: 0 }), T(), serverNow()).chOpen;
+}
+/** Rol de un usuario según la lista que carga el organizador. */
+const roleName = (u) => (orgs && orgs.roles && orgs.roles[u]) || 'admin';
+const referees = () => (orgs ? orgs.users.filter((u) => roleName(u) === 'arbitro') : []);
+/** Árbitro del partido: el organizador lo elige; los demás solo lo ven. */
+function refPickHTML(m, adm) {
+  if (adm && sync.mode !== 'local') {
+    const list = referees();
+    if (m.ref && !list.includes(m.ref)) list.unshift(m.ref);
+    return `<label class="fl">🧑‍⚖️ Árbitro del partido<select id="m-ref"><option value="">Sin asignar (solo organizadores)</option>${list.map((u) => `<option value="${esc(u)}" ${m.ref === u ? 'selected' : ''}>${esc(u)}${roleName(u) === 'arbitro' ? '' : ' (ya no es árbitro)'}</option>`).join('')}</select></label>
+      ${!list.length ? '<small class="muted">Para asignar, cree un usuario con rol <b>Árbitro</b> en Ajustes.</small>' : ''}`;
+  }
+  return m.ref ? `<p class="muted" style="text-align:center;margin:0 0 8px">🧑‍⚖️ Árbitro: <b>${esc(m.ref)}</b>${isMyMatch(m) ? ' (usted)' : ''}</p>` : '';
+}
+function lineupHTML(m, edit) {
+  const R = matchRules(), adm = canEditMatch(m);
+  if (!adm && !m.present) return '';
+  const hh = (ms) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  let h = `<h3>📋 Presentación de jugadores</h3>`;
+  if (edit) h += `<p class="muted" style="font-size:14px;margin-top:0">Toque a cada jugador que está presente. Para iniciar se necesitan al menos <b>${R.minStart}</b> por equipo.${m.status === 'live' ? ' Puede marcar a los que lleguen tarde.' : ''}</p>`;
+  for (const tid of [m.home, m.away]) {
+    const tm = teamById(tid), pr = presentOf(m, tid) || [], sus = new Set(suspendedIn(m, tid).map((x) => x.pid));
+    const n = pr.length, short = n < R.minStart;
+    h += `<div class="lineup"><div class="pick-h"><b>${esc(tname(tid))}</b> · presentes <b>${n}</b> de ${tm ? tm.players.length : 0}
+      ${presentOf(m, tid) && short ? ` <span class="badge b-bad">faltan ${R.minStart - n} para poder iniciar</span>` : ''}
+      ${m.startedWith && m.startedWith[tid] != null && m.startedWith[tid] < teamSize().starters ? ` <span class="badge b-warn">inició con ${m.startedWith[tid]}</span>` : ''}
+      ${edit ? ` <button class="link" data-a="presentAll" data-team="${tid}">Marcar todos</button>` : ''}
+      ${edit && fieldAddOpen(tm) ? ` <button class="link" data-a="addOnField" data-team="${tid}">➕ Inscribir jugador</button>` : ''}</div>
+      <div class="pick-grid">${(tm ? tm.players : []).map((p) => {
+        const on = pr.includes(p.id), s = sus.has(p.id);
+        const label = `${p.num ? `<b>${esc(p.num)}</b> ` : ''}${esc(p.name)}${p.cap ? ' (C)' : ''}${s ? ' ⛔' : on ? ' ✓' : ''}`;
+        return edit ? `<button data-a="present" data-team="${tid}" data-pid="${esc(p.id)}" class="${on ? 'sel' : ''}${s ? ' off' : ''}" ${s ? 'disabled title="Suspendido"' : ''}>${label}</button>`
+          : `<button class="${on ? 'sel' : 'off'}" disabled>${label}</button>`;
+      }).join('')}</div></div>`;
+  }
+  // Equipo que no se presenta: solo después de la espera reglamentaria
+  if (edit && m.status === 'pend') {
+    const at = schedAt(m), until = at + R.waitMin * 60000, can = !at || serverNow() >= until;
+    h += `<div class="note ${can ? 'warn' : ''}" style="margin-top:6px">🕒 ${at ? (can ? `Ya pasaron los ${R.waitMin} minutos de espera (hora programada ${esc(m.time)}).` : `Espera reglamentaria: hasta las <b>${hh(until)}</b> (${R.waitMin} min después de la hora programada ${esc(m.time)}).`) : 'Este partido no tiene hora programada: la espera no se puede controlar.'}
+      <div style="margin-top:8px"><button class="btn danger sm" data-a="wo" data-wo-at="${until}" ${can ? '' : 'disabled'}>🚫 Equipo no se presentó (W.O.)</button></div></div>`;
+  }
+  return h;
+}
+/** Opciones de cantidad de partidos para el comité. */
+const sancChoices = () => [1, 2, 3, 4, 5, 6, 8, 10].map((n, i) => ({ key: String(i + 1), label: sancText(n), value: n, style: 'ghost' })).concat({ key: 'T', label: 'Todo el torneo', value: 'all', style: 'danger' });
 function matchHTML(m) {
-  const adm = isAdmin();
+  const adm = isAdmin(), ctl = canEditMatch(m); // ctl = organizador o el árbitro asignado a este partido
   const done = m.status === 'done';
   const ready = !!(m.home && m.away);
-  const edit = adm && !done && ready;      // puede anotar
+  const edit = ctl && !done && ready;      // puede anotar
   const isKO = m.phase === 'ko';
   const side = (id, src, s, val) => `<div>
     ${id && teamById(id) && teamById(id).crest ? `<div class="mcrest-big">${crestHTML(teamById(id).crest, tname(id), 56)}</div>` : ''}
@@ -1930,24 +2295,43 @@ function matchHTML(m) {
   let h = `<div class="mh"><h2>${esc(phaseLabel(m))}</h2><button class="x" data-a="close">✕</button></div><div class="mb">`;
   if (!ready) h += `<div class="note warn" style="margin-top:12px">Este partido se define cuando terminen los partidos anteriores.</div>`;
   h += `<div class="score">${side(m.home, m.srcH, 'h', m.hs)}<div class="vs">-</div>${side(m.away, m.srcA, 'a', m.as)}</div>`;
+  // En vivo: fase del partido para todos (1er tiempo, Descanso, 2º tiempo, Penales…)
+  if (m.status === 'live') h += `<p style="text-align:center;margin:0 0 8px"><span class="badge b-live"><i class="pulse"></i>EN VIVO</span> <b data-cphase="${m.id}">${esc(livePhase(m))}</b>${pensShown(m) || (m.shoot || []).length ? ` · penales ${m.ph || 0}-${m.pa || 0}` : ''}</p>`;
   if (edit && modal && modal.goalPick) {
     const tid = modal.goalPick === 'h' ? m.home : m.away, rival = modal.goalPick === 'h' ? m.away : m.home;
-    const tm = teamById(tid), off = new Set(suspendedIn(m, tid).map((x) => x.player));
-    h += `<div class="pick"><div class="pick-h">⚽ Gol de <b>${esc(tname(tid))}</b> · ¿quién anotó?</div>
-      <div class="pick-grid">${(tm ? tm.players : []).map((p, i) => `<button data-a="scorer" data-i="${i}" ${off.has(p.name) ? 'class="off"' : ''}>${p.num ? `<b>${esc(p.num)}</b> ` : ''}${esc(p.name)}${off.has(p.name) ? ' ⛔' : ''}</button>`).join('')}</div>
+    const tm = teamById(tid), mode = modal.goalMode || 'g';
+    const why = (p) => cantPlay(m, tid, p.id);
+    const tag = (p) => (suspendedIn(m, tid).some((x) => x.pid === p.id) ? ' ⛔' : whiteOut(m, tid).some((c) => c.pid === p.id) ? ' ⬜' : why(p) ? ' (ausente)' : '');
+    const chip = (k, label) => `<button class="btn sm ${mode === k ? '' : 'ghost'}" data-a="goalMode" data-m="${k}">${label}</button>`;
+    h += `<div class="pick"><div class="pick-h">${mode === 'x' ? '❌ Penal fallado' : '⚽ Gol'} de <b>${esc(tname(tid))}</b> · ¿quién ${mode === 'x' ? 'lo tiró' : 'anotó'}?</div>
+      <div class="row" style="margin-bottom:8px">${chip('g', '⚽ Gol')}${chip('p', '🎯 Gol de penal')}${chip('x', '❌ Penal fallado')}</div>
+      <div class="pick-grid">${(tm ? tm.players : []).map((p) => `<button data-a="scorer" data-pid="${esc(p.id)}" ${why(p) ? `class="off" disabled title="${esc(why(p))}"` : ''}>${p.num ? `<b>${esc(p.num)}</b> ` : ''}${esc(p.name)}${tag(p)}</button>`).join('')}</div>
       <div class="row" style="margin-top:8px">
-        <button class="btn ghost sm" data-a="scorer" data-i="-1">Sin especificar</button>
-        <button class="btn ghost sm" data-a="scorer" data-i="own">Autogol de ${esc(tname(rival))}</button>
+        ${mode === 'x' ? '' : `<button class="btn ghost sm" data-a="scorer" data-i="-1">Sin especificar</button>`}
+        ${mode === 'g' ? `<button class="btn ghost sm" data-a="scorer" data-i="own">Autogol de ${esc(tname(rival))}</button>` : ''}
         <button class="btn danger sm" data-a="goalCancel">Cancelar</button>
       </div></div>`;
   }
-  const goalsList = (m.goals || []).filter((g) => g.player || g.own);
-  if (goalsList.length) {
-    h += `<ul class="goals">${[...goalsList].sort((a, b) => a.min - b.min).map((g) => `<li class="${g.team === m.home ? 'gh' : 'ga'}">⚽ <b>${esc(g.own ? 'Autogol' : g.player)}</b> <small>${g.min}'${g.own ? ' · de ' + esc(g.from || 'rival') : ''}</small></li>`).join('')}</ul>`;
+  const goalsList = (m.goals || []).filter((g) => g.player || g.own || g.pen);
+  const missList = m.penMiss || [];
+  if (goalsList.length || missList.length) {
+    const items = [...goalsList.map((g) => ({ g, min: g.min })), ...missList.map((x) => ({ x, min: x.min }))].sort((a, b) => a.min - b.min);
+    h += `<ul class="goals">${items.map(({ g, x }) => (g
+      ? `<li class="${g.team === m.home ? 'gh' : 'ga'}">⚽ <b>${esc(g.own ? 'Autogol' : g.player ? evName(g) : 'Gol')}</b> <small>${g.min}'${g.pen ? ' · penal' : ''}${g.own ? ' · de ' + esc(g.from || 'rival') : ''}</small></li>`
+      : `<li class="${x.team === m.home ? 'gh' : 'ga'}">❌ <b>${esc(x.player ? evName(x) : tname(x.team))}</b> <small>${x.min}' · penal fallado</small>${edit ? ` <button data-a="penMissDel" data-id="${x.id}" aria-label="Quitar">✕</button>` : ''}</li>`)).join('')}</ul>`;
+  }
+  if (m.wo) {
+    h += `<div class="note warn" style="margin:8px 0">🚫 <b>${m.wo === 'both' ? 'Ninguno de los dos equipos se presentó' : `${esc(tname(m.wo))} no se presentó`}</b>${m.wo === 'both' ? ' · ambos pierden' : ` · gana ${esc(tname(m.wo === m.home ? m.away : m.home))} ${m.hs}-${m.as}`}<br><small>Declarado por ${esc(m.woBy || '')} · ${esc(fmtWhen(m.woAt))}${m.woNote ? ' · ' + esc(m.woNote) : ''}</small></div>`;
   }
   if (done) {
     const w = winner(m);
-    h += `<p style="text-align:center;margin:0 0 6px;font-weight:700">${w ? `🏆 Ganó ${esc(tname(w))}${m.ph != null && m.hs === m.as ? ` (penales ${m.ph}-${m.pa})` : ''}` : '🤝 Empate'}</p>`;
+    h += `<p style="text-align:center;margin:0 0 6px;font-weight:700">${w ? `🏆 Ganó ${esc(tname(w))}${!m.tieOf && pensShown(m) ? ` (penales ${m.ph}-${m.pa})` : ''}` : '🤝 Empate'}${m.tieLeg === 1 ? ' <small class="muted">(ida)</small>' : ''}</p>`;
+  }
+  if (m.tieLeg) {
+    // Serie de ida y vuelta: solo puntos; si empatan en puntos, penales al final de la vuelta
+    const vuelta = m.tieLeg === 2 ? m : T().matches.find((x) => x.tieOf === m.id);
+    const note = vuelta ? seriesNote(vuelta) : '';
+    h += `<div class="note" style="margin:8px 0">🔁 <b>Serie de ida y vuelta por puntos</b> (los goles no cuentan; empate en puntos = penales al final de la vuelta).${note ? '<br>' + esc(note) : ''}${pensShown(vuelta || {}) ? ` · penales ${vuelta.ph}-${vuelta.pa}` : ''}</div>`;
   }
 
   // Programación (fecha, hora, cancha)
@@ -1961,16 +2345,21 @@ function matchHTML(m) {
     h += `<p class="muted" style="text-align:center;margin:4px 0 8px">${m.date ? '📅 ' + esc(dayLabel(m.date)) : 'Fecha por definir'}${m.time ? ' · 🕒 ' + esc(m.time) : ''}${m.field ? ' · Cancha ' + esc(m.field) : ''}</p>`;
   }
 
-  if (!done && (adm || m.status === 'live')) {
-    const running = !!m.runAt;
+  h += refPickHTML(m, adm);
+  if (ready && !done) h += lineupHTML(m, edit);
+
+  if (!done && (ctl || m.status === 'live')) {
+    const running = !!m.runAt, two = (m.status === 'pend' ? matchRules().halves : halvesOf(m)) > 1;
+    const pLab = two ? (m.status === 'pend' ? '1er tiempo · ' : inBreak(m) ? '' : periodName(m) + ' · ') : '';
+    let btns;
+    if (inBreak(m)) btns = `<button class="btn sm" data-a="secondHalf">▶ Iniciar 2º tiempo</button>`;
+    else if (running) btns = `<button class="btn ghost sm" data-a="pause">⏸ Pausar</button>${two && periodOf(m) === 1 ? `<button class="btn ghost sm" data-a="endHalf">☕ Fin del 1er tiempo (descanso)</button>` : ''}`;
+    else btns = `<button class="btn sm" data-a="start" ${ready ? '' : 'disabled'}>▶ ${m.status === 'pend' ? 'Iniciar partido' : m.elapsed ? 'Reanudar' : 'Iniciar'}</button>${two && periodOf(m) === 1 && m.status === 'live' ? `<button class="btn ghost sm" data-a="endHalf">☕ Fin del 1er tiempo (descanso)</button>` : ''}`;
     h += `<div class="timer">
-      <div><div class="clock" id="clock">00:00</div><small id="clock-lab">${running ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar'}</small></div>
-      ${adm ? `<div class="dur">Tiempo<input type="number" inputmode="numeric" min="1" id="m-dur" value="${m.duration}">min</div>
-      <div class="row" style="width:100%">
-        ${running ? `<button class="btn ghost sm" data-a="pause">⏸ Pausar</button>`
-        : `<button class="btn sm" data-a="start" ${ready ? '' : 'disabled'}>▶ ${m.elapsed ? 'Reanudar' : 'Iniciar'}</button>`}
-      </div>
-      <div class="added">
+      <div><div class="clock" id="clock">00:00</div><small id="clock-lab">${inBreak(m) ? 'Descanso' : pLab + (running ? 'En juego' : m.elapsed ? 'Pausado' : 'Sin iniciar')}</small></div>
+      ${ctl ? `<div class="dur">${two ? 'Cada tiempo' : 'Tiempo'}${adm ? `<input type="number" inputmode="numeric" min="1" id="m-dur" value="${m.duration}">min` : ` ${m.duration} min`}</div>
+      <div class="row" style="width:100%">${btns}</div>
+      ${inBreak(m) ? '' : `<div class="added">
         <span>Tiempo agregado: <b>+${m.added || 0}'</b></span>
         <span class="row" style="flex-wrap:nowrap">
           <button class="btn ghost sm" data-a="addTime" data-n="-1" ${m.added ? '' : 'disabled'} aria-label="Quitar un minuto">−1'</button>
@@ -1979,16 +2368,24 @@ function matchHTML(m) {
           <button class="btn ghost sm" data-a="addTime" data-n="3">+3'</button>
           <button class="btn ghost sm" data-a="addTime" data-n="5">+5'</button>
         </span>
-      </div>` : `<div class="dur">de ${m.duration} min${m.added ? ` <b>+${m.added}'</b>` : ''}</div>`}</div>`;
-  } else if (done) {
-    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${m.duration} min${m.added ? ` + ${m.added}' agregado` : ''}</p>`;
+      </div>`}` : `<div class="dur">${inBreak(m) ? `Descanso de ${m.breakMin || 5} min` : `${two ? `${periodName(m) || '1er tiempo'} · ` : ''}de ${m.duration} min`}${m.added ? ` <b>+${m.added}'</b>` : ''}</div>`}</div>`;
+  } else if (done && !m.wo) {
+    const two = halvesOf(m) > 1;
+    h += `<p class="muted" style="text-align:center;margin:0">Partido finalizado · ${two ? `2 tiempos de ${m.duration} min` : `${m.duration} min`}${m.h1 && m.h1.added ? ` · 1T +${m.h1.added}'` : ''}${m.added ? ` · ${two ? '2T ' : ''}+${m.added}' agregado` : ''}</p>`;
   }
 
-  if (isKO && ready && m.hs === m.as && (edit || m.ph != null)) {
-    h += `<h3>Penales (empate)</h3><div class="pens">
+  if (isKO && ready && needsPens(m) && (edit || m.ph != null)) {
+    const kicks = m.shoot || [];
+    const row = (tid) => kicks.filter((k) => k.team === tid).map((k) => (k.scored ? '✅' : '❌')).join(' ') || '—';
+    h += `<h3>Penales ${m.tieOf ? '(serie empatada en puntos)' : '(empate)'}</h3>
+      ${edit ? `<div class="grid2" style="margin-bottom:8px">${[m.home, m.away].map((tid) => `<div class="card" style="padding:10px;margin:0"><b>${esc(tname(tid))}</b><div style="margin:6px 0;font-size:18px">${row(tid)}</div>
+        <div class="row"><button class="btn sm" data-a="kick" data-team="${tid}" data-ok="1">✅ Anotó</button><button class="btn ghost sm" data-a="kick" data-team="${tid}" data-ok="0">❌ Falló</button></div></div>`).join('')}</div>
+        ${kicks.length ? `<button class="btn ghost sm" data-a="kickUndo">↩️ Deshacer último tiro</button>` : ''}` : kicks.length ? `<p class="muted" style="text-align:center">${esc(tname(m.home))}: ${row(m.home)}<br>${esc(tname(m.away))}: ${row(m.away)}</p>` : ''}
+      <div class="pens">
       <input type="number" inputmode="numeric" min="0" id="m-ph" value="${m.ph ?? ''}" ${edit ? '' : 'disabled'} placeholder="0">
       <span>-</span>
-      <input type="number" inputmode="numeric" min="0" id="m-pa" value="${m.pa ?? ''}" ${edit ? '' : 'disabled'} placeholder="0"></div>`;
+      <input type="number" inputmode="numeric" min="0" id="m-pa" value="${m.pa ?? ''}" ${edit ? '' : 'disabled'} placeholder="0"></div>
+      ${edit ? '<small class="muted">Marque cada tiro o escriba el total directamente.</small>' : ''}`;
   }
 
   // Suspendidos para este partido
@@ -2002,27 +2399,31 @@ function matchHTML(m) {
     h += `<h3>Tarjetas</h3>`;
     if (edit) {
       const selTeam = modal && modal.cardTeam && [m.home, m.away].includes(modal.cardTeam) ? modal.cardTeam : m.home;
-      const tm = teamById(selTeam);
+      const tm = teamById(selTeam), off = new Set(suspendedIn(m, selTeam).map((x) => x.pid)), pr = presentOf(m, selTeam);
+      const wm = matchRules().whiteMin;
       h += `<div class="cardform">
         <select id="c-team" class="inp">${[m.home, m.away].map((id) => `<option value="${id}" ${id === selTeam ? 'selected' : ''}>${esc(tname(id))}</option>`).join('')}</select>
         <input id="c-min" type="number" inputmode="numeric" min="0" placeholder="Minuto (auto)">
-        <select id="c-player" class="inp full">${(tm ? tm.players : []).map((p) => `<option value="${esc(p.name)}">${p.num ? esc(p.num) + ' · ' : ''}${esc(p.name)}</option>`).join('')}</select>
+        <select id="c-player" class="inp full">${(tm ? tm.players : []).map((p) => { const no = off.has(p.id) ? ' ⛔ suspendido' : pr && !pr.includes(p.id) ? ' (ausente)' : ''; return `<option value="${esc(p.id)}" ${no ? 'disabled' : ''}>${p.num ? esc(p.num) + ' · ' : ''}${esc(p.name)}${no}</option>`; }).join('')}</select>
         <button class="btn cy" data-a="card" data-type="Y">🟨 Amarilla</button>
         <button class="btn cr" data-a="card" data-type="R">🟥 Roja</button>
+        <button class="btn ghost sm" data-a="card" data-type="W">⬜ Blanca (${wm}' fuera)</button>
+        <button class="btn danger sm" data-a="card" data-type="R" data-agg="1">🟥 Roja con agresión</button>
       </div>`;
     }
+    const outs = whiteOut(m);
+    if (outs.length) h += `<div class="note warn" style="margin-top:8px"><b>⬜ Fuera por tarjeta blanca:</b><br>${outs.map((c) => `${esc(evName(c))} (${esc(tname(c.team))}) · vuelve en <b data-wcd="${c.id}">${fmtClock(c.left + 999)}</b> de juego`).join('<br>')}</div>`;
     const list = [...m.cards].sort((a, b) => a.min - b.min);
     h += list.length ? `<ul class="cardlist">${list.map((cd) => `<li><span class="chip ${cd.type}"></span>
-      <span class="grow"><b>${esc(cd.player)}</b> <small>${esc(tname(cd.team))}</small></span>
-      <small>${cd.min}'${cd.auto ? ' · doble amarilla' : ''}</small>${edit && !cd.auto ? `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>` : ''}</li>`).join('')}</ul>`
+      <span class="grow"><b>${esc(evName(cd))}</b> <small>${esc(tname(cd.team))}</small></span>
+      <small>${cd.min}'${cd.type === 'W' ? ` · blanca (${Math.round((cd.wMs || 120000) / 60000)}' fuera)` : ''}${cd.auto ? ' · doble amarilla' : ''}${cd.agg ? ' · con agresión' : ''}</small>${edit && !cd.auto ? `<button data-a="delCard" data-id="${cd.id}" aria-label="Quitar">✕</button>` : ''}</li>`).join('')}</ul>`
       : `<p class="muted" style="font-size:14px">Sin tarjetas.</p>`;
   }
+  if (ready) h += matchSanctionsHTML(m, adm);
   h += `</div><div class="mf">`;
-  if (adm && ready) {
-    h += done
-      ? `<button class="btn ghost block" data-a="reopen">✏️ Corregir resultado</button>`
-      : `<button class="btn block" data-a="finish">✅ Finalizar partido</button>`;
-  }
+  if (ready && done && adm) h += `<button class="btn ghost block" data-a="reopen">✏️ Corregir resultado</button>`;
+  else if (ready && !done && ctl) h += `<button class="btn block" data-a="finish">✅ Finalizar partido</button>`;
+  if (done && isMyMatch(m)) h += `<p class="muted" style="text-align:center;font-size:13px;margin:6px 0 0">Partido finalizado. Si hay que corregir algo, avise a un organizador.</p>`;
   if (adm && T().config.format === 'manual' && m.phase !== 'ko' && m.status === 'pend' && !T().manualClosed) {
     h += `<button class="btn danger block sm" data-a="manualDelete" data-id="${m.id}">Eliminar este partido</button>`;
   }
@@ -2031,15 +2432,27 @@ function matchHTML(m) {
 }
 
 function curMatch() { return modal && modal.type === 'match' ? mById(modal.id) : null; }
+/** El partido abierto, solo si este usuario puede anotar en él (organizador o su árbitro). */
+function editMatch() { const m = curMatch(); return canEditMatch(m) ? m : null; }
 
 function finishMatch() {
-  const m = curMatch(); if (!m) return;
-  if (m.phase === 'ko' && m.hs === m.as) {
-    const ph = $('#m-ph').value, pa = $('#m-pa').value;
-    if (ph === '' || pa === '' || +ph === +pa) return toast('En eliminación debe haber ganador: ingrese los penales');
+  const m = editMatch(); if (!m) return;
+  if (m.tieOf) {
+    const ida = mById(m.tieOf);
+    if (!ida || ida.status !== 'done') return toast('Primero finalice el partido de ida de esta serie');
+  }
+  if (needsPens(m)) {
+    const ph = $('#m-ph') ? $('#m-ph').value : '', pa = $('#m-pa') ? $('#m-pa').value : '';
+    if (ph === '' || pa === '' || +ph === +pa) return toast(m.tieOf ? 'La serie quedó empatada en puntos: ingrese los penales' : 'En eliminación debe haber ganador: ingrese los penales');
     m.ph = +ph; m.pa = +pa;
   } else { m.ph = null; m.pa = null; }
-  return ask(`${tname(m.home)} ${m.hs} - ${m.as} ${tname(m.away)}${m.ph != null ? `  (penales ${m.ph}-${m.pa})` : ''}`, { title: '✅ ¿Finalizar el partido?', ok: 'Finalizar' })
+  let extra = '';
+  if (m.tieOf) {
+    const s = seriesPts(m);
+    const w = s.pa !== s.pb ? (s.pa > s.pb ? s.a : s.b) : (m.ph > m.pa ? m.home : m.away);
+    extra = `\n\nSerie por puntos: ${tname(s.a)} ${s.pa} · ${tname(s.b)} ${s.pb}${s.pa === s.pb ? ` (penales ${m.ph}-${m.pa})` : ''}\nAvanza: ${tname(w)}`;
+  }
+  return ask(`${tname(m.home)} ${m.hs} - ${m.as} ${tname(m.away)}${!m.tieOf && m.ph != null ? `  (penales ${m.ph}-${m.pa})` : ''}${extra}`, { title: '✅ ¿Finalizar el partido?', ok: 'Finalizar' })
     .then((ok) => { if (ok) finishNow(m); });
 }
 function finishNow(m) {
@@ -2047,19 +2460,30 @@ function finishNow(m) {
   m.status = 'done';
   syncKO();
   save(); closeModal(); render();
-  const w = winner(m);
-  toast(w ? `🏆 Gana ${tname(w)}` : 'Partido finalizado (empate)');
+  const w = winner(m), adv = m.tieOf ? tieWinner(m) : null;
+  toast(adv ? `🏁 Avanza ${tname(adv)} (serie por puntos)` : w ? `🏆 Gana ${tname(w)}` : 'Partido finalizado (empate)');
+  // Se corrigió la ida con la vuelta ya jugada: si ahora la serie queda empatada sin penales, avisar
+  if (m.tieLeg === 1) {
+    const v = T().matches.find((x) => x.tieOf === m.id);
+    if (v && v.status === 'done' && !tieWinner(v)) setTimeout(() => toast('⚠️ La serie quedó empatada en puntos: corrija el partido de vuelta e ingrese los penales'), 2600);
+  }
 }
 
 function reopenMatch() {
-  const m = curMatch(); if (!m) return;
+  const m = curMatch(); if (!m || !isAdmin()) return; // corregir un resultado: solo organizadores
   const t = T();
   if (m.phase !== 'ko' && t.stage === 'final' && t.config.format !== 'elim') {
     return toast('Primero use "Deshacer fase final" en Partidos para corregir esta fase');
   }
-  const go = () => { m.status = 'live'; m.ph = null; m.pa = null; syncKO(); save(); render(); };
+  const go = () => {
+    if (m.wo) { Object.assign(m, { wo: null, woAt: null, woBy: null, woNote: '', hs: 0, as: 0, status: 'pend' }); } // anular el W.O.
+    else m.status = 'live';
+    m.ph = null; m.pa = null; m.shoot = []; syncKO(); save(); render();
+  };
   if (m.phase === 'ko') {
-    const dep = t.matches.some((x) => x.status !== 'pend' && [x.srcH, x.srcA].some((s) => s && (s.w === m.id || s.l === m.id)));
+    // De la ida de una serie dependen los partidos que siguen a su vuelta
+    const ids = [m.id, ...t.matches.filter((x) => x.tieOf === m.id).map((x) => x.id)];
+    const dep = t.matches.some((x) => x.status !== 'pend' && [x.srcH, x.srcA].some((s) => s && (ids.includes(s.w) || ids.includes(s.l))));
     if (dep) return ask('Los partidos siguientes que dependen de este se reiniciarán.', { title: '✏️ Corregir resultado', ok: 'Continuar' }).then((ok) => { if (ok) go(); });
   }
   go();
@@ -2077,6 +2501,7 @@ async function apiCall(method, body, query = '', path = 'api/state') {
   const headers = { 'Content-Type': 'application/json' };
   if (auth && auth.token) headers.Authorization = 'Bearer ' + auth.token;
   const r = await fetch(path + query, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
+  noteServerTime(r);
   let j = null;
   try { j = await r.json(); } catch (e) { /* respuesta no JSON (sin API) */ }
   return { status: r.status, j };
@@ -2105,13 +2530,13 @@ async function doLogin() {
     const { status, j } = await authCall({ action: setup ? 'setup' : 'login', user, pass });
     if (status === 409 && setup) { sync.needSetup = false; render(); return toast(j.error); }
     if (status !== 200) return toast((j && j.error) || 'No se pudo ingresar');
-    setAuth({ user: j.user, token: j.token });
+    setAuth({ user: j.user, token: j.token, role: j.role || 'admin' });
     sync.needSetup = false;
     // empezar desde lo que hay en línea para no subir datos viejos de este teléfono
     sync.dirty = false; sync.rev = -1;
     S.tab = 'inicio';
     render();
-    toast(`👋 Bienvenido, ${j.user}`);
+    toast(j.role === 'arbitro' ? `🧑‍⚖️ Bienvenido, ${j.user} (árbitro). Sus partidos están en Partidos.` : `👋 Bienvenido, ${j.user}`);
     pull(true);
   } catch (e) {
     toast('Sin conexión. Intente de nuevo.');
@@ -2160,7 +2585,7 @@ function mergeFields(L, B, R, lists = [], deltas = []) {
 }
 /** Partido: goles y tarjetas se suman de ambos lados; el marcador se combina por diferencia. */
 const mergeMatch = (L, B, R) => {
-  const o = mergeFields(L, B, R, ['cards', 'goals'], ['hs', 'as']);
+  const o = mergeFields(L, B, R, ['cards', 'goals', 'sancExtra', 'penMiss', 'shoot'], ['hs', 'as']);
   // Un partido FINALIZADO en el servidor no se reabre por cambios de otro teléfono
   // (solo si este organizador lo había finalizado y lo reabrió con "Corregir resultado").
   if (R.status === 'done' && L.status !== 'done' && B.status !== 'done') {
@@ -2284,7 +2709,7 @@ async function pull(full) {
       if (isAdmin() && totalTeams(S) > 0) { sync.dirty = true; sync.rev = j.rev; schedulePush(0); }
       return;
     }
-    if (sync.dirty && sync.known && isAdmin()) return schedulePush(0); // push combina si hay conflicto
+    if (sync.dirty && sync.known && signedIn()) return schedulePush(0); // push combina si hay conflicto
     if (j.rev !== sync.rev || !sync.known) adopt(j);
   } catch (e) {
     setMode('offline');
@@ -2292,7 +2717,8 @@ async function pull(full) {
 }
 
 async function push() {
-  if (sync.mode === 'local' || !sync.dirty || sync.pushing || !isAdmin()) return;
+  if (sync.mode === 'local' || !sync.dirty || sync.pushing || !signedIn()) return;
+  if (isRef()) return pushRef(); // el árbitro solo envía sus partidos
   sync.pushing = true;
   setMode('saving');
   try {
@@ -2331,16 +2757,100 @@ async function push() {
   }
 }
 
+/* ---- Árbitro: envía solo los partidos que cambió en este teléfono, uno por uno, a /api/match ---- */
+/** Partidos que cambiaron aquí respecto de lo último recibido del servidor: [{tor, cat, L, B}]. */
+function refChanges() {
+  const out = [];
+  const base = (sync.base && sync.base.torneos) || {};
+  for (const [tk, tor] of Object.entries(S.torneos)) {
+    for (const [ck, c] of Object.entries(tor.cats || {})) {
+      const bc = base[tk] && base[tk].cats && base[tk].cats[ck];
+      for (const L of c.matches) {
+        const B = bc && bc.matches.find((x) => x.id === L.id);
+        if (B && !same(L, B)) out.push({ tor: tk, cat: ck, L, B });
+      }
+    }
+  }
+  return out;
+}
+/** Toma los datos del servidor y vuelve a poner encima los partidos que aún no se enviaron. */
+function adoptKeeping(j, pending) {
+  const d = normalizeData(clone(j.data));
+  if (!d) return;
+  sync.base = clone({ torneos: d.torneos });
+  for (const p of pending) {
+    const c = d.torneos[p.tor] && d.torneos[p.tor].cats[p.cat];
+    const i = c ? c.matches.findIndex((x) => x.id === p.L.id) : -1;
+    if (i >= 0) c.matches[i] = clone(p.L);
+  }
+  S.torneos = d.torneos; fixSelection(S);
+  sync.rev = j.rev; sync.known = true;
+  sync.dirty = pending.length > 0;
+  saveLocal(); requestRender();
+}
+async function pushRef() {
+  sync.pushing = true;
+  setMode('saving');
+  try {
+    for (let k = 0; k < 8; k++) {
+      const changes = refChanges();
+      if (!changes.length) { sync.dirty = false; break; }
+      const c = changes[0], sent = clone(c.L); // copia: el árbitro puede seguir anotando mientras se envía
+      const { status, j } = await apiCall('POST', { action: 'save', tor: c.tor, cat: c.cat, match: sent, base: c.B }, '', 'api/match');
+      if (status === 200 && j && j.data) {
+        // Quedan pendientes los demás partidos y este solo si se volvió a cambiar durante el envío
+        adoptKeeping(j, refChanges().filter((x) => !(x.L.id === sent.id && same(x.L, sent))));
+      } else if (status === 409 && j && j.data) {
+        // Otro teléfono cambió el mismo partido: se combinan (goles y tarjetas de ambos) y se vuelve a enviar
+        const remote = normalizeData(clone(j.data));
+        const R = remote && remote.torneos[c.tor] && remote.torneos[c.tor].cats[c.cat] && remote.torneos[c.tor].cats[c.cat].matches.find((x) => x.id === sent.id);
+        const pend = refChanges().map((x) => (x.L.id === sent.id && R ? Object.assign({}, x, { L: mergeMatch(x.L, x.B, R) }) : x));
+        mergeNotices = [];
+        adoptKeeping(j, pend);
+        if (mergeNotices.length) toast('ℹ️ ' + mergeNotices.join(' '));
+      } else if (status === 401) {
+        sync.pushing = false;
+        return sessionExpired();
+      } else if (status === 404 || status === 501) {
+        return setMode('local');
+      } else if (status >= 400 && status < 500) {
+        // El servidor rechazó el cambio (fuera de sus permisos o contra el reglamento): se descarta y se recarga
+        toast('⛔ ' + ((j && j.error) || 'El servidor no aceptó el cambio'));
+        sync.dirty = false; sync.pushing = false;
+        await pull(true);
+        return;
+      } else {
+        throw new Error(status);
+      }
+    }
+    setMode('online');
+  } catch (e) {
+    setMode('offline');
+  } finally {
+    sync.pushing = false;
+    saveSync();
+  }
+}
+/** Al abrir la app con una sesión guardada, se confirma el rol con el servidor (un organizador pudo cambiarlo). */
+async function refreshRole() {
+  if (!auth || !auth.token) return;
+  try {
+    const { status, j } = await authCall({ action: 'me' });
+    if (status === 401) return sessionExpired();
+    if (status === 200 && j.role && j.role !== auth.role) { setAuth(Object.assign({}, auth, { role: j.role })); requestRender(); }
+  } catch (e) { /* sin conexión: se usa el rol guardado */ }
+}
+
 function startSync() {
   if (location.protocol === 'file:') return setMode('local');
   pull(true);
   checkSetup();
-  if (auth && S.tab === 'ajustes') loadOrgs();
+  refreshRole().then(() => { if (auth && isAdmin()) loadOrgs(); }); // la lista de usuarios sirve para asignar árbitros
   setInterval(() => {
     if (document.visibilityState !== 'visible') return;
     if (sync.pendingRender && !isBusy()) render();
     if (sync.dirty) push(); else pull(false);
-    if (auth && S.tab === 'equipos') loadInsc();
+    if (auth && isAdmin() && S.tab === 'equipos') loadInsc();
   }, 5000);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pull(false); });
   window.addEventListener('online', () => (sync.dirty ? push() : pull(true)));
@@ -2351,14 +2861,29 @@ function startSync() {
    Inscripción en línea: capitanes inscriben, organizadores aprueban.
    El servidor (api/insc) valida todo; aquí solo se ayuda a llenar bien.
    ========================================================= */
-const INSC_DEF = { open: false, until: 0, changesUntil: 0, min: 5, max: 10 };
-const inscOf = (c = T()) => Object.assign({}, INSC_DEF, (c && c.config && c.config.insc) || {});
+/** Acuerdo del comité: de 5 a 8 jugadores por equipo. */
+// from = apertura (acuerdo: a partir del día 25) · changesLeg1 = altas y bajas durante toda la primera vuelta
+const INSC_DEF = { open: false, from: 0, until: 0, changesUntil: 0, changesLeg1: true, min: 5, max: 8 };
+/** local = solo jugadores del municipio. Por defecto todas las categorías menos Femenino (jugadoras libres). */
+const localDefault = (c) => !/femen/i.test((c && c.name) || '');
+const inscOf = (c = T()) => Object.assign({}, INSC_DEF, { local: localDefault(c) }, (c && c.config && c.config.insc) || {});
+/** Tamaño de equipo de una categoría (única regla: la de la inscripción). Titulares en cancha no puede pasar del máximo. */
+function teamSize(c = T()) {
+  const i = inscOf(c);
+  const starters = Math.max(1, Math.min(i.max, TC().starters || i.min));
+  return { min: i.min, max: i.max, starters, subs: Math.max(0, i.max - starters) };
+}
 /** regOpen: se pueden crear y enviar inscripciones. chOpen: altas y bajas de jugadores. */
-function inscWin(cfg) {
-  const t = Date.now();
-  const regOpen = cfg.open && (!cfg.until || t <= cfg.until);
-  const chOpen = cfg.open && (cfg.changesUntil ? t <= cfg.changesUntil : regOpen);
-  return { regOpen, chOpen: chOpen || regOpen };
+/** Plazos (rules.js, la misma regla que aplica el servidor): {regOpen, chOpen, notYet, leg1Done}. */
+const inscWin = (cfg, c = T()) => Rules.inscWindows(cfg, c, serverNow());
+/** Texto de los plazos para capitanes y público. */
+function plazoText(cfg, w) {
+  if (!cfg.open) return '';
+  if (w.notYet) return `La inscripción abre el <b>${fmtWhen(cfg.from)}</b>.`;
+  const ch = cfg.changesLeg1 ? (w.leg1Done ? 'Terminó la primera vuelta: ya no hay altas ni bajas de jugadores.' : `Altas y bajas de jugadores durante toda la primera vuelta${cfg.changesUntil ? ' (a más tardar el <b>' + fmtWhen(cfg.changesUntil) + '</b>)' : ''}.`)
+    : cfg.changesUntil ? `Altas y bajas de jugadores hasta el <b>${fmtWhen(cfg.changesUntil)}</b>.` : '';
+  if (w.regOpen) return `Inscripción abierta${cfg.until ? ' hasta el <b>' + fmtWhen(cfg.until) + '</b>' : ''}. ${ch}`;
+  return `Inscripción de equipos cerrada. ${w.chOpen ? ch : 'El plazo de altas y bajas ya cerró.'}`;
 }
 const fmtWhen = (ms) => (ms ? new Date(ms).toLocaleString('es', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
 const toLocalInput = (ms) => { if (!ms) return ''; const d = new Date(ms); return `${isoDate(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
@@ -2372,6 +2897,7 @@ async function inscCall(body, token) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
   const r = await fetch('api/insc', { method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store' });
+  noteServerTime(r);
   let j = null;
   try { j = await r.json(); } catch (e) { /* sin API */ }
   return { status: r.status, j: j || {} };
@@ -2400,20 +2926,19 @@ async function capLoad() {
 }
 
 /** Botones públicos: inscribir equipo, mi inscripción y reglamento. */
-function inscCTA(compact) {
+/**
+ * Tarjeta de inscripción: solo para el capitán que ya ingresó (con el enlace de su invitación) en este teléfono.
+ * El público no la ve: los capitanes entran con la invitación personal que les envía la organización.
+ * El reglamento está en el ícono 📄 del encabezado, para todos.
+ */
+function inscCTA() {
+  if (!capAuth) return '';
   const cfg = inscOf(), w = inscWin(cfg);
-  let txt = '';
-  if (w.regOpen) txt = `Inscripción abierta${cfg.until ? ' hasta el <b>' + fmtWhen(cfg.until) + '</b>' : ''}.`;
-  else if (w.chOpen) txt = `Inscripción de equipos cerrada. Altas y bajas de jugadores hasta el <b>${fmtWhen(cfg.changesUntil)}</b>.`;
-  else if (cfg.open && cfg.until) txt = 'El plazo de inscripción en línea ya cerró.';
-  if (compact && !w.regOpen && !capAuth) return '';
-  const main = capAuth ? `<button class="btn" data-a="capOpen">🔑 Mi inscripción${capAuth.name ? ' · ' + esc(capAuth.name) : ''}</button>`
-    : w.regOpen ? '<button class="btn" data-a="capOpen">📝 Inscribir mi equipo</button>'
-      : '<button class="btn ghost" data-a="capOpen">🔑 Soy capitán</button>';
+  const txt = plazoText(cfg, w);
   return `<div class="card">
-    <h2>📝 Inscripción · ${esc(catName(S.cat))}</h2>
-    <p class="muted" style="margin:4px 0 10px;font-size:14px">${txt ? txt + ' ' : ''}De ${cfg.min} a ${cfg.max} jugadores por equipo. Se inscribe <b>solo con la invitación</b> que la organización envía a cada capitán, y la organización aprueba cada inscripción.</p>
-    <div class="row">${main}<button class="btn ghost" data-a="openRules">📜 Reglamento</button></div>
+    <h2>📝 Mi inscripción</h2>
+    <p class="muted" style="margin:4px 0 10px;font-size:14px">${txt ? txt + ' ' : ''}De ${cfg.min} a ${cfg.max} jugadores por equipo. La organización aprueba cada inscripción y cada cambio.</p>
+    <div class="row"><button class="btn" data-a="capOpen">🔑 Mi inscripción${capAuth.name ? ' · ' + esc(capAuth.name) : ''}</button></div>
   </div>`;
 }
 
@@ -2440,7 +2965,7 @@ function capStartHTML() {
   } else if (inv.used) {
     nueva = '<div class="note warn" style="margin-top:12px">Esta invitación ya se usó para inscribir un equipo. Ingrese abajo con el <b>código del equipo</b> y su <b>clave</b>.</div>';
   } else if (!inv.open) {
-    nueva = `<div class="note warn" style="margin-top:12px">La inscripción de <b>${esc(inv.catName)}</b> no está abierta en este momento. Consulte a la organización.</div>`;
+    nueva = `<div class="note warn" style="margin-top:12px">${inv.notYet && inv.from ? `La inscripción de <b>${esc(inv.catName)}</b> abre el <b>${fmtWhen(inv.from)}</b>. Vuelva a abrir este enlace ese día.` : `La inscripción de <b>${esc(inv.catName)}</b> no está abierta en este momento. Consulte a la organización.`}</div>`;
   } else {
     nueva = `<div class="card" style="margin-top:12px">
       <h3 style="margin-top:0">Nueva inscripción · ${esc(inv.catName)}</h3>
@@ -2488,7 +3013,7 @@ const invPretty = (c) => String(c).slice(0, 4) + '-' + String(c).slice(4);
 const invLink = (c) => `${location.origin}/?i=${invPretty(c)}`;
 function invText(inv) {
   const tor = S.torneos[inv.tor], c = tor && tor.cats[inv.cat], cfg = inscOf(c);
-  return `Hola ${inv.label} 👋\nEsta es su invitación para inscribir su equipo en *${tor ? tor.name : 'el torneo'}* · ${c ? c.name : ''}.\n\n👉 ${invLink(inv.code)}\n\nCódigo de invitación: ${invPretty(inv.code)}\n${cfg.until ? `Inscripción abierta hasta el ${fmtWhen(cfg.until)}.\n` : ''}El enlace es personal y sirve una sola vez: no lo comparta.`;
+  return `Hola ${inv.label} 👋\nEsta es su invitación para inscribir su equipo en *${tor ? tor.name : 'el torneo'}* · ${c ? c.name : ''}.\n\n👉 ${invLink(inv.code)}\n\nCódigo de invitación: ${invPretty(inv.code)}\n${cfg.from && cfg.from > Date.now() ? `La inscripción abre el ${fmtWhen(cfg.from)}.\n` : ''}${cfg.until ? `Inscripción abierta hasta el ${fmtWhen(cfg.until)}.\n` : ''}El enlace es personal y sirve una sola vez: no lo comparta.\n\nDespués, para volver a entrar a su inscripción: ${location.origin}/capitan (con el código de su equipo y su clave).`;
 }
 function invShare(inv, how) {
   const text = invText(inv);
@@ -2512,7 +3037,7 @@ function invitesHTML() {
 
 /** Qué puede cambiar el capitán ahora (el servidor aplica las mismas reglas). */
 function capPerm(reg) {
-  const c = regCat(reg), cfg = inscOf(c), w = inscWin(cfg), sent = !!reg.sentAt;
+  const c = regCat(reg), cfg = inscOf(c), w = inscWin(cfg, c), sent = !!reg.sentAt;
   const alive = reg.status !== 'rechazada';
   const full = alive && (reg.status === 'observada' || w.regOpen);
   return { c, cfg, w, sent, full, edit: alive && (full || (sent && w.chOpen)), baja: alive && w.chOpen };
@@ -2540,7 +3065,8 @@ function capEditorHTML() {
     return `<div class="prow cprow" data-srv="${esc(e)}"><span class="pn">${i + 1}</span>
       <input class="pl-name" data-cpl autocomplete="off" placeholder="Nombre y apellido${i < cfg.min ? ' *' : ''}" value="${esc(p.name)}" ${lock ? 'readonly' : ''}>
       <input class="pl-num" data-cpl type="number" inputmode="numeric" min="0" max="99" placeholder="N°" value="${esc(p.num)}" ${lock ? 'readonly' : ''}>
-      <input class="pl-doc" data-cpl maxlength="16" autocapitalize="characters" placeholder="DUI o carné (opcional)" value="${esc(p.doc || '')}" ${lock ? 'readonly' : ''}>
+      <div class="pdoc"><input class="pl-doc" data-cpl maxlength="10" inputmode="numeric" placeholder="DUI (opcional)" value="${esc(p.doc || '')}" ${lock ? 'readonly' : ''}>
+        <label class="pcap" title="Capitán del equipo"><input type="radio" name="c-cap" class="pl-cap" data-cpl ${p.cap ? 'checked' : ''} ${P.edit ? '' : 'disabled'}> Capitán</label></div>
       ${p.ok && P.baja ? `<button type="button" class="btn danger sm" data-a="capBaja" data-n="${esc(p.name)}">Baja</button>` : `<span class="pok">${p.ok ? '✅' : ''}</span>`}
       <div class="perr"></div></div>`;
   }).join('');
@@ -2559,15 +3085,17 @@ function capEditorHTML() {
     <div class="grid2">
       <label class="fl">Propietario<input id="c-rep-n" maxlength="60" value="${esc(d.rep.name)}" ${dis(P.edit)}></label>
       <label class="fl">Teléfono<input id="c-rep-p" type="tel" inputmode="tel" maxlength="20" value="${esc(d.rep.phone)}" ${dis(P.edit)}></label>
+      <label class="fl" style="grid-column:1/3">DUI del propietario <small>(opcional)</small><input id="c-rep-d" maxlength="10" inputmode="numeric" placeholder="00000000-0" value="${esc(d.rep.doc || '')}" ${dis(P.edit)}></label>
       <label class="fl">Suplente<input id="c-rep2-n" maxlength="60" value="${esc(d.rep2.name)}" ${dis(P.edit)}></label>
       <label class="fl">Teléfono<input id="c-rep2-p" type="tel" inputmode="tel" maxlength="20" value="${esc(d.rep2.phone)}" ${dis(P.edit)}></label>
+      <label class="fl" style="grid-column:1/3">DUI del suplente <small>(opcional)</small><input id="c-rep2-d" maxlength="10" inputmode="numeric" placeholder="00000000-0" value="${esc((d.rep2 && d.rep2.doc) || '')}" ${dis(P.edit)}></label>
     </div>
-    <small>El suplente actúa solo cuando el propietario no está. Los teléfonos y DUI solo los ve la organización.</small>
+    <small>El suplente actúa solo cuando el propietario no está. Si el representante también juega, agréguelo en la lista de jugadores. Los teléfonos y DUI solo los ve la organización.</small>
     <div class="psec">Jugadores <small id="c-count"></small></div>
     <div id="c-players">${playerRows || '<p class="muted">Sin jugadores.</p>'}</div>
-    <small>Si dos jugadores se llaman igual, escriba el DUI o carné de cada uno para diferenciarlos. ✅ = aprobado. Un jugador aprobado no se borra: se le da de <b>Baja</b> con el motivo y ya no podrá inscribirse en ningún otro equipo. Cada jugador usa el mismo número todo el campeonato.</small>
+    <small>Marque al <b>Capitán</b> del equipo (uno de los jugadores). Si dos jugadores se llaman igual, escriba el DUI de cada uno para diferenciarlos. ✅ = aprobado. Un jugador aprobado no se borra: se le da de <b>Baja</b> con el motivo y ya no podrá inscribirse en ningún otro equipo. Cada jugador usa el mismo número todo el campeonato.</small>
     ${reg.bajas && reg.bajas.length ? `<div class="psec">Dados de baja (intransferibles)</div><ul class="cardlist">${reg.bajas.map((b) => `<li><span class="grow"><b>${esc(b.name)}</b><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span></li>`).join('')}</ul>` : ''}
-    ${!P.sent && P.edit ? `<label class="opt ${modal.accept ? 'on' : ''}" style="margin-top:14px"><input type="checkbox" id="c-accept" ${modal.accept ? 'checked' : ''}><div><b>Confirmo</b><span>que todos los jugadores pertenecen al municipio o viven permanentemente en él, y que el equipo acepta el reglamento del campeonato.</span></div></label>` : ''}
+    ${!P.sent && P.edit ? `<label class="opt ${modal.accept ? 'on' : ''}" style="margin-top:14px"><input type="checkbox" id="c-accept" ${modal.accept ? 'checked' : ''}><div><b>Confirmo</b><span>${cfg.local ? 'que todos los jugadores pertenecen al municipio o viven permanentemente en él, y ' : ''}que el equipo acepta el reglamento del campeonato.</span></div></label>` : ''}
     <div class="psec">Historial</div>
     <ul class="cardlist">${(reg.log || []).slice(-10).reverse().map(logItem).join('')}</ul>
   </div>
@@ -2583,27 +3111,34 @@ function checkCapPlayers() {
   const cfg = inscOf(regCat(capReg));
   const idx = new Map();
   const tor = S.torneos[capReg.tor];
-  if (tor) for (const c of Object.values(tor.cats)) for (const tm of c.teams) { if (tm.id === capReg.teamId) continue; for (const p of tm.players) idx.set(norm(p.name), `${tm.name} (${c.name})`); }
+  const orig = new Map();
+  if (tor) for (const c of Object.values(tor.cats)) for (const tm of c.teams) { if (tm.id === capReg.teamId) continue; for (const p of tm.players) { idx.set(norm(p.name), `${tm.name} (${c.name})`); orig.set(norm(p.name), p.name); } }
   const seen = new Map(), nums = new Map();
   let errors = 0, filled = 0;
   document.querySelectorAll('#c-players .cprow').forEach((row) => {
     const n = norm(row.querySelector('.pl-name').value), num = row.querySelector('.pl-num').value.trim();
     const doc = row.querySelector('.pl-doc').value.trim().toUpperCase().replace(/[\s.]/g, '');
     const pn = row.querySelector('.pn').textContent;
-    let msg = '';
+    let msg = '', warn = '';
     if (n) {
       filled++;
       const twin = (seen.get(n) || []).find((o) => !doc || !o.doc || o.doc === doc);
-      if (twin) msg = `Repetido con el jugador ${twin.pn}${doc ? '' : ' (si es otra persona, escriba el DUI o carné de ambos)'}`;
-      else if (idx.has(n) && !doc) msg = `Ya hay un jugador con este nombre en ${idx.get(n)}. Si es la misma persona, debe decidir en cuál equipo jugará; si es otra persona, escriba su DUI o carné`;
+      if (doc && !/^\d{8}-?\d$/.test(doc)) msg = 'DUI no válido: debe tener 9 números (00000000-0)';
+      else if (twin) msg = `Repetido con el jugador ${twin.pn}${doc ? '' : ' (si es otra persona, escriba el DUI de ambos)'}`;
+      else if (idx.has(n) && !doc) msg = `Ya hay un jugador con este nombre en ${idx.get(n)}. Si es la misma persona, debe decidir en cuál equipo jugará; si es otra persona, escriba su DUI`;
       else if (num !== '' && nums.has(String(+num))) msg = `El número ${+num} ya lo usa el jugador ${nums.get(String(+num))}`;
       else msg = row.dataset.srv || '';
+      if (!msg) {
+        const sim = !doc && [...orig.keys()].find((k) => Rules.similarNames(n, k));
+        warn = (modal.warns && modal.warns[n]) || (sim ? `⚠️ Nombre parecido a ${orig.get(sim)}, que ya está en ${idx.get(sim)}. Si es la misma persona no puede estar en dos equipos; si es otra, escriba su DUI.` : '');
+      }
       if (!seen.has(n)) seen.set(n, []);
       seen.get(n).push({ pn, doc });
       if (num !== '' && !nums.has(String(+num))) nums.set(String(+num), pn);
     }
     row.classList.toggle('bad', !!msg);
-    row.querySelector('.perr').textContent = msg;
+    row.classList.toggle('warn', !msg && !!warn);
+    row.querySelector('.perr').textContent = msg || warn;
     if (msg) errors++;
   });
   const cnt = $('#c-count');
@@ -2617,11 +3152,12 @@ function capCollect() {
   const players = [];
   document.querySelectorAll('#c-players .cprow').forEach((row) => {
     const name = row.querySelector('.pl-name').value.trim().replace(/\s+/g, ' ');
-    if (name) players.push({ name, num: row.querySelector('.pl-num').value.trim(), doc: row.querySelector('.pl-doc').value.trim() });
+    const cap = row.querySelector('.pl-cap');
+    if (name) players.push({ name, num: row.querySelector('.pl-num').value.trim(), doc: row.querySelector('.pl-doc').value.trim(), ...(cap && cap.checked ? { cap: true } : {}) });
   });
   const acc = $('#c-accept');
   if (acc) modal.accept = acc.checked;
-  return { name: v('f-name') || capReg.name, crest: modal.crest || null, colors: v('c-colors'), rep: { name: v('c-rep-n'), phone: v('c-rep-p') }, rep2: { name: v('c-rep2-n'), phone: v('c-rep2-p') }, players };
+  return { name: v('f-name') || capReg.name, crest: modal.crest || null, colors: v('c-colors'), rep: { name: v('c-rep-n'), phone: v('c-rep-p'), doc: v('c-rep-d') }, rep2: { name: v('c-rep2-n'), phone: v('c-rep2-p'), doc: v('c-rep2-d') }, players };
 }
 
 async function capSave(send) {
@@ -2632,6 +3168,7 @@ async function capSave(send) {
   if (data.players.length > cfg.max) return toast(`Máximo ${cfg.max} jugadores`);
   if (send && data.players.length < cfg.min) return toast(`Se requieren al menos ${cfg.min} jugadores (hay ${data.players.length})`);
   if (send && !capReg.sentAt && !modal.accept) return toast('Marque la casilla de confirmación antes de enviar');
+  if (send && !data.players.some((p) => p.cap)) return toast('Indique quién es el capitán: marque “Capitán” en uno de los jugadores');
   modal.draft = Object.assign({}, capReg, data);
   try {
     const { status, j } = await capCall(Object.assign({ action: 'save', send: !!send, accept: !!modal.accept }, data));
@@ -2645,19 +3182,26 @@ async function capSave(send) {
     if (status !== 200) return toast(j.error || 'No se pudo guardar');
     const first = send && !capReg.sentAt;
     setCap(Object.assign({}, capAuth, { name: j.reg.name }), j.reg);
+    // Avisos (no bloquean): nombre igual o parecido a un jugador de otro equipo; la organización lo verifica
+    modal.warns = Object.fromEntries((j.warn || []).map((w) => [norm(w.name), w.msg]));
     Object.assign(modal, { draft: null, errors: null, general: null, crest: undefined });
     renderModal();
+    if ((j.warn || []).length) return toast(`⚠️ Guardado con ${j.warn.length} aviso(s): revise los nombres marcados en amarillo`);
     toast(first ? '📨 Inscripción enviada. La organización la revisará.' : j.reg.status === 'enviada' && j.reg.approvedAt ? '📨 Cambios enviados a revisión' : '✅ Guardado');
   } catch (e) { toast('Sin conexión. Intente de nuevo.'); }
 }
 
 async function capBaja(name) {
   modal.draft = Object.assign({}, capReg, capCollect());
-  const ok = await ask(`${name} será dado de baja del equipo.\n\nQuedará intransferible: no podrá volver a inscribirse en ningún equipo del torneo. No se puede deshacer.`, { title: '➖ Dar de baja', ok: 'Continuar', danger: true });
-  if (!ok) return;
-  const reason = await askText('¿Por qué ya no participará? Es obligatorio y lo verá la organización.', { title: 'Motivo de la baja', placeholder: 'Ej: se fue a vivir fuera del municipio', ok: 'Dar de baja', danger: true });
-  if (reason == null) return;
-  if (reason.trim().length < 10) return toast('Explique el motivo (al menos 10 letras)');
+  // Una sola ventana: aviso + motivo obligatorio (si es muy corto, se vuelve a pedir con lo escrito)
+  let reason = '';
+  for (;;) {
+    reason = await askText(`${name} será dado de baja del equipo.\n\nQuedará intransferible: no podrá volver a inscribirse en ningún equipo del torneo. No se puede deshacer.\n\nMotivo de la baja (obligatorio, lo verá la organización):`, { title: '➖ Dar de baja', placeholder: 'Ej: se fue a vivir fuera del municipio', ok: 'Dar de baja', danger: true, value: reason });
+    if (reason == null) return;
+    reason = reason.trim();
+    if (reason.length >= 10) break;
+    toast('Explique el motivo (al menos 10 letras)');
+  }
   try {
     const { status, j } = await capCall({ action: 'baja', name, reason: reason.trim() });
     if (status === 401) return capGone(j);
@@ -2674,7 +3218,7 @@ async function capBaja(name) {
 let inscList = null, inscBans = [], inscLoading = false, inscAt = 0;
 const admInsc = (body) => inscCall(body, auth && auth.token);
 async function loadInsc(force) {
-  if (!auth || !auth.token || sync.mode === 'local' || inscLoading) return;
+  if (!auth || !auth.token || !isAdmin() || sync.mode === 'local' || inscLoading) return;
   if (!force && inscList && Date.now() - inscAt < 30000) return;
   inscLoading = true;
   try {
@@ -2703,8 +3247,9 @@ function inscAdminCard() {
   const pend = regs.filter((r) => r.status === 'enviada').length;
   const bans = inscBans.filter((b) => b.tor === S.tor);
   const state = !cfg.open ? 'Cerrada (actívela en Ajustes)'
-    : w.regOpen ? `Abierta${cfg.until ? ' hasta ' + fmtWhen(cfg.until) : ''}`
-      : w.chOpen ? `Equipos nuevos cerrado · altas y bajas hasta ${fmtWhen(cfg.changesUntil)}` : 'Plazo vencido';
+    : w.notYet ? `Abre el ${fmtWhen(cfg.from)}`
+      : w.regOpen ? `Abierta${cfg.until ? ' hasta ' + fmtWhen(cfg.until) : ''}`
+        : w.chOpen ? `Equipos nuevos cerrado · altas y bajas ${cfg.changesLeg1 ? 'hasta que termine la primera vuelta' : 'hasta ' + fmtWhen(cfg.changesUntil)}` : w.leg1Done ? 'Terminó la primera vuelta: sin altas ni bajas' : 'Plazo vencido';
   return `<div class="card">
     <div class="sec-head" style="margin:0 0 6px"><h2 style="margin:0">📝 Inscripciones en línea</h2><button class="link" data-a="inscReload">🔄 Actualizar</button></div>
     <p class="muted" style="font-size:14px;margin:0 0 10px">${state} · ${cfg.min} a ${cfg.max} jugadores${pend ? ` · <b style="color:var(--text)">${pend} por revisar</b>` : ''}</p>
@@ -2736,12 +3281,12 @@ function inscAdminHTML(id) {
     <div class="crest-edit" style="grid-template-columns:72px 1fr">
       <div class="crest-prev" style="width:72px;height:80px">${crestPreview(r.crest, r.name)}</div>
       <div style="font-size:14px">🎽 <b>Uniforme:</b> ${esc(r.colors || '—')}<br>
-        👤 <b>Propietario:</b> ${esc(r.rep.name || '—')} · ${tel(r.rep.phone)}<br>
-        👥 <b>Suplente:</b> ${esc((r.rep2 && r.rep2.name) || '—')} · ${tel(r.rep2 && r.rep2.phone)}</div>
+        👤 <b>Propietario:</b> ${esc(r.rep.name || '—')} · ${tel(r.rep.phone)}${r.rep.doc ? ' · DUI ' + esc(r.rep.doc) : ''}<br>
+        👥 <b>Suplente:</b> ${esc((r.rep2 && r.rep2.name) || '—')} · ${tel(r.rep2 && r.rep2.phone)}${r.rep2 && r.rep2.doc ? ' · DUI ' + esc(r.rep2.doc) : ''}<br>🧢 <b>Capitán:</b> ${esc((r.players.find((p) => p.cap) || {}).name || '— (sin marcar)')}</div>
     </div>
     ${warns.length ? `<div class="note warn" style="margin-top:12px">${warns.map((w) => `${w.hard ? '⛔' : '⚠️'} <b>${esc(w.name)}</b>: ${esc(w.msg)}`).join('<br>')}</div>` : ''}
     <div class="psec">Jugadores (${r.players.length}) <small style="color:${nOk ? 'inherit' : 'var(--bad)'}">· se permiten ${cfg.min} a ${cfg.max}</small></div>
-    <ul class="cardlist">${r.players.map((p) => { const w = wOf(norm(p.name)); return `<li><span class="grow">${p.num !== '' ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${p.doc ? ` <small>· ${/^\d{8}-\d$/.test(p.doc) ? 'DUI' : 'Doc.'} ${esc(p.doc)}</small>` : ''}</span>
+    <ul class="cardlist">${r.players.map((p) => { const w = wOf(norm(p.name)); return `<li><span class="grow">${p.num !== '' ? `<b>${esc(p.num)}</b> · ` : ''}${esc(p.name)}${p.cap ? ' <b title="Capitán">(C)</b>' : ''}${p.doc ? ` <small>· ${/^\d{8}-\d$/.test(p.doc) ? 'DUI' : 'Doc.'} ${esc(p.doc)}</small>` : ''}</span>
       ${r.approvedAt && !appr.has(norm(p.name)) ? '<span class="badge b-warn">Alta nueva</span>' : ''}${w.some((x) => x.hard) ? '<span class="badge b-bad">Repetido</span>' : w.length ? '<span class="badge b-warn">Verificar</span>' : ''}</li>`; }).join('') || '<li class="muted">Sin jugadores</li>'}</ul>
     ${r.bajas && r.bajas.length ? `<div class="psec">Bajas</div><ul class="cardlist">${r.bajas.map((b) => `<li><span class="grow"><b>${esc(b.name)}</b><br><small>${esc(b.reason)} · ${fmtWhen(b.at)}</small></span></li>`).join('')}</ul>` : ''}
     <div class="psec">Historial</div>
@@ -2781,9 +3326,12 @@ async function inscApprove(id) {
     if (status !== 200) return toast(j.error || 'No se pudo aprobar');
     const reg = j.reg;
     team = c.teams.find((t) => t.id === teamId);
-    const starters = S.torneos[reg.tor].config.starters;
+    const starters = Math.min(S.torneos[reg.tor].config.starters || 5, inscOf(c).max);
     const prevSub = new Map(team ? team.players.map((p) => [norm(p.name), p.sub]) : []);
-    const players = reg.players.map((p, i) => ({ name: p.name, num: p.num, sub: prevSub.has(norm(p.name)) ? prevSub.get(norm(p.name)) : i >= starters }));
+    const players = reg.players.map((p, i) => ({ name: p.name, num: p.num, sub: prevSub.has(norm(p.name)) ? prevSub.get(norm(p.name)) : i >= starters, ...(p.cap ? { cap: true } : {}) }));
+    // Mismo nombre = mismo jugador (conserva su identificador); los nuevos reciben uno nuevo
+    matchPlayerIds(players, team ? team.players : []);
+    assignPlayerIds(teamId, players, team ? team.players : [], c);
     if (team) Object.assign(team, { name: reg.name, players, crest: reg.crest, colors: reg.colors, insc: reg.id });
     else c.teams.push({ id: teamId, name: reg.name, players, paid: 0, crest: reg.crest, colors: reg.colors, insc: reg.id, createdAt: Date.now() });
     replaceReg(reg);
@@ -2814,14 +3362,17 @@ function rulesHTML() {
   const sys = [
     'Solo pueden inscribir equipos los capitanes que reciben una invitación personal de la organización (sirve una sola vez).',
     `Cada equipo inscribe de ${cfg.min} a ${cfg.max} jugadores.`,
-    'Un jugador solo puede estar en un equipo del torneo (en cualquier categoría). Si ya aparece en otro equipo, el sistema no lo deja inscribir y el jugador debe decidir en cuál participará. Si son dos personas con el mismo nombre, se diferencian con el DUI o carné y la organización lo verifica.',
+    'Un jugador solo puede estar en un equipo del torneo (en cualquier categoría). Si ya aparece en otro equipo, el sistema no lo deja inscribir y el jugador debe decidir en cuál participará. Si son dos personas con el mismo nombre, se diferencian con el DUI y la organización lo verifica.',
     'Para dar de baja a un jugador hay que escribir el motivo. El jugador dado de baja queda intransferible: no puede volver a inscribirse en ningún equipo.',
     'Son obligatorios: representante propietario y suplente (nombre y teléfono), logo o escudo y colores del uniforme.',
     'El número de camisa no se repite dentro del equipo y, una vez aprobado, el jugador conserva el mismo número todo el campeonato.',
-    'El capitán confirma que sus jugadores pertenecen o viven permanentemente en el municipio.',
+    cfg.local ? 'El capitán confirma que sus jugadores pertenecen o viven permanentemente en el municipio.' : 'Categoría libre: se aceptan jugadores de otros municipios.',
     !cfg.open ? 'La inscripción en línea de esta categoría aún no está abierta.'
-      : (cfg.until ? `Inscripción de equipos hasta el ${fmtWhen(cfg.until)}.` : 'Inscripción de equipos abierta.') + (cfg.changesUntil ? ` Altas y bajas de jugadores hasta el ${fmtWhen(cfg.changesUntil)}.` : ''),
+      : (cfg.from ? `La inscripción abre el ${fmtWhen(cfg.from)}. ` : '') + (cfg.until ? `Inscripción de equipos hasta el ${fmtWhen(cfg.until)}.` : 'Inscripción de equipos abierta.')
+        + (cfg.changesLeg1 ? ' Se pueden inscribir y desinscribir jugadores durante toda la primera vuelta; al terminar, el sistema lo cierra solo.' : cfg.changesUntil ? ` Altas y bajas de jugadores hasta el ${fmtWhen(cfg.changesUntil)}.` : ''),
+    `Durante la primera vuelta, si el equipo tiene menos de ${cfg.max} jugadores, se puede inscribir a un jugador en la cancha antes de jugar (con las mismas validaciones).`,
     'Toda inscripción y todo cambio de jugadores queda pendiente hasta que la organización lo aprueba, lo observa o lo rechaza.',
+    (() => { const R = sancRules(); return `Suspensiones automáticas: 2 amarillas en un partido, ${sancText(sancN(R.y2))}; amarilla + roja, ${sancText(sancN(R.yr))}; roja directa, ${sancText(sancN(R.r))}; roja con agresión, ${sancText(sancN(R.agg))}${R.yl ? `; ${R.yl} amarillas acumuladas, 1 partido` : ''}. Se cumplen en los partidos que el equipo juega; el jugador suspendido no puede anotar ni recibir tarjetas.`; })(),
   ];
   return `<div class="mh"><h2>📜 Reglamento</h2><button class="x" data-a="close">✕</button></div>
   <div class="mb rules">
@@ -2830,23 +3381,41 @@ function rulesHTML() {
   </div>`;
 }
 
-function inscConfigCard() {
-  const cfg = inscOf();
-  return `<div class="card">
-    <h2>📝 Inscripción en línea · ${esc(catName(S.cat))}</h2>
-    <p class="muted" style="font-size:14px">Los capitanes inscriben a su equipo desde su teléfono y ustedes aprueban, observan o rechazan en <b>Equipos</b>. Cada categoría tiene su propio plazo y tamaño de equipo.</p>
-    <label class="opt ${cfg.open ? 'on' : ''}"><input type="checkbox" data-insc="open" ${cfg.open ? 'checked' : ''}><div><b>Inscripción en línea habilitada</b><span>Los capitanes pueden crear, enviar y modificar inscripciones dentro de los plazos.</span></div></label>
-    <label class="fl">Cierre de inscripción de equipos <small>(fecha y hora)</small><input type="datetime-local" data-insc="until" value="${toLocalInput(cfg.until)}"></label>
-    <label class="fl">Cierre de altas y bajas de jugadores <small>(ej: fin de la primera vuelta · vacío = mismo cierre)</small><input type="datetime-local" data-insc="changesUntil" value="${toLocalInput(cfg.changesUntil)}"></label>
+/** Categorías del torneo que no tienen el tamaño de equipo acordado por el comité (5 a 8). */
+const offAgreement = () => Object.entries(CATS_()).filter(([, c]) => { const i = inscOf(c); return i.min !== INSC_DEF.min || i.max !== INSC_DEF.max; });
+function inscAgreementNote() {
+  const off = offAgreement();
+  if (!off.length) return '';
+  return `<div class="note warn" style="margin-top:10px">⚠️ Acuerdo del comité: de <b>${INSC_DEF.min} a ${INSC_DEF.max}</b> jugadores por equipo. No lo cumplen: ${off.map(([, c]) => `${esc(c.name)} (${inscOf(c).min} a ${inscOf(c).max})`).join(', ')}.
+    <div style="margin-top:8px"><button class="btn sm" data-a="inscAgreement">Aplicar ${INSC_DEF.min} a ${INSC_DEF.max} en todas las categorías</button></div></div>`;
+}
+/** Opción de municipio y tamaño de equipo: se usa siempre (formulario de equipos y sorteo), haya o no base de datos. */
+const inscSizeHTML = (cfg) => `<label class="opt ${cfg.local ? 'on' : ''}"><input type="checkbox" data-insc="local" ${cfg.local ? 'checked' : ''}><div><b>Solo jugadores del municipio</b><span>${cfg.local ? 'El capitán debe confirmar que sus jugadores pertenecen o viven permanentemente en el municipio.' : 'Categoría libre: se aceptan jugadores de otros municipios.'}</span></div></label>
     <div class="grid2">
       <label class="fl">Mínimo de jugadores<input type="number" inputmode="numeric" min="1" max="30" data-insc="min" value="${cfg.min}"></label>
       <label class="fl">Máximo de jugadores<input type="number" inputmode="numeric" min="1" max="30" data-insc="max" value="${cfg.max}"></label>
     </div>
+    ${inscAgreementNote()}`;
+function inscConfigCard(online = true) {
+  const cfg = inscOf();
+  if (!online) return `<div class="card"><h2>👥 Jugadores por equipo · ${esc(catName(S.cat))}</h2>${inscSizeHTML(cfg)}</div>`;
+  return `<div class="card">
+    <h2>📝 Inscripción en línea · ${esc(catName(S.cat))}</h2>
+    <p class="muted" style="font-size:14px">Los capitanes inscriben a su equipo desde su teléfono y ustedes aprueban, observan o rechazan en <b>Equipos</b>. Cada categoría tiene su propio plazo y tamaño de equipo.</p>
+    <label class="opt ${cfg.open ? 'on' : ''}"><input type="checkbox" data-insc="open" ${cfg.open ? 'checked' : ''}><div><b>Inscripción en línea habilitada</b><span>Los capitanes pueden crear, enviar y modificar inscripciones dentro de los plazos.</span></div></label>
+    <label class="fl">Apertura <small>(acuerdo: a partir del día 25 · vacío = desde ya)</small><input type="datetime-local" data-insc="from" value="${toLocalInput(cfg.from)}"></label>
+    <label class="fl">Cierre de inscripción de equipos <small>(fecha y hora)</small><input type="datetime-local" data-insc="until" value="${toLocalInput(cfg.until)}"></label>
+    <label class="opt ${cfg.changesLeg1 ? 'on' : ''}"><input type="checkbox" data-insc="changesLeg1" ${cfg.changesLeg1 ? 'checked' : ''}><div><b>Altas y bajas durante la primera vuelta</b><span>${cfg.changesLeg1 ? 'Se cierran solas cuando se juega el último partido de la primera vuelta (acuerdo del comité).' : 'Se cierran en la fecha de abajo (o con la inscripción de equipos).'}</span></div></label>
+    <label class="fl">${cfg.changesLeg1 ? 'Cierre de altas y bajas a más tardar <small>(opcional)</small>' : 'Cierre de altas y bajas de jugadores <small>(vacío = mismo cierre de equipos)</small>'}<input type="datetime-local" data-insc="changesUntil" value="${toLocalInput(cfg.changesUntil)}"></label>
+    ${inscSizeHTML(cfg)}
     <small>Hora de este teléfono. El cierre lo aplica el servidor aunque el capitán tenga la pantalla abierta.</small>
   </div>`;
 }
 /** Reglamento del torneo. Si nunca se ha escrito uno, se usa el del Campeonato de Futbolito Perquín 2026. */
-const rulesText = (tor) => (tor.rules == null ? RULES_TEMPLATE : tor.rules);
+const strHash = (s) => hash36(String(s).replace(/\r/g, '').trim());
+/** Versiones anteriores del reglamento modelo: si el torneo guardó una sin modificarla, se muestra la vigente. */
+const OLD_TEMPLATES = new Set(['ozxzcr']);
+const rulesText = (tor) => (tor.rules == null || OLD_TEMPLATES.has(strHash(tor.rules)) ? RULES_TEMPLATE : tor.rules);
 function rulesCard() {
   return `<div class="card">
     <h2>📜 Reglamento del torneo</h2>
@@ -2870,27 +3439,32 @@ const RULES_TEMPLATE = `# Generalidades
 
 # Equipos e inscripción
 - Cada equipo inscribirá un representante propietario y un suplente. El suplente actuará únicamente cuando el propietario no esté.
-- Los participantes deberán pertenecer al municipio de Perquín. También podrán participar quienes vivan permanentemente en el municipio.
-- La inscripción se realizará por medio de esta plataforma, a partir de la fecha que anuncie la organización, con toda la información que se requiera.
-- El mínimo de jugadores será de 5 y el máximo a inscribir será de 10.
+- En las categorías Juvenil y Libre, los participantes deberán pertenecer al municipio de Perquín. También podrán participar quienes vivan permanentemente en el municipio.
+- En la categoría Femenino las jugadoras son libres: pueden ser de otros municipios.
+- La inscripción se realizará por medio de esta plataforma, a partir del día 25 y hasta la fecha de cierre que anuncie la organización, con toda la información que se requiera.
+- El mínimo de jugadores será de 5 y el máximo a inscribir será de 8.
 - Se permitirá inscribir y desinscribir jugadores durante toda la primera vuelta. Los jugadores desinscritos quedan intransferibles y no podrán jugar en otros equipos.
+- Durante la primera vuelta, si el equipo tiene cupos vacíos, se podrá inscribir a un jugador el mismo día del partido, antes de que juegue.
+- El jugador desinscrito conserva los goles que anotó. Si otro jugador ocupa su número, comienza con cero goles.
 - Toda inscripción se hará por medios digitales, por el encargado de realizar cambios en el sistema, y deberá tener la aprobación de los organizadores.
 - Al desinscribir a un jugador se deberá justificar el motivo por el cual ya no participará.
 - Cada equipo presentará un logo y los colores de uniforme a utilizar; de preferencia camisas numeradas, y el mismo jugador usará siempre el mismo número en todo el campeonato.
 - Si el equipo no se presenta debidamente identificado con su uniforme, será causal de pérdida de puntos.
-- El sistema detectará si un jugador intenta inscribirse en dos equipos; se le consultará al jugador en cuál equipo desea participar.
+- El sistema muestra a qué equipo pertenece cada jugador y detectará si un jugador intenta inscribirse en dos equipos; se le consultará al jugador en cuál equipo desea participar.
 - El representante será el responsable de recibir y entregar los chalecos.
 
 # Formato de competencia
-- Las fases de clasificación se determinarán de acuerdo con la cantidad de equipos inscritos.
-- Se jugará a una o dos vueltas de clasificación en dos grupos distintos, según cuántos equipos estén inscritos.
+- Se jugará en dos grupos, a dos vueltas (primera y segunda vuelta). Luego vienen la clasificación y las finales.
 - Clasificarán los dos equipos de mayor puntuación de cada grupo.
 - En caso de empate, para efectos de clasificación se definirá por diferencia de goles.
+- Las semifinales serán cruzadas entre grupos (1° de un grupo contra 2° del otro) y, junto con la final, se jugarán a ida y vuelta como una liguilla.
+- En semifinales y finales solo cuentan los puntos (3 por partido ganado, 1 por empate); los goles no cuentan. Si la serie termina empatada en puntos, se define por penales al final del partido de vuelta.
 
 # Partidos
 - Para su identificación, los jugadores titulares y suplentes deberán presentarse al terreno de juego para el reconocimiento del árbitro. El careo se hará 10 minutos antes de iniciar el juego.
-- Después de la hora señalada se esperará a los equipos un máximo de 15 minutos.
-- Un partido podrá iniciar con un mínimo de TRES jugadores; de lo contrario, el equipo pierde por default.
+- Al inicio del partido el árbitro registra qué jugadores están presentes y cuáles no.
+- Después de la hora programada se esperará a los equipos un máximo de 15 minutos.
+- Un partido podrá iniciar con un mínimo de TRES jugadores. Si un equipo tiene menos integrantes presentes que los de cancha, el árbitro deja constancia de que inicia con los que tenga, siempre que sean al menos tres; de lo contrario, el equipo pierde por default.
 - No habrá límite de cambios durante el partido.
 - Se jugarán dos tiempos de 30 minutos, con un descanso máximo de 5 minutos después del primer tiempo.
 
@@ -2901,7 +3475,8 @@ const RULES_TEMPLATE = `# Generalidades
 - No se aceptan reclamos sobre el trámite del partido. Toda apelación se hará en reunión con las partes involucradas, con elementos justificables.
 - Los árbitros rendirán ante el comité, únicamente en las reuniones, un informe de todos los incidentes del partido.
 
-# Sanción de 3 minutos fuera del terreno de juego
+# Tarjeta blanca: 2 minutos fuera del terreno de juego
+- Durante esos 2 minutos el jugador no podrá jugar. Se aplica por:
 1. Entrar o salir sin autorización del árbitro.
 2. Botar el balón deliberadamente.
 3. Entrar cambiándose.
@@ -2912,11 +3487,11 @@ const RULES_TEMPLATE = `# Generalidades
 2. Falta física leve por conducta antideportiva.
 
 # Expulsiones y suspensiones
-- Dos tarjetas amarillas más roja: expulsión y 2 partidos de suspensión.
-- Una tarjeta amarilla más roja: 3 partidos de suspensión.
-- Tres tarjetas amarillas durante 3 partidos consecutivos: 1 partido de suspensión.
-- Roja directa: 5 partidos de suspensión.
-- Roja directa con agresiones graves: expulsión de todo el campeonato.
+- Dos tarjetas amarillas en el mismo partido: expulsión y 1 partido de suspensión.
+- Una tarjeta amarilla más una roja: 2 partidos de suspensión.
+- Roja directa: 3 partidos de suspensión.
+- Roja con agresiones: expulsión de todo el campeonato.
+- Las suspensiones se cumplen en los siguientes partidos que juegue el equipo.
 
 # Reglas de juego
 1. Toda mano y falta grave dentro del área será sancionada como penal, sin ningún jugador o jugadora en la portería.
@@ -2931,8 +3506,8 @@ const actions = {
   cat: (d) => { S.cat = d.c; save(); render(); window.scrollTo(0, 0); },
   tab: (d) => {
     S.tab = d.t; save(); render(); window.scrollTo(0, 0);
-    if (d.t === 'ajustes' && auth && sync.mode !== 'local') loadOrgs();
-    if (d.t === 'ajustes' && !isAdmin()) checkSetup();
+    if (d.t === 'ajustes' && auth && isAdmin() && sync.mode !== 'local') loadOrgs();
+    if (d.t === 'ajustes' && !signedIn()) checkSetup();
   },
   close: () => { if (modal && modal.type === 'rules' && modal.back) { modal = modal.back; return renderModal(); } closeModal(); },
   view: (d) => { S.view = d.v; save(); render(); },
@@ -2966,6 +3541,14 @@ const actions = {
     const { status, j } = await authCall({ action: 'password', pass: p1 });
     if (status === 401) return sessionExpired();
     toast(status === 200 ? '✅ Contraseña cambiada' : (j && j.error) || 'No se pudo cambiar');
+  },
+  orgRole: async (d) => {
+    const txt = d.r === 'arbitro' ? 'solo podrá anotar en los partidos que se le asignen' : 'podrá inscribir, sortear, programar y editar todo';
+    if (!(await ask('"' + d.u + '" ' + txt + '.', { title: d.r === 'arbitro' ? 'Hacer árbitro' : 'Hacer organizador', ok: 'Cambiar' }))) return;
+    const { status, j } = await authCall({ action: 'setRole', user: d.u, role: d.r });
+    if (status === 401) return sessionExpired();
+    if (status !== 200) return toast((j && j.error) || 'No se pudo cambiar el rol');
+    orgs = j; render(); toast('Rol actualizado');
   },
   delOrg: async (d) => {
     if (!(await ask('"' + d.u + '" ya no podrá ingresar ni editar.', { title: 'Quitar usuario', ok: 'Quitar', danger: true }))) return;
@@ -3025,6 +3608,22 @@ const actions = {
     if (status !== 200) return toast(j.error || 'No se pudo eliminar');
     inscList = (inscList || []).filter((x) => x.id !== d.id);
     closeModal(); render(); toast('Inscripción eliminada');
+  },
+  inscAgreement: async () => {
+    if (!isAdmin()) return;
+    const off = offAgreement();
+    if (!off.length) return;
+    const { min, max } = INSC_DEF;
+    // Equipos (o inscripciones en línea) que quedarían fuera del rango: se avisan, no se borran jugadores
+    const big = [];
+    for (const [k, c] of off) {
+      for (const tm of c.teams) if (tm.players.length > max || tm.players.length < min) big.push(`${tm.name} (${c.name}): ${tm.players.length}`);
+      for (const r of inscList || []) if (r.tor === S.tor && r.cat === k && r.status !== 'rechazada' && !r.teamId && r.players.length > max) big.push(`inscripción de ${r.name} (${c.name}): ${r.players.length}`);
+    }
+    const ok = await ask(`Se aplicará de ${min} a ${max} jugadores por equipo en: ${off.map(([, c]) => c.name).join(', ')}.${big.length ? `\n\n⚠️ Estos equipos quedan fuera del rango y deberán ajustar su lista (no se borra a nadie):\n• ${big.join('\n• ')}` : ''}`, { title: 'Acuerdo del comité', ok: 'Aplicar' });
+    if (!ok) return;
+    for (const [, c] of off) c.config.insc = Object.assign(inscOf(c), { min, max });
+    save(); render(); toast(`Aplicado: de ${min} a ${max} jugadores por equipo`);
   },
   inscUnban: async (d) => {
     const b = inscBans.find((x) => x.key === d.k);
@@ -3136,9 +3735,11 @@ const actions = {
     });
   },
   openMatch: (d) => openModal('match', d.id),
+  viewTeamCat: (d) => { if (CATS_()[d.c]) S.cat = d.c; render(); openModal('teamView', d.id); },
+  openMyMatch: (d) => { if (CATS_()[d.c]) S.cat = d.c; S.tab = 'partidos'; save(); render(); openModal('match', d.id); },
   goal: (d) => {
     // Quitar el último gol del equipo
-    const m = curMatch(); if (!m) return;
+    const m = editMatch(); if (!m) return;
     const k = d.s === 'h' ? 'hs' : 'as', tid = d.s === 'h' ? m.home : m.away;
     if (!m[k]) return;
     m[k]--;
@@ -3147,62 +3748,282 @@ const actions = {
     modal.goalPick = null;
     save(); renderModal();
   },
-  goalPick: (d) => { if (modal) { modal.goalPick = d.s; renderModal(); } },
-  goalCancel: () => { if (modal) { modal.goalPick = null; renderModal(); } },
-  scorer: (d) => {
-    const m = curMatch(); if (!m || !modal.goalPick) return;
-    const side = modal.goalPick, tid = side === 'h' ? m.home : m.away, rival = side === 'h' ? m.away : m.home;
-    const min = Math.floor(elapsedMs(m) / 60000) + 1;
-    let player = '', own = false;
-    if (d.i === 'own') own = true;
-    else if (+d.i >= 0) player = ((teamById(tid) || {}).players || [])[+d.i]?.name || '';
-    m.goals = m.goals || [];
-    m.goals.push({ id: uid(), team: tid, player, own, min, ...(own ? { player: '', from: tname(rival) } : {}) });
-    m[side === 'h' ? 'hs' : 'as']++;
-    if (m.status === 'pend') m.status = 'live';
-    modal.goalPick = null;
-    save(); renderModal();
-    toast(`⚽ Gol de ${tname(tid)}${player ? ' · ' + player : own ? ' (autogol)' : ''}`);
+  goalPick: (d) => {
+    if (!modal) return;
+    const m = editMatch(); if (!m) return;
+    if (m.status === 'pend') return toast('Primero haga la presentación de jugadores e inicie el partido');
+    modal.goalPick = d.s; modal.goalMode = 'g'; renderModal();
   },
-  start: () => {
-    const m = curMatch(); if (!m) return;
+  goalCancel: () => { if (modal) { modal.goalPick = null; modal.goalMode = null; renderModal(); } },
+  goalMode: (d) => { if (modal && modal.goalPick) { modal.goalMode = d.m; renderModal(); } },
+  scorer: (d) => {
+    const m = editMatch(); if (!m || !modal.goalPick) return;
+    if (m.status === 'pend') return toast('Primero haga la presentación de jugadores e inicie el partido');
+    const side = modal.goalPick, tid = side === 'h' ? m.home : m.away, rival = side === 'h' ? m.away : m.home;
+    const mode = modal.goalMode || 'g';
+    const min = matchMinute(m);
+    let player = '', pid = '', own = false;
+    if (d.i === 'own') own = true;
+    else if (d.pid) {
+      const p = playerById(tid, d.pid);
+      if (!p) { modal.goalPick = null; renderModal(); return toast('Ese jugador ya no está en el equipo'); }
+      const why = cantPlay(m, tid, p.id);
+      if (why) return toast('⛔ ' + why);
+      player = p.name; pid = p.id;
+    }
+    modal.goalPick = null; modal.goalMode = null;
+    if (mode === 'x') {
+      // Penal fallado: queda registrado, no cambia el marcador
+      m.penMiss = (m.penMiss || []).concat({ id: uid(), team: tid, player, ...(pid ? { pid } : {}), min });
+      save(); renderModal();
+      return toast(`❌ Penal fallado · ${player || tname(tid)}`);
+    }
+    m.goals = m.goals || [];
+    m.goals.push({ id: uid(), team: tid, player, ...(pid ? { pid } : {}), own, min, ...(mode === 'p' && !own ? { pen: true } : {}), ...(own ? { player: '', from: tname(rival) } : {}) });
+    m[side === 'h' ? 'hs' : 'as']++;
+    save(); renderModal();
+    toast(`⚽ ${mode === 'p' ? 'Gol de penal' : 'Gol'} de ${tname(tid)}${player ? ' · ' + player : own ? ' (autogol)' : ''}`);
+  },
+  penMissDel: (d) => { const m = editMatch(); if (!m) return; m.penMiss = (m.penMiss || []).filter((x) => x.id !== d.id); save(); renderModal(); },
+  /* Inscribir a un jugador en la cancha (organizador o árbitro del partido) */
+  addOnField: async (d) => {
+    const m = editMatch(); if (!m || m.status === 'done') return;
+    const tm = teamById(d.team), cfg = inscOf();
+    if (!tm || !fieldAddOpen(tm)) return toast(tm && tm.players.length >= cfg.max ? `${tm.name} ya tiene el máximo de ${cfg.max} jugadores` : 'Terminó la primera vuelta: ya no se pueden inscribir jugadores');
+    const name = ((await askText(`Nombre y apellido del jugador que se inscribe en ${tm.name} (cupo: ${tm.players.length} de ${cfg.max}):`, { title: '➕ Inscribir en la cancha', placeholder: 'Ej: Juan Pérez' })) || '').trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    if (name.split(' ').filter((w) => w.length >= 2).length < 2) return toast('Escriba nombre y apellido');
+    if (tm.players.some((p) => norm(p.name) === norm(name))) return toast(`${name} ya está en ${tm.name}`);
+    const other = playerIndex(tm.id).get(norm(name));
+    if (other && sync.mode === 'local') return toast(`Ya hay un jugador con ese nombre en ${other}`);
+    const num = await askText('Número de camisa (opcional):', { title: name, type: 'number', placeholder: 'Ej: 14' });
+    if (num == null) return;
+    if (num !== '' && !/^\d{1,2}$/.test(num.trim())) return toast('El número debe ser de 0 a 99');
+    if (num !== '' && tm.players.some((p) => String(p.num) === String(+num))) return toast(`El número ${+num} ya lo usa otro jugador de ${tm.name}`);
+    let doc = '';
+    if (sync.mode !== 'local') {
+      doc = await askText(`DUI (opcional)${other ? `
+
+⚠️ Ya hay un jugador con ese nombre en ${other}: si es otra persona, escriba su DUI.` : ''}`, { title: name, placeholder: '00000000-0' });
+      if (doc == null) return;
+    }
+    if (!(await ask(`${name}${num !== '' ? ' #' + +num : ''} se inscribe en ${tm.name} y queda presente para este partido.
+
+Queda registrado quién lo inscribió. Un jugador inscrito ya no puede pasar a otro equipo.`, { title: '➕ Inscribir en la cancha', ok: 'Inscribir' }))) return;
+    if (sync.mode === 'local') {
+      const pid = Rules.newPlayerId(T(), tm.id, name);
+      tm.players.push({ id: pid, name, num: num === '' ? '' : String(+num), sub: true, addedAt: Date.now(), addedBy: 'local', addedIn: m.id });
+      const pr = presentOf(m, tm.id);
+      if (pr) m.present = Object.assign({}, m.present, { [tm.id]: pr.concat(pid) });
+      save(); renderModal(); return toast(`✅ ${name} inscrito en ${tm.name}`);
+    }
+    // En línea: el servidor valida (un solo equipo por jugador, dados de baja, cupo, primera vuelta) y guarda
+    for (let i = 0; i < 20 && (sync.pushing || sync.dirty); i++) { if (!sync.pushing) push(); await new Promise((r) => setTimeout(r, 300)); }
+    if (sync.dirty) return toast('Hay cambios sin guardar: espere un momento e intente de nuevo');
+    try {
+      const { status, j } = await inscCall({ action: 'matchAdd', tor: S.tor, cat: S.cat, matchId: m.id, team: tm.id, name, num, doc }, auth && auth.token);
+      if (status === 401) return sessionExpired();
+      if (status !== 200) return toast('⛔ ' + (j.error || 'No se pudo inscribir'));
+      if (isRef()) adoptKeeping(j, []); else adopt(j);
+      if (isAdmin()) loadInsc(true);
+      renderModal();
+      toast(`✅ ${name} inscrito en ${tm.name}${(j.warn || []).length ? ' · ⚠️ ' + j.warn[0].msg : ''}`);
+    } catch (e) { toast('Sin conexión: para inscribir en la cancha se necesita internet'); }
+  },
+  /* Presentación de jugadores */
+  present: (d) => {
+    const m = editMatch(); if (!m || m.status === 'done') return;
+    if (suspendedIn(m, d.team).some((x) => x.pid === d.pid)) return toast('⛔ Suspendido: no puede jugar este partido');
+    const cur = presentOf(m, d.team) || [];
+    m.present = Object.assign({}, m.present, { [d.team]: cur.includes(d.pid) ? cur.filter((x) => x !== d.pid) : cur.concat(d.pid) });
+    save(); renderModal();
+  },
+  presentAll: (d) => {
+    const m = editMatch(); if (!m || m.status === 'done') return;
+    const sus = new Set(suspendedIn(m, d.team).map((x) => x.pid));
+    m.present = Object.assign({}, m.present, { [d.team]: (teamById(d.team) || { players: [] }).players.filter((p) => !sus.has(p.id)).map((p) => p.id) });
+    save(); renderModal();
+  },
+  start: async () => {
+    const m = editMatch(); if (!m || inBreak(m)) return;
+    if (m.status === 'pend') {
+      // Validación al inicio: mínimo de jugadores presentes por equipo; si son menos de los de cancha, queda constancia
+      const R = matchRules(), st = teamSize().starters;
+      const cnt = (tid) => (presentOf(m, tid) || []).length;
+      const short = [m.home, m.away].filter((tid) => cnt(tid) < R.minStart);
+      if (short.length) return toast(`Para iniciar se necesitan al menos ${R.minStart} jugadores presentes. Falta en: ${short.map(tname).join(' y ')}`);
+      const few = [m.home, m.away].filter((tid) => cnt(tid) < st);
+      const ok = await ask(`${tname(m.home)}: ${cnt(m.home)} presentes\n${tname(m.away)}: ${cnt(m.away)} presentes${few.length ? `\n\nQueda constancia: ${few.map((tid) => `${tname(tid)} inicia con ${cnt(tid)} integrantes`).join('; ')}.` : ''}${R.halves > 1 ? `\n\n2 tiempos de ${m.duration} min, descanso de ${R.breakMin} min.` : ''}`, { title: '▶ Iniciar partido', ok: 'Iniciar' });
+      if (!ok || curMatch() !== m || m.status !== 'pend') return;
+      m.startedWith = { [m.home]: cnt(m.home), [m.away]: cnt(m.away) };
+      Object.assign(m, { halves: R.halves, period: 1, breakMin: R.breakMin, startedAt: serverNow() });
+    }
     m.runAt = Date.now(); m.status = 'live';
     save(); renderModal();
   },
+  endHalf: async () => {
+    const m = editMatch(); if (!m || m.status !== 'live' || halvesOf(m) < 2 || periodOf(m) !== 1 || inBreak(m)) return;
+    if (!(await ask(`Termina el 1er tiempo (${minuteText(m)}). Empieza el descanso de ${m.breakMin || 5} minutos.`, { title: '☕ Fin del 1er tiempo', ok: 'Ir al descanso' }))) return;
+    if (curMatch() !== m) return;
+    if (m.runAt) { m.elapsed += Date.now() - m.runAt; m.runAt = null; }
+    m.h1 = { elapsed: m.elapsed, added: m.added || 0 };
+    m.breakAt = Date.now();
+    save(); renderModal(); toast('☕ Descanso');
+  },
+  secondHalf: () => {
+    const m = editMatch(); if (!m || !inBreak(m)) return;
+    Object.assign(m, { period: 2, elapsed: 0, added: 0, alerted: false, alertedAdd: false, breakAt: null, runAt: Date.now() });
+    save(); renderModal(); toast('▶ Comienza el 2º tiempo');
+  },
+  /* Equipo que no se presentó: después de la espera reglamentaria */
+  wo: async () => {
+    const m = editMatch(); if (!m || m.status !== 'pend' || !m.home || !m.away) return;
+    const R = matchRules(), at = schedAt(m);
+    if (at && serverNow() < at + R.waitMin * 60000) return toast(`Aún no terminan los ${R.waitMin} minutos de espera`);
+    const opts = [m.home, m.away].map((tid, i) => ({ key: String(i + 1), label: `${tname(tid)} no se presentó`, value: tid, style: 'danger' }));
+    if (m.phase !== 'ko') opts.push({ key: 'B', label: 'No se presentó ninguno', value: 'both', style: 'ghost' });
+    const who = await askChoice(`El equipo presente gana ${R.woGoals}-0 y se lleva los 3 puntos.${at ? '' : '\n\n⚠️ Este partido no tiene hora programada.'}`, opts, { title: '🚫 W.O. (no se presentó)' });
+    if (!who) return;
+    const note = await askText('Observación (opcional, queda registrada):', { title: 'W.O.', placeholder: 'Ej: esperamos hasta las 8:15' });
+    if (note == null || curMatch() !== m || m.status !== 'pend') return;
+    Object.assign(m, { wo: who, woAt: serverNow(), woBy: auth ? auth.user : 'local', woNote: note.trim().slice(0, 200), goals: [], ph: null, pa: null, runAt: null, status: 'done' });
+    if (who === 'both') { m.hs = 0; m.as = 0; } else { m.hs = who === m.away ? R.woGoals : 0; m.as = who === m.home ? R.woGoals : 0; }
+    syncKO(); save(); closeModal(); render();
+    const streak = who === 'both' ? [m.home, m.away] : [who];
+    const out = streak.filter((tid) => { const l = teamMatches(tid).filter((x) => x.status === 'done'); let k = 0; for (let i = l.length - 1; i >= 0 && (l[i].wo === tid || l[i].wo === 'both'); i--) k++; return k >= 3; });
+    toast(`🚫 W.O. registrado${out.length ? ` · ⚠️ ${out.map(tname).join(' y ')} lleva 3 W.O. seguidos: según el reglamento queda fuera` : ''}`);
+  },
+  /* Tanda de penales tiro por tiro */
+  kick: (d) => {
+    const m = editMatch(); if (!m) return;
+    m.shoot = (m.shoot || []).concat({ id: uid(), team: d.team, scored: d.ok === '1' });
+    m.ph = m.shoot.filter((k) => k.team === m.home && k.scored).length;
+    m.pa = m.shoot.filter((k) => k.team === m.away && k.scored).length;
+    save(); renderModal();
+  },
+  kickUndo: () => {
+    const m = editMatch(); if (!m || !(m.shoot || []).length) return;
+    m.shoot = m.shoot.slice(0, -1);
+    m.ph = m.shoot.filter((k) => k.team === m.home && k.scored).length;
+    m.pa = m.shoot.filter((k) => k.team === m.away && k.scored).length;
+    save(); renderModal();
+  },
   pause: () => {
-    const m = curMatch(); if (!m || !m.runAt) return;
+    const m = editMatch(); if (!m || !m.runAt) return;
     m.elapsed += Date.now() - m.runAt; m.runAt = null;
     save(); renderModal();
   },
   addTime: (d) => {
-    const m = curMatch(); if (!m) return;
+    const m = editMatch(); if (!m) return;
     m.added = Math.max(0, Math.min(30, (m.added || 0) + Number(d.n)));
     m.alertedAdd = false;
     save(); renderModal();
     toast(m.added ? `⏱ Tiempo agregado: +${m.added}'` : 'Sin tiempo agregado');
   },
-  card: (d) => {
-    const m = curMatch(); if (!m) return;
-    const team = $('#c-team').value, player = $('#c-player').value;
-    if (!player) return toast('Seleccione un jugador');
+  card: async (d) => {
+    const m = editMatch(); if (!m) return;
+    const team = $('#c-team').value, pl = playerById(team, $('#c-player').value);
+    if (!pl) return toast('Seleccione un jugador');
+    const player = pl.name, pid = pl.id;
+    if (m.status === 'pend') return toast('Primero haga la presentación de jugadores e inicie el partido');
+    if (suspendedIn(m, team).some((x) => x.pid === pid)) return toast(`⛔ ${player} está suspendido y no puede jugar este partido`);
+    const pr = presentOf(m, team);
+    if (pr && !pr.includes(pid)) return toast(`${player} no está marcado como presente`);
     let min = $('#c-min').value;
-    min = min === '' ? Math.floor(elapsedMs(m) / 60000) + 1 : Math.max(0, parseInt(min, 10) || 0);
-    const mine = m.cards.filter((c) => c.team === team && c.player === player);
+    min = min === '' ? matchMinute(m) : Math.max(0, parseInt(min, 10) || 0);
+    const mine = m.cards.filter((c) => c.team === team && evKey(c) === pid);
     if (mine.some((c) => c.type === 'R')) return toast(`${player} ya fue expulsado en este partido`);
+    const agg = d.type === 'R' && d.agg === '1';
+    if (agg) {
+      const ok = await ask(`${player} (${tname(team)}) recibe roja por agresión: queda fuera ${sancText(sancN(sancRules().agg))}.`, { title: '🟥 Roja con agresión', ok: 'Confirmar', danger: true });
+      const cur = curMatch();
+      if (!ok || cur !== m) return;
+    }
     const yellows = mine.filter((c) => c.type === 'Y').length;
     const id = uid();
-    m.cards.push({ id, team, player, type: d.type, min });
+    if (d.type === 'W') {
+      // Tarjeta blanca: 2 minutos de juego fuera (el reloj pausado o el descanso no descuentan)
+      const ms = matchRules().whiteMin * 60000;
+      m.cards.push({ id, team, player, pid, type: 'W', min, wAt: playMs(m), wMs: ms });
+      save(); renderModal();
+      return toast(`⬜ Blanca · ${player}: ${matchRules().whiteMin} minutos fuera`);
+    }
+    m.cards.push({ id, team, player, pid, type: d.type, min, ...(agg ? { agg: true } : {}) });
     // Doble amarilla = roja automática
-    if (d.type === 'Y' && yellows >= 1) m.cards.push({ id: uid(), team, player, type: 'R', min, auto: true, from: id });
-    if (m.status === 'pend') m.status = 'live';
+    if (d.type === 'Y' && yellows >= 1) m.cards.push({ id: uid(), team, player, pid, type: 'R', min, auto: true, from: id });
     save(); renderModal();
     if (d.type === 'Y' && yellows >= 1) toast(`🟥 Segunda amarilla: ${player} expulsado (roja automática)`);
-    else toast(`${d.type === 'Y' ? '🟨 Amarilla' : '🟥 Roja'} · ${player}`);
+    else toast(`${d.type === 'Y' ? '🟨 Amarilla' : agg ? '🟥 Roja con agresión' : '🟥 Roja'} · ${player}`);
   },
   delCard: (d) => {
-    const m = curMatch(); if (!m) return;
+    const m = editMatch(); if (!m) return;
     m.cards = m.cards.filter((c) => c.id !== d.id && c.from !== d.id); // si se quita la 2ª amarilla, se quita su roja
     save(); renderModal();
+  },
+  /* Ajuste del comité a la sanción de una tarjeta (apelación): cambia los partidos o la anula, con motivo */
+  sancAdj: async (d) => {
+    const m = editMatch(); if (!m || !isAdmin()) return;
+    const s = sanctionList(d.team).find((x) => x.matchId === m.id && x.kind === 'card' && x.pid === d.pid);
+    if (!s) return;
+    const opts = [{ key: '0', label: 'Anular (sin suspensión)', value: 0, style: 'ghost' }, ...sancChoices()];
+    if (s.adj) opts.push({ key: 'R', label: `Volver a la regla (${sancText(s.base)})`, value: 'rule', style: 'ghost' });
+    const n = await askChoice(`${s.player} · ${s.why}\nSegún la regla: ${sancText(s.base)}${s.adj ? `\nAhora: ${sancText(s.n)} (ajustada)` : ''}\n\n¿Cuántos partidos decidió el comité?`, opts, { title: '⚖️ Ajustar sanción' });
+    if (n == null) return;
+    const reason = await askText(n === 'rule' ? 'Motivo para volver a la regla:' : 'Motivo de la decisión del comité (queda registrado y es público):', { title: 'Motivo', placeholder: 'Ej: apelación aprobada en reunión del 3/12' });
+    if (reason == null) return;
+    if (reason.trim().length < 5) return toast('Escriba el motivo (al menos 5 letras)');
+    const cur = curMatch(); if (!cur) return;
+    const adj = Object.assign({}, cur.sancAdj);
+    if (n === 'rule') delete adj[d.pid];
+    else adj[d.pid] = { n, reason: reason.trim().slice(0, 200), by: auth ? auth.user : 'local', at: Date.now() };
+    cur.sancAdj = adj;
+    save(); renderModal();
+    toast(n === 'rule' ? 'Sanción según la regla' : `Sanción ajustada: ${sancText(sancN(n))}`);
+  },
+  /* Sanción directa del comité (por ejemplo, por un informe del árbitro) a partir de este partido */
+  sancAdd: async () => {
+    const m = editMatch(); if (!m || !isAdmin()) return;
+    const team = await askChoice('¿De qué equipo es el jugador?', [m.home, m.away].map((id, i) => ({ key: String(i + 1), label: tname(id), value: id, style: 'ghost' })), { title: '➕ Sanción del comité' });
+    if (!team) return;
+    const tm = teamById(team);
+    const pid = await askChoice('¿Qué jugador?', tm.players.map((p, i) => ({ key: String(i + 1), label: `${p.num ? p.num + ' · ' : ''}${p.name}`, value: p.id, style: 'ghost' })), { title: tname(team) });
+    if (!pid) return;
+    const n = await askChoice(`${playerById(team, pid).name}: se cumple desde el siguiente partido que juegue ${tname(team)}.`, sancChoices(), { title: 'Partidos de suspensión' });
+    if (n == null) return;
+    const reason = await askText('Motivo (queda registrado y es público):', { title: 'Motivo', placeholder: 'Ej: informe del árbitro por agresión verbal' });
+    if (reason == null) return;
+    if (reason.trim().length < 5) return toast('Escriba el motivo (al menos 5 letras)');
+    const cur = curMatch(); if (!cur) return;
+    cur.sancExtra = (cur.sancExtra || []).concat({ id: uid(), team, pid, player: playerById(team, pid).name, n, reason: reason.trim().slice(0, 200), by: auth ? auth.user : 'local', at: Date.now() });
+    save(); renderModal();
+    toast(`Sanción registrada: ${sancText(sancN(n))}`);
+  },
+  sancDel: async (d) => {
+    const m = editMatch(); if (!m || !isAdmin()) return;
+    if (!(await ask('Se quitará esta sanción del comité.', { title: 'Quitar sanción', ok: 'Quitar', danger: true }))) return;
+    m.sancExtra = (m.sancExtra || []).filter((e) => e.id !== d.id);
+    save(); renderModal(); toast('Sanción quitada');
+  },
+  matchAgree: async () => {
+    if (!isAdmin()) return;
+    const t = T(), pend = t.matches.filter((m) => m.status === 'pend' && m.duration !== MATCH_AGREE.duration);
+    const ok = await ask(`${catName(S.cat)}: ${MATCH_AGREE.halves} tiempos de ${MATCH_AGREE.duration} minutos con ${MATCH_AGREE.breakMin} de descanso, espera de ${MATCH_AGREE.waitMin} minutos, mínimo ${MATCH_AGREE.minStart} jugadores para iniciar, tarjeta blanca de ${MATCH_AGREE.whiteMin} minutos y W.O. ${MATCH_AGREE.woGoals}-0.${pend.length ? `\n\nTambién se cambiarán a ${MATCH_AGREE.duration} minutos por tiempo ${pend.length} partido(s) pendientes. Los ya jugados o en juego no cambian.` : ''}`, { title: 'Acuerdo del comité', ok: 'Aplicar' });
+    if (!ok) return;
+    const { duration, ...rest } = MATCH_AGREE;
+    t.config.duration = duration;
+    t.config.match = Object.assign({}, rest);
+    pend.forEach((m) => { m.duration = duration; });
+    save(); render(); toast('Reglas del partido según el acuerdo del comité');
+  },
+  formatComite: () => {
+    if (!isAdmin() || T().stage !== 'inscripcion') return;
+    Object.assign(T().config, COMITE_FORMAT);
+    save(); render(); toast('Formato del comité aplicado. Revise y realice el sorteo.');
+  },
+  sancDefault: () => {
+    if (!isAdmin()) return;
+    T().config.sanc = Object.assign({}, SANC_DEF);
+    save(); render(); toast('Sanciones según el acuerdo del comité');
   },
   finish: () => finishMatch(),
   reopen: () => reopenMatch(),
@@ -3391,8 +4212,11 @@ const actions = {
   },
 };
 
-const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow', 'openCompare',
+const PUBLIC_ACTIONS = new Set(['cat', 'tab', 'close', 'view', 'viewTeam', 'viewTeamCat', 'openMatch', 'syncInfo', 'syncNow', 'install', 'openTorneos', 'switchTorneo', 'theme', 'share', 'scrollRow', 'openCompare',
   'capOpen', 'capSave', 'capBaja', 'capLogout', 'openRules', 'crestRandom', 'crestNone', 'crestPreset', 'crestSet']);
+/** Acciones del árbitro (cada una revisa además que sea SU partido: editMatch). */
+const REF_ACTIONS = new Set(['openMyMatch', 'addOnField', 'changePass', 'logout', 'goal', 'goalPick', 'goalCancel', 'goalMode', 'scorer', 'penMissDel', 'present', 'presentAll',
+  'start', 'pause', 'addTime', 'endHalf', 'secondHalf', 'wo', 'kick', 'kickUndo', 'card', 'delCard', 'finish']);
 
 document.addEventListener('submit', async (e) => {
   if (e.target.id === 'loginForm') { e.preventDefault(); return doLogin(); }
@@ -3404,7 +4228,7 @@ document.addEventListener('submit', async (e) => {
       if (status !== 200) { if (status === 409 && modal.inv && /invitación/.test(j.error || '')) { modal.inv.used = true; renderModal(); } return toast(j.error || 'No se pudo crear la inscripción'); }
       setCap({ id: j.reg.id, token: j.token, name: j.reg.name }, j.reg);
       modal = { type: 'cap' }; renderModal(); render();
-      ask(`Su código es ${j.reg.id}\n\nAnótelo junto con su clave: los necesitará para entrar desde otro teléfono. Ahora agregue a sus jugadores y envíe la inscripción.`, { title: '✅ Inscripción creada', ok: 'Entendido' });
+      ask(`Su código de equipo es ${j.reg.id}\n\nAnótelo junto con su clave. Para volver a entrar desde cualquier teléfono: ${location.origin}/capitan\n\nAhora agregue a sus jugadores y envíe la inscripción.`, { title: '✅ Inscripción creada', ok: 'Entendido' });
     } catch (err) { toast('Sin conexión. Intente de nuevo.'); }
     return;
   }
@@ -3436,12 +4260,12 @@ document.addEventListener('submit', async (e) => {
   }
   if (e.target.id === 'orgForm') {
     e.preventDefault();
-    const user = $('#o-user').value.trim().toLowerCase(), pass = $('#o-pass').value;
+    const user = $('#o-user').value.trim().toLowerCase(), pass = $('#o-pass').value, role = ($('#o-role') || {}).value || 'admin';
     if (!user || !pass) return toast('Escriba usuario y contraseña');
-    const { status, j } = await authCall({ action: 'add', user, pass });
+    const { status, j } = await authCall({ action: 'add', user, pass, role });
     if (status === 401) return sessionExpired();
     if (status !== 200) return toast((j && j.error) || 'No se pudo agregar');
-    orgs = j; render(); toast('✅ Usuario ' + user + ' agregado');
+    orgs = j; render(); toast('✅ ' + (role === 'arbitro' ? 'Árbitro ' : 'Organizador ') + user + ' agregado');
   }
 });
 
@@ -3452,11 +4276,12 @@ document.addEventListener('click', (e) => {
   const fn = actions[el.dataset.a];
   if (!fn) return;
   e.preventDefault();
-  if (!isAdmin() && !PUBLIC_ACTIONS.has(el.dataset.a)) return toast('Ingrese como organizador para editar');
+  if (!isAdmin() && !PUBLIC_ACTIONS.has(el.dataset.a) && !(isRef() && REF_ACTIONS.has(el.dataset.a))) return toast(isRef() ? 'Como árbitro solo puede anotar en sus partidos' : 'Ingrese como organizador para editar');
   fn(el.dataset, el);
 });
 
 document.addEventListener('input', (e) => {
+  if (e.target.id === 'psearch') { S.psearch = e.target.value.slice(0, 60); const r = $('#presults'); if (r) r.innerHTML = playerResultsHTML(S.psearch); return; }
   if (e.target.matches('[data-pl]')) checkPlayers();
   if (e.target.matches('[data-cpl]')) { const row = e.target.closest('.cprow'); if (row) row.dataset.srv = ''; checkCapPlayers(); }
   if (e.target.id === 'f-name' && modal && modal.crest && modal.crest.e === 'inicial') updateCrestUI();
@@ -3479,8 +4304,8 @@ document.addEventListener('change', (e) => {
   if (el.dataset.insc) {
     if (!isAdmin()) return;
     const k = el.dataset.insc, cur = inscOf();
-    if (k === 'open') cur.open = el.checked;
-    else if (k === 'until' || k === 'changesUntil') { const ms = el.value ? new Date(el.value).getTime() : 0; cur[k] = isNaN(ms) ? 0 : ms; }
+    if (k === 'open' || k === 'local' || k === 'changesLeg1') cur[k] = el.checked;
+    else if (k === 'from' || k === 'until' || k === 'changesUntil') { const ms = el.value ? new Date(el.value).getTime() : 0; cur[k] = isNaN(ms) ? 0 : ms; }
     else cur[k] = Math.max(1, Math.min(30, Math.round(num(el.value, cur[k]))));
     if (cur.min > cur.max) { if (k === 'min') cur.min = cur.max; else cur.max = cur.min; toast('El mínimo no puede ser mayor que el máximo'); }
     else if (cur.until && cur.changesUntil && cur.changesUntil < cur.until) toast('⚠️ El cierre de altas y bajas quedó antes que el de inscripción');
@@ -3504,11 +4329,27 @@ document.addEventListener('change', (e) => {
     }
     return;
   }
+  if (el.dataset.mrule) {
+    if (!isAdmin()) return;
+    const c = T().config;
+    c.match = Object.assign({}, matchRules(c), { [el.dataset.mrule]: Math.round(num(el.value)) });
+    delete c.match.duration; // la duración está en c.duration
+    save(); render(); toast('Reglas del partido actualizadas');
+    return;
+  }
+  if (el.dataset.sanc) {
+    if (!isAdmin()) return;
+    const c = T().config, k = el.dataset.sanc;
+    c.sanc = Object.assign(sancRules(c), { [k]: el.value === 'all' ? 'all' : Math.max(0, Math.round(num(el.value))) });
+    save(); render();
+    toast('Sanciones actualizadas');
+    return;
+  }
   if (el.dataset.tcfg) {
     if (!isAdmin()) return;
     const g = TC(), k = el.dataset.tcfg;
-    g[k] = Math.max(k === 'subs' ? 0 : 1, Math.min(k === 'minPlayers' ? 60 : 30, Math.round(num(el.value, g[k]))));
-    if (g.minPlayers > g.starters + g.subs) { g.minPlayers = g.starters + g.subs; toast('El mínimo no puede superar el total del equipo'); }
+    g[k] = Math.max(1, Math.min(30, Math.round(num(el.value, g[k]))));
+    delete g.subs; delete g.minPlayers; // campos antiguos: ya no se usan
     save(); render();
     return;
   }
@@ -3537,15 +4378,21 @@ document.addEventListener('change', (e) => {
     if (el.type === 'radio' || el.tagName === 'SELECT') render();
     return;
   }
+  if (el.id === 'm-ref') {
+    const m = editMatch(); if (!m || !isAdmin()) return;
+    m.ref = el.value || null;
+    save(); renderModal(); toast(m.ref ? '🧑‍⚖️ Árbitro asignado: ' + m.ref : 'Sin árbitro asignado');
+    return;
+  }
   if (el.id === 'm-dur') {
-    const m = curMatch(); if (!m) return;
+    const m = editMatch(); if (!m || !isAdmin()) return;
     m.duration = Math.max(1, Math.min(200, Math.round(num(el.value, m.duration))));
     m.alerted = false; save(); updateClock();
     return;
   }
   if (el.id === 'c-team' && modal) { modal.cardTeam = el.value; renderModal(); return; }
   if (['m-date', 'm-time', 'm-field'].includes(el.id)) {
-    const m = curMatch(); if (!m || !isAdmin()) return;
+    const m = editMatch(); if (!m || !isAdmin()) return;
     m[{ 'm-date': 'date', 'm-time': 'time', 'm-field': 'field' }[el.id]] = el.value.trim();
     save(); toast('Programación guardada');
     return;
@@ -3596,6 +4443,7 @@ startSync();
 // Enlace de invitación para capitanes: /?i=XXXX-XXXX
 (() => {
   const code = new URLSearchParams(location.search).get('i');
+  if (!code && CAP_URL) { S.tab = 'equipos'; render(); actions.capOpen(); return; } // con sesión guardada abre su inscripción
   if (!code) return;
   try { history.replaceState(null, '', location.pathname); } catch (e) { /* nada */ }
   S.tab = 'equipos'; render();

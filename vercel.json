@@ -1,9 +1,11 @@
 {
   "rewrites": [
-    { "source": "/admin", "destination": "/index.html" }
+    { "source": "/admin", "destination": "/index.html" },
+    { "source": "/capitan", "destination": "/index.html" }
   ],
   "redirects": [
-    { "source": "/admin/", "destination": "/admin", "permanent": false }
+    { "source": "/admin/", "destination": "/admin", "permanent": false },
+    { "source": "/capitan/", "destination": "/capitan", "permanent": false }
   ],
   "headers": [
     { "source": "/sw.js", "headers": [{ "key": "Cache-Control", "value": "no-cache" }] }

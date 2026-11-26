@@ -1,6 +1,7 @@
 // Inscripciones en línea: los capitanes inscriben a su equipo y los organizadores aprueban, observan o rechazan.
 // Todas las reglas se validan aquí (en el servidor), no solo en el teléfono del capitán.
-const { configured, redis, hashPass, checkPass, signData, verifyData, verify, readBody } = require('./_lib');
+const { configured, redis, hashPass, checkPass, signData, verifyData, verify, verifyRole, readBody, roleOf, readAll, casWrite } = require('./_lib');
+const Rules = require('../rules.js');
 
 const K_INSC = 'torneo:insc';     // hash: código → inscripción (JSON)
 const K_BANS = 'torneo:bajas';    // hash: "torneo|nombre" → jugador dado de baja (no puede inscribirse en otro equipo)
@@ -32,19 +33,21 @@ function inscCfg(cat) {
   const c = (cat && cat.config && cat.config.insc) || {};
   return {
     open: !!c.open,
+    from: Number(c.from) || 0,               // apertura (acuerdo: a partir del día 25)
     until: Number(c.until) || 0,
     changesUntil: Number(c.changesUntil) || 0,
+    // Acuerdo: altas y bajas de jugadores durante toda la primera vuelta (se cierran solas al terminarla)
+    changesLeg1: c.changesLeg1 != null ? !!c.changesLeg1 : true,
+    // Acuerdo del comité: de 5 a 8 jugadores por equipo
     min: Math.max(1, Number(c.min) || 5),
-    max: Math.max(1, Number(c.max) || 10),
+    max: Math.max(1, Number(c.max) || 8),
+    // Solo jugadores del municipio. Por defecto todas las categorías menos Femenino (jugadoras libres).
+    local: c.local != null ? !!c.local : !/femen/i.test((cat && cat.name) || ''),
   };
 }
-/** regOpen: se pueden crear y enviar inscripciones. chOpen: se pueden dar altas y bajas de jugadores. */
-function windows(cfg) {
-  const now = Date.now();
-  const regOpen = cfg.open && (!cfg.until || now <= cfg.until);
-  const chOpen = cfg.open && (cfg.changesUntil ? now <= cfg.changesUntil : regOpen);
-  return { regOpen, chOpen: chOpen || regOpen };
-}
+/** regOpen: se pueden crear y enviar inscripciones. chOpen: altas y bajas de jugadores (regla compartida en rules.js). */
+const windows = (cfg, cat) => Rules.inscWindows(cfg, cat, Date.now());
+const chClosedMsg = (w) => (w.leg1Done ? 'Terminó la primera vuelta: ya no se pueden dar altas ni bajas de jugadores' : w.notYet ? 'La inscripción aún no abre' : 'El plazo para altas y bajas de jugadores ya cerró');
 
 async function loadData() {
   const raw = await redis(['GET', 'torneo:data']);
@@ -91,23 +94,26 @@ const validTeamName = (n) => n.length >= 2 && n.length <= 40;
 const validPersonName = (n) => /^[\p{L} .'-]{5,60}$/u.test(n) && n.split(' ').filter((w) => w.replace(/[.'-]/g, '').length >= 2).length >= 2;
 const validPhone = (p) => digits(p).length >= 8 && digits(p).length <= 15;
 /**
- * Documento opcional para distinguir a dos personas con el mismo nombre:
- * DUI (00000000-0) o carné de minoridad / partida (5 a 15 letras o números).
- * Devuelve '' si está vacío y null si no es válido.
+ * DUI opcional (00000000-0): sirve para distinguir a dos personas con el mismo nombre.
+ * Solo DUI (acuerdo: sin carné). Devuelve '' si está vacío y null si no es válido.
  */
 const normDoc = (d) => {
-  const x = String(d || '').toUpperCase().replace(/[\s.]/g, '');
+  const x = String(d || '').replace(/[\s.]/g, '');
   if (!x) return '';
   if (/^\d{8}-?\d$/.test(x)) { const n = x.replace('-', ''); return n.slice(0, 8) + '-' + n.slice(8); }
-  return /^[A-Z0-9-]{5,15}$/.test(x) ? x : null;
+  return null;
 };
+const BAD_DUI = 'DUI no válido: debe tener 9 números (00000000-0)';
 
-function cleanRep(r) { r = r || {}; return { name: clean(r.name), phone: clean(r.phone, 20) }; }
+/** Representante: nombre, teléfono y DUI (opcional). */
+function cleanRep(r) { r = r || {}; return { name: clean(r.name), phone: clean(r.phone, 20), doc: clean(r.doc, 16) }; }
+/** Jugadores: nombre, número, DUI (opcional) y si es el capitán del equipo. */
 function cleanPlayers(list) {
   return (Array.isArray(list) ? list : []).slice(0, 40).map((p) => ({
     name: clean(p && p.name),
     num: String((p && p.num) ?? '').trim().slice(0, 3),
     doc: clean(p && p.doc, 16),
+    ...(p && p.cap ? { cap: true } : {}),
   })).filter((p) => p.name);
 }
 function cleanCrest(c) {
@@ -124,7 +130,7 @@ function cleanCrest(c) {
  */
 function playerIndex(data, regs, reg) {
   const names = new Map(), docs = new Map();
-  const add = (n, label, doc) => { if (!names.has(n)) names.set(n, []); names.get(n).push({ label, doc: doc || '' }); };
+  const add = (n, label, doc, name) => { if (!names.has(n)) names.set(n, []); names.get(n).push({ label, doc: doc || '', name: name || n }); };
   const tor = data && data.torneos && data.torneos[reg.tor];
   const catLabel = (k) => (tor && tor.cats[k] && tor.cats[k].name) || 'otra categoría';
   const live = new Set();
@@ -133,7 +139,7 @@ function playerIndex(data, regs, reg) {
     live.add(r.id);
     if (r.id === reg.id) continue;
     for (const p of r.players || []) {
-      add(norm(p.name), `${r.name} (${catLabel(r.cat)})`, p.doc);
+      add(norm(p.name), `${r.name} (${catLabel(r.cat)})`, p.doc, p.name);
       if (p.doc) docs.set(p.doc, `${r.name} (${catLabel(r.cat)})`);
     }
   }
@@ -141,7 +147,7 @@ function playerIndex(data, regs, reg) {
     for (const [k, cat] of Object.entries(tor.cats || {})) {
       for (const tm of cat.teams || []) {
         if ((reg.teamId && tm.id === reg.teamId) || (tm.insc && live.has(tm.insc))) continue;
-        for (const p of tm.players || []) add(norm(p.name), `${tm.name} (${catLabel(k)})`, '');
+        for (const p of tm.players || []) add(norm(p.name), `${tm.name} (${catLabel(k)})`, '', p.name);
       }
     }
   }
@@ -153,7 +159,7 @@ function banIndex(bans, tor) {
     if (b.tor !== tor) continue;
     const n = norm(b.name);
     if (!names.has(n)) names.set(n, []);
-    names.get(n).push({ label: b.team, doc: b.doc || '' });
+    names.get(n).push({ label: b.team, doc: b.doc || '', name: b.name });
     if (b.doc) docs.set(b.doc, b.team);
   }
   return { names, docs };
@@ -190,21 +196,25 @@ function checkPlayers(players, { cfg, idx, bans, reg, send }) {
     const twin = clash(seen.get(n), doc).hard;
     if (!validPersonName(p.name)) msg = 'Escriba nombre y apellido (solo letras)';
     else if (p.num !== '' && !(/^\d{1,2}$/.test(p.num))) msg = 'El número de camisa debe ser de 0 a 99';
-    else if (doc === null) msg = 'Documento no válido: DUI (00000000-0) o número de carné';
-    else if (twin) msg = `Repetido con el jugador ${twin.label}${doc ? '' : ' (si es otra persona, escriba el DUI o carné de ambos)'}`;
-    else if (doc && seenDoc.has(doc)) msg = `Documento repetido con el jugador ${seenDoc.get(doc) + 1}`;
+    else if (doc === null) msg = BAD_DUI;
+    else if (twin) msg = `Repetido con el jugador ${twin.label}${doc ? '' : ' (si es otra persona, escriba el DUI de ambos)'}`;
+    else if (doc && seenDoc.has(doc)) msg = `DUI repetido con el jugador ${seenDoc.get(doc) + 1}`;
     else if (p.num !== '' && seenNum.has(String(+p.num))) msg = `El número ${+p.num} ya lo usa el jugador ${seenNum.get(String(+p.num)) + 1}`;
     else {
       const b = clash(bi.names.get(n), doc), bd = doc && bi.docs.get(doc);
       const o = clash(idx.names.get(n), doc), od = doc && idx.docs.get(doc);
       if (bd || b.hard) msg = `Fue dado de baja de ${bd || b.hard.label} y no puede volver a inscribirse en ningún equipo`;
-      else if (od) msg = `Ese documento ya está inscrito en ${od}`;
+      else if (od) msg = `Ese DUI ya está inscrito en ${od}`;
       else if (o.hard) msg = doc ? `Ya está inscrito en ${o.hard.label}`
-        : `Ya hay un jugador con este nombre en ${o.hard.label}. Si es la misma persona, debe decidir en cuál equipo jugará; si es otra persona, escriba su DUI o carné para diferenciarlo`;
+        : `Ya hay un jugador con este nombre en ${o.hard.label}. Si es la misma persona, debe decidir en cuál equipo jugará; si es otra persona, escriba su DUI para diferenciarlo`;
       else if (approved.has(n) && String(approved.get(n).num || '') !== String(p.num === '' ? '' : +p.num)) msg = `Ya aprobado con el número ${approved.get(n).num || 'sin número'}: debe usar el mismo número todo el campeonato`;
       else {
-        if (b.soft) flags.push({ name: p.name, msg: `Mismo nombre que un jugador dado de baja de ${b.soft.label}. Verifique con el documento que sea otra persona.` });
-        if (o.soft) flags.push({ name: p.name, msg: `Mismo nombre que un jugador de ${o.soft.label}. Verifique con el DUI o carné que sean personas distintas.` });
+        if (b.soft) flags.push({ name: p.name, msg: `Mismo nombre que un jugador dado de baja de ${b.soft.label}. Verifique con el DUI que sea otra persona.` });
+        if (o.soft) flags.push({ name: p.name, msg: `Mismo nombre que un jugador de ${o.soft.label}. Verifique con el DUI que sean personas distintas.` });
+        else if (!b.soft) {
+          const sim = similarTo(n, doc, bi, idx);
+          if (sim) flags.push({ name: p.name, msg: sim });
+        }
       }
     }
     if (!msg) {
@@ -222,6 +232,24 @@ function checkPlayers(players, { cfg, idx, bans, reg, send }) {
   if (players.length > cfg.max) general.push(`Máximo ${cfg.max} jugadores por equipo (hay ${players.length})`);
   if (send && players.length < cfg.min) general.push(`Se requieren al menos ${cfg.min} jugadores (hay ${players.length})`);
   return { errors, general, flags };
+}
+
+/**
+ * Nombre parecido a un jugador de otro equipo o dado de baja (ej. "David Gómez" y "David Antonio Gómez Vásquez").
+ * Puede ser la misma persona escrita de otra forma: se avisa al capitán y a la organización. Si los dos tienen
+ * documento y es distinto, son personas distintas y no se avisa.
+ */
+function similarTo(n, doc, bi, idx) {
+  for (const [src, banned] of [[bi.names, true], [idx.names, false]]) {
+    for (const [n2, list] of src) {
+      if (!Rules.similarNames(n, n2)) continue;
+      const o = list.find((x) => !(doc && x.doc && x.doc !== doc));
+      if (!o) continue;
+      return banned ? `Nombre parecido a ${o.name}, dado de baja de ${o.label} (intransferible). Si es la misma persona no puede inscribirse; si es otra, escriba su DUI.`
+        : `Nombre parecido a ${o.name}, que ya está en ${o.label}. Si es la misma persona no puede estar en dos equipos; si es otra, escriba su DUI para diferenciarla.`;
+    }
+  }
+  return '';
 }
 
 /** Avisos para la organización: conflictos (hard) y posibles homónimos por verificar. */
@@ -259,8 +287,8 @@ module.exports = async function handler(req, res) {
       if (!inv) { await sleep(800); return fail(res, 404, 'Código de invitación no válido. Revise el enlace que le enviaron.'); }
       const data = await loadData();
       const cat = data && data.torneos && data.torneos[inv.tor] && data.torneos[inv.tor].cats[inv.cat];
-      const cfg = inscCfg(cat), w = windows(cfg);
-      return res.status(200).json({ invite: inv.code, tor: inv.tor, cat: inv.cat, catName: cat ? cat.name : '', label: inv.label, used: !!inv.usedBy, open: w.regOpen, until: cfg.until });
+      const cfg = inscCfg(cat), w = windows(cfg, cat);
+      return res.status(200).json({ invite: inv.code, tor: inv.tor, cat: inv.cat, catName: cat ? cat.name : '', label: inv.label, used: !!inv.usedBy, open: w.regOpen, notYet: w.notYet, from: cfg.from, until: cfg.until });
     }
 
     /* ---- Capitán: crear inscripción (solo con invitación de la organización) ---- */
@@ -275,16 +303,17 @@ module.exports = async function handler(req, res) {
         const cat = tor && tor.cats && tor.cats[b.cat];
         if (!cat) return fail(res, 404, 'Categoría no encontrada');
         const cfg = inscCfg(cat);
-        if (!windows(cfg).regOpen) return fail(res, 403, cfg.open ? 'El plazo de inscripción ya cerró' : 'La inscripción en línea de esta categoría no está habilitada');
+        if (!windows(cfg, cat).regOpen) return fail(res, 403, windows(cfg, cat).notYet ? `La inscripción abre el ${new Date(cfg.from).toLocaleString('es-SV', { timeZone: 'America/El_Salvador', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}` : cfg.open ? 'El plazo de inscripción ya cerró' : 'La inscripción en línea de esta categoría no está habilitada');
         const name = clean(b.name, 40), rep = cleanRep(b.rep);
         if (!validTeamName(name)) return fail(res, 400, 'Escriba el nombre del equipo (2 a 40 letras)');
         if (!validPersonName(rep.name)) return fail(res, 400, 'Escriba nombre y apellido del representante');
         if (!validPhone(rep.phone)) return fail(res, 400, 'Escriba un teléfono válido del representante');
+        if (normDoc(rep.doc) === null) return fail(res, 400, 'Representante: ' + BAD_DUI);
         if (typeof b.pass !== 'string' || b.pass.length < 6 || b.pass.length > 60) return fail(res, 400, 'La clave debe tener al menos 6 caracteres');
         const regs = await allRegs();
         if (regs.filter((r) => r.tor === b.tor).length >= MAX_REGS) return fail(res, 429, 'Se alcanzó el máximo de inscripciones');
         const reg = {
-          id: newCode(new Set(regs.map((r) => r.id))), tor: b.tor, cat: b.cat, name, rep, rep2: { name: '', phone: '' },
+          id: newCode(new Set(regs.map((r) => r.id))), tor: b.tor, cat: b.cat, name, rep: Object.assign(rep, { doc: normDoc(rep.doc) || '' }), rep2: { name: '', phone: '', doc: '' },
           crest: cleanCrest(b.crest), colors: '', players: [], bajas: [], status: 'borrador',
           createdAt: Date.now(), updatedAt: Date.now(), pass: hashPass(b.pass), pv: 1, log: [], invite: inv.code,
         };
@@ -320,7 +349,7 @@ module.exports = async function handler(req, res) {
         const data = await loadData();
         const cat = data && data.torneos && data.torneos[reg.tor] && data.torneos[reg.tor].cats[reg.cat];
         if (!cat) return fail(res, 404, 'La categoría ya no existe');
-        const cfg = inscCfg(cat), win = windows(cfg);
+        const cfg = inscCfg(cat), win = windows(cfg, cat);
         if (reg.status === 'rechazada') return fail(res, 403, 'Esta inscripción fue rechazada. Comuníquese con la organización.');
         const [regs, bans] = await Promise.all([allRegs(), allBans()]);
 
@@ -329,7 +358,7 @@ module.exports = async function handler(req, res) {
           const p = (reg.players || []).find((x) => norm(x.name) === n);
           if (!p) return fail(res, 404, 'Ese jugador no está en la lista');
           if (!(reg.approvedPlayers || []).some((x) => norm(x.name) === n)) return fail(res, 400, 'Este jugador aún no fue aprobado: puede quitarlo de la lista sin darle de baja');
-          if (!win.chOpen) return fail(res, 403, 'El plazo para altas y bajas de jugadores ya cerró');
+          if (!win.chOpen) return fail(res, 403, chClosedMsg(win));
           const reason = clean(b.reason, 200);
           if (reason.length < 10) return fail(res, 400, 'Explique el motivo de la baja (al menos 10 letras)');
           reg.players = reg.players.filter((x) => norm(x.name) !== n);
@@ -346,7 +375,7 @@ module.exports = async function handler(req, res) {
         const sent = !!reg.sentAt;
         const send = !!b.send || sent;
         const fullEdit = reg.status === 'observada' || win.regOpen;
-        if (!fullEdit && !(sent && win.chOpen)) return fail(res, 403, sent ? 'El plazo para altas y bajas de jugadores ya cerró' : 'El plazo de inscripción ya cerró');
+        if (!fullEdit && !(sent && win.chOpen)) return fail(res, 403, sent ? chClosedMsg(win) : 'El plazo de inscripción ya cerró');
 
         const next = {
           name: fullEdit ? clean(b.name, 40) : reg.name,
@@ -358,19 +387,25 @@ module.exports = async function handler(req, res) {
         if (!validTeamName(next.name)) general.push('Escriba el nombre del equipo (2 a 40 letras)');
         else if (teamNameTaken(next.name, data, regs, reg)) general.push(`Ya existe un equipo llamado "${next.name}" en ${cat.name}`);
         if (!validPersonName(next.rep.name) || !validPhone(next.rep.phone)) general.push('Complete nombre y teléfono del representante propietario');
+        if (normDoc(next.rep.doc) === null) general.push('Representante propietario: ' + BAD_DUI);
+        if (normDoc(next.rep2.doc) === null) general.push('Representante suplente: ' + BAD_DUI);
+        const caps = next.players.filter((p) => p.cap).length;
+        if (caps > 1) general.push('Marque un solo capitán');
+        else if (send && !caps) general.push('Indique quién es el capitán del equipo (marque “Capitán” en uno de los jugadores)');
         if (send) {
           if (!validPersonName(next.rep2.name) || !validPhone(next.rep2.phone)) general.push('Complete nombre y teléfono del representante suplente');
           else if (norm(next.rep2.name) === norm(next.rep.name)) general.push('El suplente debe ser una persona distinta al representante propietario');
           if (!next.crest) general.push('Agregue el logo o escudo del equipo');
           if (next.colors.length < 3) general.push('Indique los colores del uniforme');
-          if (!sent && !b.accept) general.push('Debe confirmar que los jugadores pertenecen o residen permanentemente en el municipio y que acepta el reglamento');
+          if (!sent && !b.accept) general.push(cfg.local ? 'Debe confirmar que los jugadores pertenecen o residen permanentemente en el municipio y que acepta el reglamento' : 'Debe confirmar que acepta el reglamento');
         }
         const idx = playerIndex(data, regs, reg);
         const chk = checkPlayers(next.players, { cfg, idx, bans, reg, send });
         general.push(...chk.general);
         if (general.length || chk.errors.length) return fail(res, 422, general[0] || 'Hay jugadores con errores (marcados en rojo)', { errors: chk.errors, general });
 
-        next.players = next.players.map((p) => ({ name: p.name, num: p.num === '' ? '' : String(+p.num), doc: normDoc(p.doc) || '' }));
+        next.players = next.players.map((p) => ({ name: p.name, num: p.num === '' ? '' : String(+p.num), doc: normDoc(p.doc) || '', ...(p.cap ? { cap: true } : {}) }));
+        next.rep.doc = normDoc(next.rep.doc) || ''; next.rep2.doc = normDoc(next.rep2.doc) || '';
         const changed = JSON.stringify(next) !== JSON.stringify({ name: reg.name, rep: reg.rep, rep2: reg.rep2, crest: reg.crest, colors: reg.colors, players: reg.players });
         const before = new Set((reg.players || []).map((p) => norm(p.name)));
         const added = next.players.filter((p) => !before.has(norm(p.name))).map((p) => p.name);
@@ -384,13 +419,72 @@ module.exports = async function handler(req, res) {
           addLog(reg, 'capitán', 'cambio', added.length ? 'Altas: ' + added.join(', ') : changed ? 'Datos actualizados' : 'Reenviada para revisión');
         }
         await putReg(reg);
-        return res.status(200).json({ reg: publicReg(reg) });
+        return res.status(200).json({ reg: publicReg(reg), warn: chk.flags });
+      });
+    }
+
+    /* ---- Inscribir a un jugador en el momento del partido (organizador o el árbitro del partido) ----
+       Acuerdo: durante la primera vuelta, si el equipo tiene cupo. Mismas validaciones que una inscripción:
+       un jugador en un solo equipo del torneo, los dados de baja no vuelven, número sin repetir. */
+    if (action === 'matchAdd') {
+      const s = await verifyRole(req);
+      if (!s) return fail(res, 401, 'Debe ingresar con su usuario');
+      return await withLock(async () => {
+        for (let k = 0; k < 5; k++) {
+          const { rev, data } = await readAll();
+          const cat = data && data.torneos && data.torneos[b.tor] && data.torneos[b.tor].cats[b.cat];
+          if (!cat) return fail(res, 404, 'Categoría no encontrada');
+          Rules.normalizeCat(cat);
+          const m = cat.matches.find((x) => x.id === b.matchId);
+          if (!m) return fail(res, 404, 'Partido no encontrado');
+          const team = cat.teams.find((x) => x.id === b.team);
+          if (!team || ![m.home, m.away].includes(team.id)) return fail(res, 400, 'Ese equipo no juega este partido');
+          if (s.role !== 'admin' && m.ref !== s.user) return fail(res, 403, 'Este partido no está asignado a usted');
+          if (m.status === 'done') return fail(res, 403, 'El partido ya terminó');
+          const cfg = inscCfg(cat);
+          // La regla de la primera vuelta vale aunque la inscripción en línea esté apagada
+          const win = Rules.inscWindows(Object.assign({}, cfg, { open: true, from: 0 }), cat, Date.now());
+          if (!win.chOpen) return fail(res, 403, chClosedMsg(win));
+          if (team.players.length >= cfg.max) return fail(res, 409, `${team.name} ya tiene el máximo de ${cfg.max} jugadores`);
+          const p = { name: clean(b.name), num: String(b.num ?? '').trim().slice(0, 3), doc: clean(b.doc, 16) };
+          const [regs, bans] = await Promise.all([allRegs(), allBans()]);
+          const reg = team.insc ? regs.find((r) => r.id === team.insc) || null : null;
+          // Equipo inscrito por el organizador (sin inscripción en línea): se revisa igual, como si fuera una
+          const asReg = reg || { id: '_t' + team.id, tor: b.tor, cat: b.cat, teamId: team.id, players: team.players.map((x) => ({ name: x.name, num: x.num || '', doc: '' })) };
+          if (!reg) asReg.approvedPlayers = asReg.players.slice();
+          const list = asReg.players.concat(p);
+          const chk = checkPlayers(list, { cfg, idx: playerIndex(data, regs, asReg), bans, reg: asReg, send: false });
+          const mine = chk.errors.find((e) => e.i === list.length - 1);
+          if (mine) return fail(res, 422, mine.msg);
+          const gen = chk.general.find((x) => /^Máximo/.test(x));
+          if (gen) return fail(res, 409, gen);
+          const np = { name: p.name, num: p.num === '' ? '' : String(+p.num), doc: normDoc(p.doc) || '' };
+          // Datos del torneo: el jugador entra como suplente y, si ya se pasó lista, queda presente
+          const pid = Rules.newPlayerId(cat, team.id, np.name);
+          team.players.push({ id: pid, name: np.name, num: np.num, sub: true, addedAt: Date.now(), addedBy: s.user, addedIn: m.id });
+          const pr = Rules.presentOf(m, team.id);
+          if (pr) m.present = Object.assign({}, m.present, { [team.id]: pr.concat(pid) });
+          const w = await casWrite(rev, JSON.stringify(data), { at: Date.now(), by: s.user, role: s.role, add: np.name });
+          if (!w.ok) continue; // otro guardó al mismo tiempo: se vuelve a intentar sobre lo nuevo
+          // Inscripción en línea del capitán: queda igual que el equipo (aprobado en la cancha)
+          if (reg) {
+            reg.players = reg.players.concat(np);
+            reg.approvedPlayers = (reg.approvedPlayers || []).concat(np);
+            reg.updatedAt = Date.now();
+            addLog(reg, s.user, 'cambio', `Alta en la cancha (${Rules.tname(cat, m.home)} vs ${Rules.tname(cat, m.away)}): ${np.name}${np.num ? ' #' + np.num : ''}`);
+            await putReg(reg);
+          }
+          return res.status(200).json({ rev: w.rev, data, player: { id: pid, ...np }, warn: chk.flags.filter((f) => f.name === np.name) });
+        }
+        return fail(res, 503, 'El sistema está ocupado, intente de nuevo');
       });
     }
 
     /* ---- Organizadores ---- */
     const me = await verify(req);
     if (!me) return fail(res, 401, 'Debe ingresar como organizador');
+    // Los árbitros no aprueban inscripciones ni administran invitaciones
+    if ((await roleOf(me)) !== 'admin') return fail(res, 403, 'Su usuario es de árbitro: no tiene permiso para esta acción');
 
     if (action === 'list') {
       const [regs, bans, invites] = await Promise.all([allRegs(), allBans(), allInvites()]);
@@ -471,7 +565,7 @@ module.exports = async function handler(req, res) {
         if (reg.status !== 'aprobada') return fail(res, 409, 'Esta inscripción no está aprobada');
         const docs = new Map([...(reg.approvedPlayers || []), ...(reg.players || [])].map((p) => [norm(p.name), p.doc || '']));
         const nums = new Map((reg.players || []).map((p) => [norm(p.name), p.num]));
-        const players = cleanPlayers(b.players).map((p) => ({ name: p.name, num: /^\d{1,2}$/.test(p.num) ? String(+p.num) : '', doc: docs.get(norm(p.name)) || '' }));
+        const players = cleanPlayers(b.players).map((p) => ({ name: p.name, num: /^\d{1,2}$/.test(p.num) ? String(+p.num) : '', doc: docs.get(norm(p.name)) || '', ...(p.cap ? { cap: true } : {}) }));
         const after = new Set(players.map((p) => norm(p.name))), before = new Set(reg.players.map((p) => norm(p.name)));
         const added = players.filter((p) => !before.has(norm(p.name))).map((p) => p.name);
         const removed = reg.players.filter((p) => !after.has(norm(p.name)));

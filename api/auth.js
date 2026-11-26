@@ -1,5 +1,5 @@
 // Acceso de organizadores: crear la primera cuenta, ingresar y administrar organizadores.
-const { configured, redis, hashPass, checkPass, signToken, verify, readBody, USERS } = require('./_lib');
+const { configured, redis, hashPass, checkPass, signToken, verify, readBody, USERS, ROLES, ROLE_NAMES, roleOf } = require('./_lib');
 
 const cleanUser = (u) => String(u || '').trim().toLowerCase();
 const validUser = (u) => /^[a-z0-9._-]{3,30}$/.test(u);
@@ -40,34 +40,59 @@ module.exports = async function handler(req, res) {
           return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
         }
       }
-      return res.status(200).json({ user, token: await signToken(user) });
+      return res.status(200).json({ user, role: await roleOf(user), token: await signToken(user) });
     }
 
     // Acciones que requieren sesión
     const me = await verify(req);
     if (!me) return res.status(401).json({ error: 'Sesión no válida' });
-    const list = async () => (await redis(['HKEYS', USERS])).sort();
+    const myRole = await roleOf(me);
 
-    if (action === 'list') return res.status(200).json({ me, users: await list() });
+    // Cualquier usuario: saber su rol y cambiar su propia contraseña
+    if (action === 'me') return res.status(200).json({ user: me, role: myRole });
+    if (action === 'password') {
+      if (!validPass(b.pass)) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+      await redis(['HSET', USERS, me, hashPass(b.pass)]);
+      return res.status(200).json({ ok: true });
+    }
+
+    // El resto: solo organizadores (un árbitro no administra usuarios ni reinicia datos)
+    if (myRole !== 'admin') return res.status(403).json({ error: 'Su usuario es de árbitro: no tiene permiso para esta acción' });
+    const list = async () => {
+      const users = (await redis(['HKEYS', USERS])).sort();
+      const flat = (await redis(['HGETALL', ROLES])) || [];
+      const roles = {};
+      for (let i = 0; i < flat.length; i += 2) if (users.includes(flat[i])) roles[flat[i]] = flat[i + 1];
+      return { me, users, roles };
+    };
+    const validRole = (r) => ROLE_NAMES.includes(r);
+
+    if (action === 'list') return res.status(200).json(await list());
 
     if (action === 'add') {
       if (!validUser(user)) return res.status(400).json({ error: 'Usuario: 3 a 30 letras o números, sin espacios' });
       if (!validPass(b.pass)) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+      const role = b.role || 'admin';
+      if (!validRole(role)) return res.status(400).json({ error: 'Rol no válido' });
       const ok = Number(await redis(['HSETNX', USERS, user, hashPass(b.pass)]));
       if (!ok) return res.status(409).json({ error: 'Ese usuario ya existe' });
-      return res.status(200).json({ me, users: await list() });
+      if (role === 'admin') await redis(['HDEL', ROLES, user]); else await redis(['HSET', ROLES, user, role]);
+      return res.status(200).json(await list());
+    }
+
+    if (action === 'setRole') {
+      if (user === me) return res.status(400).json({ error: 'No puede cambiar su propio rol' });
+      if (!validRole(b.role)) return res.status(400).json({ error: 'Rol no válido' });
+      if (Number(await redis(['HEXISTS', USERS, user])) !== 1) return res.status(404).json({ error: 'Ese usuario no existe' });
+      if (b.role === 'admin') await redis(['HDEL', ROLES, user]); else await redis(['HSET', ROLES, user, b.role]);
+      return res.status(200).json(await list());
     }
 
     if (action === 'remove') {
       if (user === me) return res.status(400).json({ error: 'No puede eliminar su propio usuario' });
       await redis(['HDEL', USERS, user]);
-      return res.status(200).json({ me, users: await list() });
-    }
-
-    if (action === 'password') {
-      if (!validPass(b.pass)) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
-      await redis(['HSET', USERS, me, hashPass(b.pass)]);
-      return res.status(200).json({ ok: true });
+      await redis(['HDEL', ROLES, user]);
+      return res.status(200).json(await list());
     }
 
     // Reiniciar toda la base de datos: deja un torneo vacío, borra el historial, las inscripciones en línea y deja solo al usuario que lo hace.
@@ -81,7 +106,7 @@ module.exports = async function handler(req, res) {
       if (!okData) return res.status(400).json({ error: 'Datos de reinicio no válidos' });
       const others = (await redis(['HKEYS', USERS])).filter((u) => u !== me);
       for (const u of others) await redis(['HDEL', USERS, u]);
-      await redis(['DEL', 'torneo:hist', 'torneo:insc', 'torneo:bajas', 'torneo:invit']);
+      await redis(['DEL', 'torneo:hist', 'torneo:insc', 'torneo:bajas', 'torneo:invit', ROLES]);
       const rev = Number((await redis(['GET', 'torneo:rev'])) || 0) + 1;
       await redis(['SET', 'torneo:data', JSON.stringify(data)]);
       await redis(['SET', 'torneo:meta', JSON.stringify({ at: Date.now(), by: me, reset: true })]);

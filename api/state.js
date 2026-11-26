@@ -1,33 +1,6 @@
-// Estado del torneo. Lectura pública; guardar requiere sesión de organizador.
+// Estado del torneo. Lectura pública; guardar requiere sesión de organizador (los árbitros usan /api/match).
 // Cada guardado conserva la versión anterior en un historial (últimas 40) para poder restaurarla.
-const { configured, redis, verify, readBody } = require('./_lib');
-
-const K_REV = 'torneo:rev';
-const K_DATA = 'torneo:data';
-const K_HIST = 'torneo:hist';
-const K_META = 'torneo:meta';
-const HIST_MAX = 40;
-
-// Guardar solo si nadie más guardó antes (control de versiones atómico) y respaldar la versión anterior.
-const CAS = `
-local r = redis.call('GET', KEYS[1]) or '0'
-if r ~= ARGV[1] then return {0, r} end
-local old = redis.call('GET', KEYS[2])
-if old then
-  local meta = redis.call('GET', KEYS[4]) or '{}'
-  redis.call('LPUSH', KEYS[3], '{"rev":' .. r .. ',"meta":' .. meta .. ',"data":' .. old .. '}')
-  redis.call('LTRIM', KEYS[3], 0, ${HIST_MAX - 1})
-end
-local n = tonumber(r) + 1
-redis.call('SET', KEYS[1], tostring(n))
-redis.call('SET', KEYS[2], ARGV[2])
-redis.call('SET', KEYS[4], ARGV[3])
-return {1, tostring(n)}`;
-
-async function readAll() {
-  const [rev, data] = await redis(['MGET', K_REV, K_DATA]);
-  return { rev: Number(rev || 0), data: data ? JSON.parse(data) : null };
-}
+const { configured, redis, requireAdmin, readBody, K_REV, K_HIST, HIST_MAX, readAll, casWrite } = require('./_lib');
 
 /** Resumen corto de una versión: equipos y partidos finalizados. */
 function summary(data) {
@@ -50,7 +23,7 @@ module.exports = async function handler(req, res) {
       const q = req.query || {};
       // Historial (solo organizadores)
       if (q.history !== undefined || q.version !== undefined) {
-        if (!(await verify(req))) return res.status(401).json({ error: 'Debe ingresar como organizador' });
+        if (!(await requireAdmin(req, res))) return;
         if (q.version !== undefined) {
           const raw = await redis(['LINDEX', K_HIST, String(Number(q.version) || 0)]);
           if (!raw) return res.status(404).json({ error: 'Versión no encontrada' });
@@ -72,8 +45,9 @@ module.exports = async function handler(req, res) {
     }
 
     if (req.method === 'PUT' || req.method === 'POST') {
-      const user = await verify(req);
-      if (!user) return res.status(401).json({ error: 'Debe ingresar como organizador' });
+      // Solo organizadores: un árbitro no puede reemplazar el torneo completo
+      const user = await requireAdmin(req, res);
+      if (!user) return;
       const body = readBody(req);
       const data = body.data;
       const tors = data && data.torneos && typeof data.torneos === 'object' ? Object.values(data.torneos) : [];
@@ -85,10 +59,9 @@ module.exports = async function handler(req, res) {
       }
       const json = JSON.stringify(data);
       if (json.length > 900000) return res.status(413).json({ error: 'Datos demasiado grandes' });
-      const meta = JSON.stringify({ at: Date.now(), by: user });
 
-      const [ok, rev] = await redis(['EVAL', CAS, '4', K_REV, K_DATA, K_HIST, K_META, String(Number(body.baseRev) || 0), json, meta]);
-      if (Number(ok) === 1) return res.status(200).json({ rev: Number(rev) });
+      const w = await casWrite(body.baseRev, json, { at: Date.now(), by: user });
+      if (w.ok) return res.status(200).json({ rev: w.rev });
       return res.status(409).json(await readAll());
     }
 
